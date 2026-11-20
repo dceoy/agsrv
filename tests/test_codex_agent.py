@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess  # ruff: ignore[suspicious-subprocess-import]
 import sys
 import threading
 import time
@@ -24,7 +25,6 @@ from agsrv.main import create_app
 from agsrv.schemas import CodexQueryRequest
 
 if TYPE_CHECKING:
-    import subprocess
     from pathlib import Path
 
 
@@ -261,6 +261,65 @@ async def test_probe_coalesces_and_times_out(
     release.clear()
     monkeypatch.setattr(main, "CODEX_PROBE_TIMEOUT", 0.01)
     assert not await main._codex_available(app)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_probe_timeout_releases_waiters_but_keeps_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A blocked SDK start retains capacity until its late child is closed."""
+    app = create_app(
+        Settings(workspace_root=tmp_path, codex_max_concurrency=1, api_key="key")
+    )
+    client = codex_agent.make_client(None)
+    started = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+    processes: list[subprocess.Popen[str]] = []
+    sync = client._client._sync  # pyright: ignore[reportPrivateUsage]
+
+    def start() -> None:
+        started.set()
+        release.wait()
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"], text=True
+        )
+        processes.append(process)
+        sync._proc = process  # pyright: ignore[reportPrivateUsage]
+
+    def close() -> None:
+        processes[0].wait(timeout=1)
+        closed.set()
+
+    monkeypatch.setattr(client._client._sync, "start", start)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(client._client._sync, "close", close)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(codex_agent, "make_client", MagicMock(return_value=client))
+    monkeypatch.setattr(main, "CODEX_PROBE_TIMEOUT", 0.05)
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers={"Authorization": "Bearer key"},
+    ) as http:
+        first = asyncio.create_task(http.get("/v1/agents"))
+        try:
+            assert await asyncio.to_thread(started.wait, 1)
+            second = asyncio.create_task(http.get("/v1/agents"))
+            responses = await asyncio.wait_for(asyncio.gather(first, second), 0.5)
+            assert all(
+                not response.json()["codex"]["healthy"] for response in responses
+            )
+            assert not release.is_set()
+            assert app.state.codex_semaphore.locked()
+            assert (await http.get("/v1/agents/codex/rate-limits")).status_code == 429
+        finally:
+            release.set()
+        assert await asyncio.to_thread(closed.wait, 1)
+        assert processes[0].poll() is not None
+        for _ in range(100):
+            if not app.state.codex_semaphore.locked():
+                break
+            await asyncio.sleep(0.01)
+        assert not app.state.codex_semaphore.locked()
 
 
 @pytest.mark.asyncio

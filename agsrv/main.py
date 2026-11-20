@@ -55,7 +55,7 @@ HEARTBEAT_INTERVAL = 15.0
 CODEX_PROBE_TIMEOUT = 10.0
 
 # Keep detached cleanup alive if the response task is externally cancelled.
-_pump_tasks: set[asyncio.Task[None]] = set()
+_pump_tasks: set[asyncio.Task[Any]] = set()
 
 Auth = Depends(auth_dependency)
 
@@ -243,7 +243,7 @@ class _ClosingStreamingResponse(StreamingResponse):
 
 
 @asynccontextmanager
-async def _codex_slot(app: FastAPI) -> AsyncGenerator[None, None]:
+async def _codex_slot(app: FastAPI) -> AsyncGenerator[_SlotLease, None]:
     """Acquire capacity for an operation.
 
     Yields:
@@ -258,36 +258,66 @@ async def _codex_slot(app: FastAPI) -> AsyncGenerator[None, None]:
             status.HTTP_429_TOO_MANY_REQUESTS, "agent concurrency limit reached"
         )
     await semaphore.acquire()
+    lease = _SlotLease(semaphore)
     try:
-        yield
+        yield lease
     finally:
-        semaphore.release()
+        if not lease.claimed:
+            lease.release()
 
 
-async def _codex_available(app: FastAPI, *, slot_held: bool = False) -> bool:
+async def _codex_available(app: FastAPI, *, lease: _SlotLease | None = None) -> bool:
     settings: Settings = app.state.settings
     if not settings.codex_enabled:
         return False
     if time.monotonic() < app.state.codex_probe_expires:
         return cast("bool", app.state.codex_healthy)
-    async with app.state.codex_probe_lock:  # ruff: ignore[too-many-nested-blocks]
+    async with app.state.codex_probe_lock:
         now = time.monotonic()
         if now >= app.state.codex_probe_expires:
-            try:  # ruff: ignore[too-many-statements-in-try-clause]
-                async with asyncio.timeout(CODEX_PROBE_TIMEOUT):
-                    if slot_held:
-                        app.state.codex_healthy = await codex_agent.probe(
-                            settings.codex_bin
-                        )
-                    else:
-                        async with _codex_slot(app):
-                            app.state.codex_healthy = await codex_agent.probe(
-                                settings.codex_bin
-                            )
-            except TimeoutError:
-                app.state.codex_healthy = False
+            if lease is None:
+                async with _codex_slot(app) as acquired:
+                    app.state.codex_healthy = await _timed_probe(settings, acquired)
+            else:
+                app.state.codex_healthy = await _timed_probe(settings, lease)
             app.state.codex_probe_expires = time.monotonic() + 30
     return cast("bool", app.state.codex_healthy)
+
+
+async def _timed_probe(settings: Settings, lease: _SlotLease) -> bool:
+    """Release the caller at the deadline while cleanup retains capacity.
+
+    Returns:
+        The probe result, or false on timeout.
+
+    Raises:
+        asyncio.CancelledError: If the caller is cancelled.
+    """
+    task = asyncio.create_task(codex_agent.probe(settings.codex_bin))
+    try:
+        done, _ = await asyncio.wait({task}, timeout=CODEX_PROBE_TIMEOUT)
+    except asyncio.CancelledError:
+        task.cancel()
+        while not task.done():
+            with suppress(asyncio.CancelledError):
+                await asyncio.shield(task)
+        with suppress(asyncio.CancelledError):
+            task.result()
+        raise
+    if done:
+        return task.result()
+    lease.claimed = True
+    _pump_tasks.add(task)
+
+    def finished(probe: asyncio.Task[bool]) -> None:
+        _pump_tasks.discard(probe)
+        lease.release()
+        with suppress(asyncio.CancelledError):
+            probe.exception()
+
+    task.add_done_callback(finished)
+    task.cancel()
+    return False
 
 
 async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, Any]:
@@ -305,9 +335,10 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
             status.HTTP_429_TOO_MANY_REQUESTS, "agent concurrency limit reached"
         )
     await semaphore.acquire()
+    lease = _SlotLease(semaphore)
     try:
         async with asyncio.timeout(timeout):
-            if not await _codex_available(request.app, slot_held=True):
+            if not await _codex_available(request.app, lease=lease):
                 raise HTTPException(  # ruff: ignore[raise-within-try]
                     status.HTTP_503_SERVICE_UNAVAILABLE,
                     "Codex is disabled or unavailable",
@@ -333,7 +364,8 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
             status.HTTP_502_BAD_GATEWAY, "agent execution failed"
         ) from exc
     finally:
-        semaphore.release()
+        if not lease.claimed:
+            lease.release()
 
 
 async def _codex_query_with_disconnect(
@@ -424,8 +456,11 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:
     @app.get("/v1/agents/codex/rate-limits", dependencies=[Auth])
     async def rate_limits() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         try:
-            async with _codex_slot(app), asyncio.timeout(settings.max_timeout_seconds):
-                if not await _codex_available(app, slot_held=True):
+            async with (
+                _codex_slot(app) as lease,
+                asyncio.timeout(settings.max_timeout_seconds),
+            ):
+                if not await _codex_available(app, lease=lease):
                     raise HTTPException(  # ruff: ignore[raise-within-try]
                         status.HTTP_503_SERVICE_UNAVAILABLE,
                         "Codex is disabled or unavailable",
