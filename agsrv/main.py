@@ -240,7 +240,7 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
         )
     semaphore: asyncio.Semaphore = request.app.state.codex_semaphore
     if semaphore.locked():
-        raise HTTPException(
+        raise HTTPException(  # ruff: ignore[raise-within-try]
             status.HTTP_429_TOO_MANY_REQUESTS, "agent concurrency limit reached"
         )
     await semaphore.acquire()
@@ -248,7 +248,7 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
     try:
         async with asyncio.timeout(timeout):
             if not await _codex_available(request.app, lease=lease):
-                raise HTTPException(
+                raise HTTPException(  # ruff: ignore[raise-within-try]
                     status.HTTP_503_SERVICE_UNAVAILABLE,
                     "Codex is disabled or unavailable",
                 )
@@ -288,7 +288,7 @@ async def _codex_query_with_disconnect(
 
     async def watch_disconnect() -> None:
         nonlocal client_gone
-        while not await request.is_disconnected():
+        while not await request.is_disconnected():  # ruff: ignore[async-busy-wait]
             await asyncio.sleep(DISCONNECT_POLL_INTERVAL)
         client_gone = True
         task.cancel()
@@ -372,7 +372,7 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:
                 asyncio.timeout(settings.max_timeout_seconds),
             ):
                 if not await _codex_available(app, lease=lease):
-                    raise HTTPException(
+                    raise HTTPException(  # ruff: ignore[raise-within-try]
                         status.HTTP_503_SERVICE_UNAVAILABLE,
                         "Codex is disabled or unavailable",
                     )
@@ -380,7 +380,7 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:
                     codex_agent.read_rate_limits(settings.codex_bin), lease
                 )
         except TimeoutError as exc:
-            raise HTTPException(
+            raise HTTPException(  # ruff: ignore[raise-within-try]
                 status.HTTP_504_GATEWAY_TIMEOUT, "Codex rate limits timed out"
             ) from exc
         except HTTPException:
@@ -431,7 +431,7 @@ def _add_query_routes(app: FastAPI) -> None:
 
         async def watch_disconnect() -> None:
             nonlocal client_gone
-            while not await request.is_disconnected():  # ASGI disconnect polling
+            while not await request.is_disconnected():  # ASGI disconnect polling  # ruff: ignore[async-busy-wait]
                 await asyncio.sleep(DISCONNECT_POLL_INTERVAL)
             logger.info("client disconnected; cancelling agent run")
             client_gone = True
