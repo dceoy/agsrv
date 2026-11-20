@@ -57,7 +57,9 @@ def _principal(authorization: str | None) -> str:
 
 def _canonical(body: QueryRequest | CodexQueryRequest) -> str:
     """Serialize validated requests in a stable canonical representation."""
-    return json.dumps(body.model_dump(mode="json"), sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        body.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+    )
 
 
 class JobManager:
@@ -191,7 +193,9 @@ class JobManager:
         payload = _canonical(body)
         settings: Settings = self.app.state.settings
         if len(payload.encode()) > settings.jobs_max_payload_bytes:
-            raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "job payload too large")
+            raise HTTPException(
+                status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "job payload too large"
+            )
         caller = _principal(authorization)
         digest = hashlib.sha256(payload.encode()).hexdigest()
         job_id = uuid4().hex
@@ -253,9 +257,7 @@ class JobManager:
             "status_url": f"/v1/jobs/{job_id}",
         }
 
-    def _row(
-        self, job_id: str, authorization: str | None
-    ) -> sqlite3.Row:
+    def _row(self, job_id: str, authorization: str | None) -> sqlite3.Row:
         self.start()
         with closing(self._connect()) as db:
             self._gc(db)
@@ -280,7 +282,9 @@ class JobManager:
             "started_at": row["started_at"],
             "finished_at": row["finished_at"],
             "result": result,
-            "error": {"code": code, "message": code.replace("_", " ")} if code else None,
+            "error": {"code": code, "message": code.replace("_", " ")}
+            if code
+            else None,
         }
 
     def get(self, job_id: str, authorization: str | None) -> dict[str, Any]:
@@ -334,7 +338,10 @@ class JobManager:
             if result is not None
             else None
         )
-        if serialized is not None and len(serialized.encode()) > settings.jobs_max_result_bytes:
+        if (
+            serialized is not None
+            and len(serialized.encode()) > settings.jobs_max_result_bytes
+        ):
             outcome, code, serialized = "failed", "result_too_large", None
         with closing(self._connect()) as db:
             db.execute(
@@ -347,9 +354,11 @@ class JobManager:
     async def _acquire_workspace(self, cwd: Path) -> None:
         async with self.workspace_condition:
             await self.workspace_condition.wait_for(
-                lambda: not any(
-                    cwd.is_relative_to(active) or active.is_relative_to(cwd)
-                    for active in self.workspaces
+                lambda: (
+                    not any(
+                        cwd.is_relative_to(active) or active.is_relative_to(cwd)
+                        for active in self.workspaces
+                    )
                 )
             )
             self.workspaces.add(cwd)
@@ -369,7 +378,9 @@ class JobManager:
                 options = build_options(body, settings, cwd, home)
                 runner = self.app.state.runner
                 stream = runner.stream(body.prompt, options)
-                async with aclosing(cast("AsyncGenerator[Message]", stream)) as messages:
+                async with aclosing(
+                    cast("AsyncGenerator[Message]", stream)
+                ) as messages:
                     result = await collect_result(
                         messages, include_messages=body.include_messages
                     )
@@ -393,7 +404,9 @@ class JobManager:
     ) -> None:
         acquired = False
         try:  # ruff: ignore[too-many-statements-in-try-clause]
-            timeout = body.timeout_seconds or self.app.state.settings.max_timeout_seconds
+            timeout = (
+                body.timeout_seconds or self.app.state.settings.max_timeout_seconds
+            )
             async with asyncio.timeout(timeout):
                 await self._acquire_workspace(cwd)
                 acquired = True
