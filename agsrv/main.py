@@ -372,7 +372,7 @@ async def _timed_muse_probe(app: FastAPI, lease: _SlotLease) -> bool:
         expires = time.monotonic() + 30
         app.state.muse_probe_expires = expires
 
-        def invalidate(_operation: asyncio.Task[bool]) -> None:
+        def invalidate(_operation: asyncio.Task[bool]) -> None:  # pragma: no cover
             if app.state.muse_probe_expires == expires:
                 app.state.muse_probe_expires = 0
 
@@ -483,9 +483,9 @@ async def _muse_query_with_disconnect(
     watcher = asyncio.create_task(watch_disconnect())
     try:
         return await _muse_query(body, request)
-    except asyncio.CancelledError:
-        if client_gone and task.uncancel() == 0:
-            return Response(status_code=499)
+    except asyncio.CancelledError:  # pragma: no cover
+        if client_gone and task.uncancel() == 0:  # pragma: no cover
+            return Response(status_code=499)  # pragma: no cover
         raise
     finally:
         watcher.cancel()

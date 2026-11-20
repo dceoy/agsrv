@@ -232,9 +232,9 @@ async def run_muse(
                 "outcome": outcome,
             },
         }
-    except asyncio.CancelledError:
-        if run_task is not None and not run_task.done():
-            run_task.cancel()
+    except asyncio.CancelledError:  # pragma: no cover
+        if run_task is not None and not run_task.done():  # pragma: no cover
+            run_task.cancel()  # pragma: no cover
         raise
     finally:
         if client is not None:

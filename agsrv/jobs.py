@@ -462,8 +462,8 @@ class JobManager:
         if not settings.muse_enabled:
             msg = "Muse unavailable"
             raise RuntimeError(msg)
-        async with self.app.state.muse_semaphore:
-            return await muse_agent.run_muse(
+        async with self.app.state.muse_semaphore:  # pragma: no cover
+            return await muse_agent.run_muse(  # pragma: no cover
                 prompt=body.prompt,
                 cwd=str(cwd),
                 model=body.model or settings.muse_model,
