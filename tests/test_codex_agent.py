@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, NoReturn, Self
 from unittest.mock import AsyncMock, MagicMock
@@ -39,8 +40,8 @@ class FakeClient:
         """Enter the fake context."""
         return self
 
-    async def __aexit__(self, *_args: object) -> None:
-        """Exit the fake context."""
+    async def close(self) -> None:
+        """Close the fake client."""
 
 
 def test_client_declines() -> None:
@@ -141,7 +142,17 @@ async def test_run(
 def test_endpoints(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Exercise routing, authentication, validation, and backend failure mapping."""
     probe = AsyncMock(return_value=True)
-    run = AsyncMock(return_value={"agent": "codex", "result": "ok"})
+    run = AsyncMock(
+        return_value={
+            "agent": "codex",
+            "result": "ok",
+            "model": None,
+            "is_error": False,
+            "duration_ms": 0,
+            "usage": None,
+            "backend": {},
+        }
+    )
     limits = AsyncMock(return_value={"plan": "plus"})
     monkeypatch.setattr(codex_agent, "probe", probe)
     monkeypatch.setattr(codex_agent, "run_codex", run)
@@ -302,3 +313,72 @@ async def test_codex_deadline_and_disconnect(
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_transport_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Cancellation waits for the SDK start worker before closing its transport."""
+    client = codex_agent.make_client(None)
+    started = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+
+    def start() -> None:
+        started.set()
+        release.wait()
+
+    def close() -> None:
+        closed.set()
+
+    monkeypatch.setattr(client._client._sync, "start", start)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(client._client._sync, "close", close)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(
+        client._client,  # pyright: ignore[reportPrivateUsage]
+        "initialize",
+        AsyncMock(side_effect=RuntimeError()),
+    )
+    monkeypatch.setattr(codex_agent, "make_client", MagicMock(return_value=client))
+    task = asyncio.create_task(codex_agent.probe(None))
+    await asyncio.to_thread(started.wait)
+    task.cancel()
+    await asyncio.sleep(0.01)
+    assert not task.done()
+    assert not closed.is_set()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert closed.is_set()
+
+
+def test_metadata_capacity_timeout_and_schema(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Metadata starts require capacity; cached health and OpenAPI remain available."""
+    app = create_app(
+        Settings(workspace_root=tmp_path, max_timeout_seconds=0.01, api_key="key")
+    )
+    probe = AsyncMock(return_value=True)
+
+    async def slow_limits(_binary: str | None) -> dict[str, object]:
+        await asyncio.Event().wait()
+        return {}
+
+    limits = AsyncMock(side_effect=slow_limits)
+    monkeypatch.setattr(codex_agent, "probe", probe)
+    monkeypatch.setattr(codex_agent, "read_rate_limits", limits)
+    client = TestClient(app, headers={"Authorization": "Bearer key"})
+    app.state.codex_semaphore = asyncio.Semaphore(0)
+    assert client.get("/v1/agents").status_code == 429
+    assert client.get("/v1/agents/codex/rate-limits").status_code == 429
+    probe.assert_not_awaited()
+    app.state.codex_semaphore = asyncio.Semaphore(1)
+    assert client.get("/v1/agents").status_code == 200
+    app.state.codex_semaphore = asyncio.Semaphore(0)
+    assert client.get("/v1/agents").json()["codex"]["healthy"] is True
+    app.state.codex_semaphore = asyncio.Semaphore(1)
+    assert client.get("/v1/agents/codex/rate-limits").status_code == 504
+    schema = client.get("/openapi.json").json()["paths"]["/v1/query"]["post"][
+        "responses"
+    ]["200"]["content"]["application/json"]["schema"]
+    assert schema["discriminator"]["propertyName"] == "agent"
+    assert len(schema["oneOf"]) == 2

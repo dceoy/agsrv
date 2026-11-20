@@ -71,6 +71,18 @@ class QueryResponse(BaseModel):
     messages: list[dict[str, Any]]
 
 
+class CodexQueryResponse(BaseModel):
+    """Final Codex result and backend metadata."""
+
+    agent: Literal["codex"]
+    result: str | None
+    model: str | None
+    is_error: bool
+    duration_ms: int
+    usage: dict[str, Any] | None
+    backend: dict[str, Any]
+
+
 class InfoResponse(BaseModel):
     """Server capabilities and defaults."""
 

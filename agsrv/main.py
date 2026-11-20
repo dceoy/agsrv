@@ -6,7 +6,7 @@ import asyncio
 import json
 import logging
 import time
-from contextlib import aclosing, suppress
+from contextlib import aclosing, asynccontextmanager, suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, cast
 
@@ -27,7 +27,13 @@ from agsrv.agent import (
 )
 from agsrv.config import Settings
 from agsrv.sandbox import SandboxSetupError, service_home
-from agsrv.schemas import CodexQueryRequest, InfoResponse, QueryRequest, QueryResponse
+from agsrv.schemas import (
+    CodexQueryRequest,
+    CodexQueryResponse,
+    InfoResponse,
+    QueryRequest,
+    QueryResponse,
+)
 from agsrv.security import (
     auth_dependency,
     check_permission_mode,
@@ -237,21 +243,49 @@ class _ClosingStreamingResponse(StreamingResponse):
                     self.lease.release()
 
 
-async def _codex_available(app: FastAPI) -> bool:
+@asynccontextmanager
+async def _codex_slot(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Acquire capacity for an operation.
+
+    Yields:
+        After acquiring the slot.
+
+    Raises:
+        HTTPException: If capacity is exhausted.
+    """
+    semaphore: asyncio.Semaphore = app.state.codex_semaphore
+    if semaphore.locked():
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS, "agent concurrency limit reached"
+        )
+    await semaphore.acquire()
+    try:
+        yield
+    finally:
+        semaphore.release()
+
+
+async def _codex_available(app: FastAPI, *, slot_held: bool = False) -> bool:
     settings: Settings = app.state.settings
     if not settings.codex_enabled or (
         settings.codex_bin is not None
         and not await asyncio.to_thread(Path(settings.codex_bin).is_file)
     ):
         return False
-    async with app.state.codex_probe_lock:
+    async with app.state.codex_probe_lock:  # ruff: ignore[too-many-nested-blocks]
         now = time.monotonic()
         if now >= app.state.codex_probe_expires:
-            try:
+            try:  # ruff: ignore[too-many-statements-in-try-clause]
                 async with asyncio.timeout(CODEX_PROBE_TIMEOUT):
-                    app.state.codex_healthy = await codex_agent.probe(
-                        settings.codex_bin
-                    )
+                    if slot_held:
+                        app.state.codex_healthy = await codex_agent.probe(
+                            settings.codex_bin
+                        )
+                    else:
+                        async with _codex_slot(app):
+                            app.state.codex_healthy = await codex_agent.probe(
+                                settings.codex_bin
+                            )
             except TimeoutError:
                 app.state.codex_healthy = False
             app.state.codex_probe_expires = time.monotonic() + 30
@@ -275,7 +309,7 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
     await semaphore.acquire()
     try:
         async with asyncio.timeout(timeout):
-            if not await _codex_available(request.app):
+            if not await _codex_available(request.app, slot_held=True):
                 raise HTTPException(  # ruff: ignore[raise-within-try]
                     status.HTTP_503_SERVICE_UNAVAILABLE,
                     "Codex is disabled or unavailable",
@@ -391,12 +425,20 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:
 
     @app.get("/v1/agents/codex/rate-limits", dependencies=[Auth])
     async def rate_limits() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
-        if not await _codex_available(app):
-            raise HTTPException(
-                status.HTTP_503_SERVICE_UNAVAILABLE, "Codex is disabled or unavailable"
-            )
         try:
-            return await codex_agent.read_rate_limits(settings.codex_bin)
+            async with _codex_slot(app), asyncio.timeout(settings.max_timeout_seconds):
+                if not await _codex_available(app, slot_held=True):
+                    raise HTTPException(  # ruff: ignore[raise-within-try]
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "Codex is disabled or unavailable",
+                    )
+                return await codex_agent.read_rate_limits(settings.codex_bin)
+        except TimeoutError as exc:
+            raise HTTPException(
+                status.HTTP_504_GATEWAY_TIMEOUT, "Codex rate limits timed out"
+            ) from exc
+        except HTTPException:
+            raise
         except Exception as exc:
             logger.exception("Codex rate limits failed")
             raise HTTPException(
@@ -409,19 +451,25 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:
 def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure]
     """Register the agent execution routes."""
 
-    @app.post("/v1/query", dependencies=[Auth], response_model=None)
+    @app.post(
+        "/v1/query",
+        dependencies=[Auth],
+        response_model=Annotated[
+            QueryResponse | CodexQueryResponse, Field(discriminator="agent")
+        ],
+    )
     async def run_query(  # pyright: ignore[reportUnusedFunction]
         body: Annotated[QueryRequest | CodexQueryRequest, Field(discriminator="agent")],
         request: Request,
     ) -> QueryResponse | Response | dict[str, Any]:
-        """Run one ephemeral agent query and return the transcript.
+        """Run one ephemeral agent query and return its result.
 
         Args:
             body: Query request.
             request: Incoming request.
 
         Returns:
-            Final result and message transcript.
+            Final result and optional Claude message transcript.
 
         Raises:
             HTTPException: 502 on agent failure, 504 on timeout.

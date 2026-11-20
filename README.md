@@ -17,8 +17,8 @@ result as JSON. Claude also supports a Server-Sent Events transcript.
 | GET    | `/v1/info`         | yes  | Server defaults and limits                 |
 | GET    | `/v1/agents`       | yes  | Agent capabilities and health              |
 | GET    | `/v1/agents/codex/rate-limits` | yes | Codex account limits              |
-| POST   | `/v1/query`        | yes  | Run one agent query, return the transcript |
-| POST   | `/v1/query/stream` | yes  | Same, streamed as SSE                      |
+| POST   | `/v1/query`        | yes  | Run one agent query, return the result |
+| POST   | `/v1/query/stream` | yes  | Run one Claude query, streamed as SSE                      |
 
 See [docs/api/rest-api.md](docs/api/rest-api.md) for the full reference.
 

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
+from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING, Any, cast
 
+import anyio
 from openai_codex import (
     ApprovalMode,
     AsyncCodex,
@@ -15,6 +18,8 @@ from openai_codex import (
 from openai_codex.generated.v2_all import GetAccountRateLimitsResponse
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
     from openai_codex.generated.v2_all import ReasoningEffort
     from openai_codex.models import JsonObject
 
@@ -43,6 +48,30 @@ def make_client(binary: str | None) -> AsyncCodex:
     return client
 
 
+@asynccontextmanager
+async def client_context(binary: str | None) -> AsyncGenerator[AsyncCodex, None]:
+    """Finish entry before closing, even if cancellation interrupts startup.
+
+    Yields:
+        The initialized client.
+    """
+    client = make_client(binary)
+    entry = asyncio.create_task(client.__aenter__())  # ruff: ignore[unnecessary-dunder-call]
+    try:
+        await asyncio.shield(entry)
+    except BaseException:
+        with anyio.CancelScope(shield=True):
+            with suppress(Exception, asyncio.CancelledError):
+                await asyncio.shield(entry)
+            await client.close()
+        raise
+    try:
+        yield client
+    finally:
+        with anyio.CancelScope(shield=True):
+            await client.close()
+
+
 def _window(window: dict[str, Any] | None) -> dict[str, Any] | None:
     if window is None:
         return None
@@ -59,7 +88,7 @@ async def probe(binary: str | None) -> bool:
         Whether initialization succeeded.
     """
     try:
-        async with make_client(binary):
+        async with client_context(binary):
             return True
     except Exception:  # ruff: ignore[blind-except]  # any initialization failure means unhealthy
         return False
@@ -74,7 +103,7 @@ async def read_rate_limits(binary: str | None) -> dict[str, Any]:
     Returns:
         Normalized fields and the SDK payload.
     """
-    async with make_client(binary) as client:
+    async with client_context(binary) as client:
         response = await client._client.request(  # pyright: ignore[reportPrivateUsage]  # ruff: ignore[private-member-access]
             "account/rateLimits/read", None, response_model=GetAccountRateLimitsResponse
         )
@@ -114,7 +143,7 @@ async def run_codex(
     Returns:
         The collected turn and thread metadata.
     """
-    async with make_client(binary) as client:
+    async with client_context(binary) as client:
         started = await client._client.thread_start({  # pyright: ignore[reportPrivateUsage]  # ruff: ignore[private-member-access]
             "cwd": cwd,
             "model": model,

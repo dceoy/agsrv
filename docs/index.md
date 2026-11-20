@@ -5,8 +5,8 @@ Stateless HTTP API for remote Claude Code execution powered by Claude Agent SDK.
 ## Capabilities
 
 - `POST /v1/query`: run one ephemeral agent query and receive the result and
-  full message transcript as JSON.
-- `POST /v1/query/stream`: the same run streamed as Server-Sent Events.
+  result as JSON, with an optional Claude transcript.
+- `POST /v1/query/stream`: a Claude run streamed as Server-Sent Events.
 - `GET /v1/info` and `GET /health`.
 - Bearer-token authentication, workspace confinement, opt-in
   `bypassPermissions`, concurrency and timeout limits.
