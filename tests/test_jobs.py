@@ -456,7 +456,6 @@ def test_sync_codex_query_shares_job_workspace_lock(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The detached Codex operation also holds the job workspace lease."""
-    runner = MeteredRunner()
     codex_active = False
 
     async def fake_available(*_args: object, **_kwargs: object) -> bool:
@@ -469,7 +468,15 @@ def test_sync_codex_query_shares_job_workspace_lock(
         try:
             await asyncio.sleep(0.08)
             assert runner.active == 0
-            return {"agent": "codex", "result": "done", "is_error": False}
+            return {
+                "agent": "codex",
+                "result": "done",
+                "model": None,
+                "is_error": False,
+                "duration_ms": 0,
+                "usage": None,
+                "backend": {},
+            }
         finally:
             codex_active = False
 
