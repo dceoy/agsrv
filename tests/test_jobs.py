@@ -413,9 +413,11 @@ def test_job_database_rejects_concurrent_owners(tmp_path: Path) -> None:
     second = create_app(settings, FakeRunner())
     with TestClient(first) as client:
         job_id = client.post("/v1/jobs", headers=AUTH, json=BODY).json()["job_id"]
-        with pytest.raises(RuntimeError, match="owned by another worker"):
-            with TestClient(second):
-                pass
+        with (
+            pytest.raises(RuntimeError, match="owned by another worker"),
+            TestClient(second),
+        ):
+            pass
         assert _wait(client, job_id)["status"] == "succeeded"
     # A clean shutdown relinquishes ownership for the replacement worker.
     with TestClient(second) as client:
@@ -459,6 +461,7 @@ def test_sync_codex_query_shares_job_workspace_lock(
     codex_active = False
 
     async def fake_available(*_args: object, **_kwargs: object) -> bool:
+        await asyncio.sleep(0)
         return True
 
     async def fake_codex(**_kwargs: object) -> dict[str, Any]:
@@ -522,6 +525,7 @@ def test_oversized_results_preserve_success(
     app = create_app(_settings(tmp_path, jobs_max_result_bytes=max_bytes))
 
     async def oversized_result(_body: object, _cwd: object) -> dict[str, Any]:
+        await asyncio.sleep(0)
         return {
             "agent": "claude",
             "is_error": False,
