@@ -170,7 +170,7 @@ def test_validation_and_auth(tmp_path: Path) -> None:
         )
         assert (
             client.post(
-                "/v1/jobs", headers={**AUTH, "Idempotency-Key": "é"}, json=BODY
+                "/v1/jobs", headers={**AUTH, "Idempotency-Key": "x" * 129}, json=BODY
             ).status_code
             == 400
         )
@@ -269,3 +269,136 @@ def test_codex_jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         result = _wait(client, response.json()["job_id"])
         assert result["status"] == "succeeded"
         assert result["result"]["agent"] == "codex"
+
+def test_job_admission_failure_cases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Enforce shutdown, sandbox initialization, and key validation failures."""
+    from fastapi import HTTPException  # ruff: ignore[import-outside-toplevel]
+    from agsrv.sandbox import SandboxSetupError  # ruff: ignore[import-outside-toplevel]
+    from agsrv.schemas import QueryRequest  # ruff: ignore[import-outside-toplevel]
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        body = QueryRequest(agent="claude", prompt="x", sandbox=False)
+        for bad in ("é", "\t", "", "x" * 129):
+            with pytest.raises(HTTPException) as exc:
+                app.state.jobs.submit(body, "Bearer secret", bad)
+            assert exc.value.status_code == 400
+
+        def no_home() -> Path:
+            raise SandboxSetupError("missing home")
+
+        monkeypatch.setattr("agsrv.jobs.service_home", no_home)
+        assert client.post(
+            "/v1/jobs", headers=AUTH, json={"agent": "claude", "prompt": "x"}
+        ).status_code == 503
+
+        app.state.jobs.stopping = True
+        assert client.post("/v1/jobs", headers=AUTH, json=BODY).status_code == 503
+
+
+def test_cancel_without_tracked_task(tmp_path: Path) -> None:
+    """Cancel a stored queued job even when no in-memory task exists."""
+    import hashlib  # ruff: ignore[import-outside-toplevel]
+
+    app = create_app(_settings(tmp_path))
+    with TestClient(app) as client:
+        principal = hashlib.sha256("Bearer secret".encode()).hexdigest()
+        with sqlite3.connect(app.state.jobs.path) as db:
+            db.execute(
+                """INSERT INTO jobs
+                    (job_id, caller, payload_hash, request_json, agent, workspace,
+                     status, created_at)
+                    VALUES ('orphan-queue', ?, 'hash', '{}', 'claude', ?, 'queued', ?)""",
+                (principal, str(tmp_path), "2026-11-20T13:00:00.000+00:00"),
+            )
+        response = client.post("/v1/jobs/orphan-queue/cancel", headers=AUTH)
+        assert response.status_code == 200
+        assert response.json()["status"] == "cancelled"
+
+
+def test_disabled_codex_and_missing_claude_result(tmp_path: Path) -> None:
+    """Classify terminal failures without leaking backend internals."""
+    with TestClient(
+        create_app(_settings(tmp_path, codex_enabled=False))
+    ) as client:
+        job_id = client.post(
+            "/v1/jobs", headers=AUTH, json={"agent": "codex", "prompt": "x"}
+        ).json()["job_id"]
+        result = _wait(client, job_id)
+        assert result["status"] == "failed"
+        assert result["error"]["code"] == "execution_failed"
+
+    with TestClient(
+        create_app(_settings(tmp_path), FakeRunner(canned()[:2]))
+    ) as client:
+        job_id = client.post("/v1/jobs", headers=AUTH, json=BODY).json()["job_id"]
+        result = _wait(client, job_id)
+        assert result["status"] == "failed"
+        assert result["error"]["code"] == "agent_result_missing"
+
+
+def test_sandbox_runtime_setup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Represent failed sandbox prerequisites as a stable error code."""
+    from agsrv.sandbox import SandboxSetupError  # ruff: ignore[import-outside-toplevel]
+
+    def broken(*_args: object, **_kwargs: object) -> None:
+        raise SandboxSetupError("bundled CLI is unavailable")
+
+    monkeypatch.setattr("agsrv.jobs.build_options", broken)
+    with TestClient(create_app(_settings(tmp_path), FakeRunner())) as client:
+        job_id = client.post("/v1/jobs", headers=AUTH, json=BODY).json()["job_id"]
+        result = _wait(client, job_id)
+        assert result["status"] == "failed"
+        assert result["error"]["code"] == "sandbox_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_orphaned_run_and_unstarted_manager_stop(tmp_path: Path) -> None:
+    """A non-existent record cannot start, and uninitialized shutdown is safe."""
+    from agsrv.schemas import QueryRequest  # ruff: ignore[import-outside-toplevel]
+
+    app = create_app(_settings(tmp_path))
+    manager = app.state.jobs
+    manager.start()
+    await manager._run(  # pyright: ignore[reportPrivateUsage]
+        "does-not-exist",
+        QueryRequest(agent="claude", prompt="x", sandbox=False),
+        tmp_path,
+    )
+    await manager.stop()
+    unstarted = create_app(_settings(tmp_path)).state.jobs
+    await unstarted.stop()
+
+
+def test_shutdown_interrupts_active_jobs(tmp_path: Path) -> None:
+    """Shutdown drains in-memory tasks and leaves an interrupted record."""
+    app = create_app(_settings(tmp_path), FakeRunner(delay=30.0))
+    with TestClient(app) as client:
+        job_id = client.post("/v1/jobs", headers=AUTH, json=BODY).json()["job_id"]
+    with sqlite3.connect(app.state.jobs.path) as db:
+        assert db.execute(
+            "SELECT status FROM jobs WHERE job_id=?", (job_id,)
+        ).fetchone()[0] == "interrupted"
+
+
+def test_cancel_queued_workspace_job(tmp_path: Path) -> None:
+    """Cancelling a workspace waiter does not release an unowned lock."""
+    app = create_app(_settings(tmp_path), FakeRunner(delay=0.35))
+    with TestClient(app) as client:
+        first = client.post("/v1/jobs", headers=AUTH, json=BODY).json()["job_id"]
+        for _ in range(100):
+            if client.get(f"/v1/jobs/{first}", headers=AUTH).json()["status"] == "running":
+                break
+            time.sleep(0.005)
+        second = client.post(
+            "/v1/jobs", headers=AUTH, json={**BODY, "prompt": "other"}
+        ).json()["job_id"]
+        assert client.post(
+            f"/v1/jobs/{second}/cancel", headers=AUTH
+        ).status_code == 200
+        assert _wait(client, second)["status"] == "cancelled"
+        assert _wait(client, first)["status"] == "succeeded"
