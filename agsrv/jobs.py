@@ -95,7 +95,11 @@ class JobManager:
         return connection
 
     def start(self) -> None:
-        """Initialize persistent storage and interrupt orphaned operations."""
+        """Initialize storage, owning its database for the worker lifetime.
+
+        Raises:
+            RuntimeError: If another worker already owns the database.
+        """
         if self.started:
             return
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -104,9 +108,10 @@ class JobManager:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             lock.close()
-            raise RuntimeError("jobs database is owned by another worker") from exc
+            msg = "jobs database is owned by another worker"
+            raise RuntimeError(msg) from exc
         self._lock_file = lock
-        try:
+        try:  # ruff: ignore[too-many-statements-in-try-clause]
             with closing(self._connect()) as db:
                 db.execute("PRAGMA journal_mode=WAL")
                 db.execute(
@@ -134,7 +139,8 @@ class JobManager:
                 )
                 db.execute(
                     "UPDATE jobs SET status='interrupted', finished_at=?, "
-                    "error_code='server_interrupted' WHERE status IN ('queued','running')",
+                    "error_code='server_interrupted' "
+                    "WHERE status IN ('queued','running')",
                     (_now(),),
                 )
                 db.commit()
@@ -361,12 +367,17 @@ class JobManager:
             if result is not None
             else None
         )
-        if serialized is not None and len(serialized.encode()) > settings.jobs_max_result_bytes:
+        if (
+            serialized is not None
+            and len(serialized.encode()) > settings.jobs_max_result_bytes
+        ):
             compact = dict(cast("dict[str, Any]", result))
             if "messages" in compact:
                 compact.pop("messages")
                 compact["messages_truncated"] = True
-                serialized = json.dumps(compact, separators=(",", ":"), ensure_ascii=False)
+                serialized = json.dumps(
+                    compact, separators=(",", ":"), ensure_ascii=False
+                )
             if len(serialized.encode()) > settings.jobs_max_result_bytes:
                 serialized = json.dumps(
                     {
