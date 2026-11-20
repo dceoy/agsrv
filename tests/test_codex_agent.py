@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import threading
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, NoReturn, Self
+from typing import TYPE_CHECKING, NoReturn
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.responses import Response
 from fastapi.testclient import TestClient
+from openai_codex.models import InitializeResponse
 from starlette.requests import Request
 
 from agsrv import codex_agent, main
@@ -35,10 +36,8 @@ class FakeClient:
         )
         self.request = AsyncMock()
         self._client = self
-
-    async def __aenter__(self) -> Self:
-        """Enter the fake context."""
-        return self
+        self.start = AsyncMock()
+        self.initialize = AsyncMock(return_value=InitializeResponse(userAgent="test/1"))
 
     async def close(self) -> None:
         """Close the fake client."""
@@ -322,6 +321,7 @@ async def test_cancel_during_transport_start(monkeypatch: pytest.MonkeyPatch) ->
     started = threading.Event()
     release = threading.Event()
     closed = threading.Event()
+    finish_close = threading.Event()
 
     def start() -> None:
         started.set()
@@ -329,6 +329,7 @@ async def test_cancel_during_transport_start(monkeypatch: pytest.MonkeyPatch) ->
 
     def close() -> None:
         closed.set()
+        finish_close.wait()
 
     monkeypatch.setattr(client._client._sync, "start", start)  # pyright: ignore[reportPrivateUsage]
     monkeypatch.setattr(client._client._sync, "close", close)  # pyright: ignore[reportPrivateUsage]
@@ -338,16 +339,59 @@ async def test_cancel_during_transport_start(monkeypatch: pytest.MonkeyPatch) ->
         AsyncMock(side_effect=RuntimeError()),
     )
     monkeypatch.setattr(codex_agent, "make_client", MagicMock(return_value=client))
-    task = asyncio.create_task(codex_agent.probe(None))
+    app = create_app(Settings())
+    app.state.codex_semaphore = asyncio.Semaphore(1)
+
+    async def operation() -> None:
+        async with main._codex_slot(app):  # pyright: ignore[reportPrivateUsage]
+            await codex_agent.probe(None)
+
+    task = asyncio.create_task(operation())
     await asyncio.to_thread(started.wait)
     task.cancel()
     await asyncio.sleep(0.01)
+    task.cancel()
+    await asyncio.sleep(0.01)
     assert not task.done()
+    assert app.state.codex_semaphore.locked()
     assert not closed.is_set()
     release.set()
+    assert await asyncio.to_thread(closed.wait, 1)
+    assert app.state.codex_semaphore.locked()
+    assert not task.done()
+    finish_close.set()
     with pytest.raises(asyncio.CancelledError):
         await task
     assert closed.is_set()
+    assert not app.state.codex_semaphore.locked()
+
+
+@pytest.mark.asyncio
+async def test_stalled_initialize_closed_on_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closing the transport unblocks an initialize worker after a deadline."""
+    client = codex_agent.make_client(None)
+    started = threading.Event()
+    closed = threading.Event()
+    finished = threading.Event()
+
+    def initialize() -> InitializeResponse:
+        started.set()
+        closed.wait()
+        finished.set()
+        return InitializeResponse(userAgent="test/1")
+
+    monkeypatch.setattr(client._client._sync, "start", lambda: None)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(client._client._sync, "initialize", initialize)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(client._client._sync, "close", closed.set)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(codex_agent, "make_client", MagicMock(return_value=client))
+    with pytest.raises(TimeoutError):
+        async with asyncio.timeout(0.1):
+            await codex_agent.probe(None)
+    assert started.is_set()
+    assert closed.is_set()
+    assert await asyncio.to_thread(finished.wait, 1)
 
 
 def test_metadata_capacity_timeout_and_schema(

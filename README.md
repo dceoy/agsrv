@@ -6,8 +6,8 @@ Stateless HTTP API for remote Claude and Codex execution using their Python SDKs
 
 Each request is one ephemeral Claude or Codex run. There are no
 sessions, no resume, and no server-side conversation state. A client on another
-machine POSTs a prompt and receives the agent result plus the full message
-result as JSON. Claude also supports a Server-Sent Events transcript.
+machine POSTs a prompt and receives the agent result as JSON. Claude can also
+include a message transcript and supports Server-Sent Events streaming.
 
 ## Endpoints
 

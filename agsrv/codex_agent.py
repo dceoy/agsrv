@@ -6,7 +6,6 @@ import asyncio
 from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING, Any, cast
 
-import anyio
 from openai_codex import (
     ApprovalMode,
     AsyncCodex,
@@ -14,6 +13,9 @@ from openai_codex import (
     AsyncTurnHandle,
     CodexConfig,
     Sandbox,
+)
+from openai_codex._initialize_metadata import (  # ruff: ignore[import-private-name]
+    validate_initialize_metadata,
 )
 from openai_codex.generated.v2_all import GetAccountRateLimitsResponse
 
@@ -50,26 +52,39 @@ def make_client(binary: str | None) -> AsyncCodex:
 
 @asynccontextmanager
 async def client_context(binary: str | None) -> AsyncGenerator[AsyncCodex, None]:
-    """Finish entry before closing, even if cancellation interrupts startup.
+    """Start the transport separately so a stalled handshake can be closed.
 
     Yields:
         The initialized client.
+
+    Raises:
+        asyncio.CancelledError: If cancelled during cleanup.
     """
     client = make_client(binary)
-    entry = asyncio.create_task(client.__aenter__())  # ruff: ignore[unnecessary-dunder-call]
+    start = asyncio.create_task(client._client.start())  # pyright: ignore[reportPrivateUsage]  # ruff: ignore[private-member-access]
+
+    async def cleanup() -> None:
+        with suppress(Exception):
+            await start
+        await client.close()
+
     try:
-        await asyncio.shield(entry)
-    except BaseException:
-        with anyio.CancelScope(shield=True):
-            with suppress(Exception, asyncio.CancelledError):
-                await asyncio.shield(entry)
-            await client.close()
-        raise
-    try:
+        await asyncio.shield(start)
+        payload = await client._client.initialize()  # pyright: ignore[reportPrivateUsage]  # ruff: ignore[private-member-access]
+        client._init = validate_initialize_metadata(payload)  # pyright: ignore[reportPrivateUsage]  # ruff: ignore[private-member-access]
+        client._initialized = True  # pyright: ignore[reportPrivateUsage]  # ruff: ignore[private-member-access]
         yield client
     finally:
-        with anyio.CancelScope(shield=True):
-            await client.close()
+        closing = asyncio.create_task(cleanup())
+        cancelled = False
+        while not closing.done():
+            try:
+                await asyncio.shield(closing)
+            except asyncio.CancelledError:
+                cancelled = True
+        closing.result()
+        if cancelled:
+            raise asyncio.CancelledError
 
 
 def _window(window: dict[str, Any] | None) -> dict[str, Any] | None:
