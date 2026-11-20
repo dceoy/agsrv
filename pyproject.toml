@@ -1,6 +1,6 @@
 [project]
 name = "agsrv"
-version = "0.2.0"
+version = "0.3.0"
 description = "Stateless HTTP API for remote multi-agent execution"
 authors = [{name = "dceoy", email = "dceoy@users.noreply.github.com"}]
 maintainers = [{name = "dceoy", email = "dceoy@users.noreply.github.com"}]
