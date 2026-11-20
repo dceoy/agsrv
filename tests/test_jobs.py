@@ -311,7 +311,8 @@ def test_cancel_without_tracked_task(tmp_path: Path) -> None:
                 """INSERT INTO jobs
                     (job_id, caller, payload_hash, request_json, agent, workspace,
                      status, created_at)
-                    VALUES ('orphan-queue', ?, 'hash', '{}', 'claude', ?, 'queued', ?)""",
+                    VALUES ('orphan-queue', ?, 'hash', '{}', 'claude', ?,
+                            'queued', ?)""",
                 (principal, str(tmp_path), "2026-11-20T13:00:00.000+00:00"),
             )
         response = client.post("/v1/jobs/orphan-queue/cancel", headers=AUTH)
