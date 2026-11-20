@@ -172,8 +172,12 @@ with `Retry-After`. Expired terminal records and idempotency keys are removed
 after 24 hours by default. Jobs run in-process and **do not survive process
 termination**: after restart nonterminal records become `interrupted`
 without replaying filesystem or Git side effects. Only one uvicorn worker may
-use a given SQLite database. Jobs for overlapping workspace directories are
-serialized. Shared API keys represent one caller and authorize access to the
+use a given SQLite database; the server rejects concurrent owners via a lock
+file alongside the database. Synchronous queries and jobs targeting overlapping
+workspace directories are serialized. Oversized transcripts are omitted with
+`messages_truncated: true` while retaining the final answer. If even the core
+result exceeds the size limit, `result_truncated: true` preserves a minimal
+outcome summary. Shared API keys represent one caller and authorize access to the
 same job records; use a separate server/key for caller isolation.
 
 ## Development
