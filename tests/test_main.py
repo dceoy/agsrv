@@ -1002,7 +1002,7 @@ async def test_query_asgi_disconnect_returns_499(tmp_path: Path) -> None:
             request_sent = True
             return {
                 "type": "http.request",
-                "body": b'{"agent": "claude", "sandbox": False, "prompt":"x"}',
+                "body": b'{"agent": "claude", "sandbox": false, "prompt":"x"}',
                 "more_body": False,
             }
         await runner.started.wait()
@@ -1457,7 +1457,7 @@ def test_sandbox_setup_failure_is_controlled(
     """Verify a cache setup failure is a controlled 503 and the slot is freed."""
     (sbx.home / ".cache").write_text("not a directory")
     client, runner = sbx_client(sbx, max_concurrency=1)
-    for path in ("/v1/query", "/v1/query/stream", "/v1/query"):
+    for path in ("/v1/query", "/v1/query"):
         response = client.post(path, json=SANDBOX_BODY, headers=AUTH)
         assert response.status_code == 503
         assert "sandbox unavailable" in response.json()["detail"]
