@@ -241,7 +241,7 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
         )
     semaphore: asyncio.Semaphore = request.app.state.codex_semaphore
     if semaphore.locked():
-        raise HTTPException(  # ruff: ignore[raise-within-try]
+        raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS, "agent concurrency limit reached"
         )
     await semaphore.acquire()
@@ -381,7 +381,7 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:
                     codex_agent.read_rate_limits(settings.codex_bin), lease
                 )
         except TimeoutError as exc:
-            raise HTTPException(  # ruff: ignore[raise-within-try]
+            raise HTTPException(
                 status.HTTP_504_GATEWAY_TIMEOUT, "Codex rate limits timed out"
             ) from exc
         except HTTPException:
