@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, suppress
 from typing import TYPE_CHECKING, Any, cast
 
@@ -66,7 +67,12 @@ async def client_context(binary: str | None) -> AsyncGenerator[AsyncCodex, None]
     async def cleanup() -> None:
         with suppress(Exception):
             await start
-        await client.close()
+        # A stalled SDK RPC must not prevent its transport from closing.
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            await asyncio.get_running_loop().run_in_executor(
+                executor,
+                client._client._sync.close,  # pyright: ignore[reportPrivateUsage]  # ruff: ignore[private-member-access]
+            )
 
     try:
         await asyncio.shield(start)

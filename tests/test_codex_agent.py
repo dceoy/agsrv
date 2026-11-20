@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, NoReturn
 from unittest.mock import AsyncMock, MagicMock
@@ -20,6 +23,7 @@ from agsrv.main import create_app
 from agsrv.schemas import CodexQueryRequest
 
 if TYPE_CHECKING:
+    import subprocess
     from pathlib import Path
 
 
@@ -36,10 +40,11 @@ class FakeClient:
         )
         self.request = AsyncMock()
         self._client = self
+        self._sync = self
         self.start = AsyncMock()
         self.initialize = AsyncMock(return_value=InitializeResponse(userAgent="test/1"))
 
-    async def close(self) -> None:
+    def close(self) -> None:
         """Close the fake client."""
 
 
@@ -392,6 +397,49 @@ async def test_stalled_initialize_closed_on_deadline(
     assert started.is_set()
     assert closed.is_set()
     assert await asyncio.to_thread(finished.wait, 1)
+
+
+def test_saturated_executor_closes_real_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stalled handshake cannot queue its own shutdown behind itself."""
+    binary = tmp_path / "silent-codex"
+    handshake = tmp_path / "handshake"
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        "import sys, time\n"
+        "sys.stdin.readline()\n"
+        f"open({str(handshake)!r}, 'w').close()\n"
+        "time.sleep(30)\n"
+    )
+    binary.chmod(0o755)
+    client = codex_agent.make_client(str(binary))
+    sync = client._client._sync  # pyright: ignore[reportPrivateUsage]
+    close = sync.close
+    processes: list[subprocess.Popen[str] | None] = []
+
+    def record_close() -> None:
+        processes.append(sync._proc)  # pyright: ignore[reportPrivateUsage]
+        close()
+
+    monkeypatch.setattr(sync, "close", record_close)
+    monkeypatch.setattr(codex_agent, "make_client", MagicMock(return_value=client))
+
+    async def exercise() -> None:
+        loop = asyncio.get_running_loop()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            loop.set_default_executor(executor)
+            started = time.monotonic()
+            with pytest.raises(TimeoutError):
+                async with asyncio.timeout(0.2):
+                    await codex_agent.probe(str(binary))
+            assert time.monotonic() - started < 3
+            assert handshake.exists()
+            assert len(processes) == 1
+            assert processes[0] is not None
+            assert processes[0].poll() is not None
+
+    asyncio.run(exercise())
 
 
 def test_metadata_capacity_timeout_and_schema(
