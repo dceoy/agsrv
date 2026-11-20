@@ -20,6 +20,7 @@ from agsrv.agent import (
     build_options,
     collect_result,
 )
+from agsrv.claude_limits import parse_usage
 from agsrv.config import Settings
 from agsrv.jobs import JobManager
 from agsrv.sandbox import SandboxSetupError, service_home
@@ -309,7 +310,7 @@ async def _codex_query_with_disconnect(
             await watcher
 
 
-def _add_meta_routes(app: FastAPI, settings: Settings) -> None:
+def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[complex-structure]
     """Register the health and info routes."""
 
     @app.get("/health")
@@ -350,7 +351,7 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:
                 "supports": {
                     "sandbox": True,
                     "network_access": False,
-                    "rate_limits": False,
+                    "rate_limits": True,
                     "streaming": False,
                 },
             },
@@ -366,6 +367,45 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:
                 },
             },
         }
+
+    @app.get("/v1/agents/claude/rate-limits", dependencies=[Auth])
+    async def claude_rate_limits(request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        body = QueryRequest(
+            agent="claude",
+            prompt="/usage",
+            allowed_tools=[],
+            max_turns=1,
+            include_messages=False,
+        )
+        options, timeout, semaphore = await _prepare(request, body)
+        options.tools = []
+        try:  # ruff: ignore[too-many-statements-in-try-clause]
+            async with asyncio.timeout(timeout):
+                cwd = resolve_cwd(settings, body.cwd)
+                async with app.state.jobs.workspace(cwd):
+                    stream = app.state.runner.stream(body.prompt, options)
+                    async with aclosing(
+                        cast("AsyncGenerator[Message]", stream)
+                    ) as messages:
+                        result = await collect_result(messages, include_messages=False)
+                if result.is_error:
+                    msg = "Claude rate limits failed"
+                    raise AgentExecutionError(msg)  # ruff: ignore[raise-within-try]
+                return {
+                    **parse_usage(result.result or ""),
+                    "backend": result.model_dump(mode="json"),
+                }
+        except TimeoutError as exc:
+            raise HTTPException(
+                status.HTTP_504_GATEWAY_TIMEOUT, "Claude rate limits timed out"
+            ) from exc
+        except Exception as exc:
+            logger.exception("Claude rate limits failed")
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY, "Claude rate limits failed"
+            ) from exc
+        finally:
+            semaphore.release()
 
     @app.get("/v1/agents/codex/rate-limits", dependencies=[Auth])
     async def rate_limits() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
@@ -394,7 +434,7 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:
                 status.HTTP_502_BAD_GATEWAY, "Codex rate limits failed"
             ) from exc
 
-    _ = (health, info, agents, rate_limits)
+    _ = (health, info, agents, claude_rate_limits, rate_limits)
 
 
 def _add_query_routes(app: FastAPI) -> None:
