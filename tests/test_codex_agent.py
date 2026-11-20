@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi.responses import Response
 from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 from openai_codex.models import InitializeResponse
 from starlette.requests import Request
 
@@ -229,6 +230,8 @@ def test_endpoints(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     app.state.settings = Settings(
         api_key="key", workspace_root=tmp_path, codex_bin=str(tmp_path / "missing")
     )
+    monkeypatch.undo()
+    app.state.codex_probe_expires = 0
     assert client.get("/v1/agents", headers=headers).json()["codex"]["healthy"] is False
 
 
@@ -258,6 +261,47 @@ async def test_probe_coalesces_and_times_out(
     release.clear()
     monkeypatch.setattr(main, "CODEX_PROBE_TIMEOUT", 0.01)
     assert not await main._codex_available(app)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_cached_agents_with_busy_executor_and_probe_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cached health responds while the executor and probe lock remain occupied."""
+    app = create_app(
+        Settings(
+            api_key="key", workspace_root=tmp_path, codex_bin=str(tmp_path / "codex")
+        )
+    )
+    probe = AsyncMock(return_value=True)
+    monkeypatch.setattr(codex_agent, "probe", probe)
+    monkeypatch.setattr(main, "CODEX_PROBE_TIMEOUT", 0.05)
+    release = threading.Event()
+    occupied = threading.Event()
+
+    def block() -> None:
+        occupied.set()
+        release.wait()
+
+    loop = asyncio.get_running_loop()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        loop.set_default_executor(executor)
+        async with AsyncClient(
+            transport=ASGITransport(app=app),
+            base_url="http://test",
+            headers={"Authorization": "Bearer key"},
+        ) as client:
+            assert (await client.get("/v1/agents")).json()["codex"]["healthy"] is True
+            loop.run_in_executor(None, block)
+            assert occupied.wait(1)
+            try:
+                async with app.state.codex_probe_lock:
+                    response = await asyncio.wait_for(client.get("/v1/agents"), 0.5)
+                    assert response.json()["codex"]["healthy"] is True
+                    assert not release.is_set()
+                probe.assert_awaited_once()
+            finally:
+                release.set()
 
 
 @pytest.mark.asyncio

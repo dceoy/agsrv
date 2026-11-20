@@ -7,7 +7,6 @@ import json
 import logging
 import time
 from contextlib import aclosing, asynccontextmanager, suppress
-from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, cast
 
 import anyio
@@ -267,11 +266,10 @@ async def _codex_slot(app: FastAPI) -> AsyncGenerator[None, None]:
 
 async def _codex_available(app: FastAPI, *, slot_held: bool = False) -> bool:
     settings: Settings = app.state.settings
-    if not settings.codex_enabled or (
-        settings.codex_bin is not None
-        and not await asyncio.to_thread(Path(settings.codex_bin).is_file)
-    ):
+    if not settings.codex_enabled:
         return False
+    if time.monotonic() < app.state.codex_probe_expires:
+        return cast("bool", app.state.codex_healthy)
     async with app.state.codex_probe_lock:  # ruff: ignore[too-many-nested-blocks]
         now = time.monotonic()
         if now >= app.state.codex_probe_expires:
