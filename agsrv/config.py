@@ -6,13 +6,10 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
 
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
 _DEFAULT_TOOLS = "Read,Write,Edit,Bash,Glob,Grep"
 
-SandboxMode = Literal["off", "opt-in"]
-_SANDBOX_MODES: tuple[SandboxMode, ...] = ("off", "opt-in")
 DEFAULT_SANDBOX_ALLOWED_DOMAINS: tuple[str, ...] = (
     "github.com",
     "api.github.com",
@@ -62,15 +59,6 @@ def _valid_domain(domain: str) -> bool:
     )
 
 
-def _env_sandbox_mode() -> SandboxMode:
-    raw = os.environ.get("AGSRV_SANDBOX_MODE", "off")
-    for mode in _SANDBOX_MODES:
-        if raw == mode:
-            return mode
-    msg = f"AGSRV_SANDBOX_MODE must be one of off, opt-in; got {raw!r}"
-    raise ValueError(msg)
-
-
 def _env_sandbox_domains() -> tuple[str, ...]:
     raw = os.environ.get("AGSRV_SANDBOX_ALLOWED_DOMAINS")
     if raw is None:
@@ -96,15 +84,17 @@ class Settings:
         default_model: Model used when a request does not specify one.
         permission_mode: Default permission mode for agent runs.
         allowed_tools: Default tool allow-list for agent runs.
-        allow_bypass_permissions: Permit requests using ``bypassPermissions``.
         max_concurrency: Maximum number of simultaneous agent runs.
         max_timeout_seconds: Upper bound (and default) for run duration.
-        sandbox_mode: ``off`` rejects ``sandbox: true`` requests; ``opt-in`` lets
-            requests enable the Bash sandbox.
         sandbox_allowed_domains: Network egress allow-list for sandboxed Bash.
         codex_bin: Optional path to the Codex executable.
         codex_enabled: Whether Codex execution is enabled.
         codex_max_concurrency: Maximum number of simultaneous Codex runs.
+        jobs_db_path: Durable SQLite WAL database (single worker).
+        jobs_max_pending: Maximum queued and running jobs.
+        jobs_retention_seconds: Retention for completed jobs and deduplication keys.
+        jobs_max_payload_bytes: Maximum validated request size.
+        jobs_max_result_bytes: Maximum persisted response size.
     """
 
     api_key: str | None = None
@@ -113,14 +103,19 @@ class Settings:
     default_model: str | None = None
     permission_mode: str = "acceptEdits"
     allowed_tools: tuple[str, ...] = tuple(_DEFAULT_TOOLS.split(","))
-    allow_bypass_permissions: bool = False
     max_concurrency: int = 4
     max_timeout_seconds: float = 3600.0
-    sandbox_mode: SandboxMode = "off"
     sandbox_allowed_domains: tuple[str, ...] = DEFAULT_SANDBOX_ALLOWED_DOMAINS
     codex_bin: str | None = None
     codex_enabled: bool = True
     codex_max_concurrency: int = 2
+    jobs_db_path: Path = field(
+        default_factory=lambda: Path.home() / ".local/state/agsrv/jobs.sqlite3"
+    )
+    jobs_max_pending: int = 32
+    jobs_retention_seconds: int = 86400
+    jobs_max_payload_bytes: int = 65536
+    jobs_max_result_bytes: int = 1048576
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -139,16 +134,32 @@ class Settings:
             default_model=os.environ.get("AGSRV_DEFAULT_MODEL"),
             permission_mode=os.environ.get("AGSRV_PERMISSION_MODE", "acceptEdits"),
             allowed_tools=tuple(t.strip() for t in tools.split(",") if t.strip()),
-            allow_bypass_permissions=_env_bool("AGSRV_ALLOW_BYPASS_PERMISSIONS"),
             max_concurrency=int(os.environ.get("AGSRV_MAX_CONCURRENCY", "4")),
             max_timeout_seconds=float(
                 os.environ.get("AGSRV_MAX_TIMEOUT_SECONDS", "3600")
             ),
-            sandbox_mode=_env_sandbox_mode(),
             sandbox_allowed_domains=_env_sandbox_domains(),
             codex_bin=os.environ.get("AGSRV_CODEX_BIN"),
             codex_enabled=_env_bool("AGSRV_CODEX_ENABLED", default=True),
             codex_max_concurrency=int(
                 os.environ.get("AGSRV_CODEX_MAX_CONCURRENCY", "2")
+            ),
+            jobs_db_path=Path(
+                os.environ.get(
+                    "AGSRV_JOBS_DB_PATH",
+                    str(Path.home() / ".local/state/agsrv/jobs.sqlite3"),
+                )
+            )
+            .expanduser()
+            .resolve(),
+            jobs_max_pending=int(os.environ.get("AGSRV_JOBS_MAX_PENDING", "32")),
+            jobs_retention_seconds=int(
+                os.environ.get("AGSRV_JOBS_RETENTION_SECONDS", "86400")
+            ),
+            jobs_max_payload_bytes=int(
+                os.environ.get("AGSRV_JOBS_MAX_PAYLOAD_BYTES", "65536")
+            ),
+            jobs_max_result_bytes=int(
+                os.environ.get("AGSRV_JOBS_MAX_RESULT_BYTES", "1048576")
             ),
         )

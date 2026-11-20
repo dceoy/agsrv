@@ -32,7 +32,7 @@ No authentication.
 
 ```json
 {
-  "version": "0.2.0",
+  "version": "0.3.0",
   "stateless": true,
   "default_model": null,
   "workspace_root": "/srv/workspaces",
@@ -40,7 +40,6 @@ No authentication.
   "default_allowed_tools": ["Read", "Write", "Edit", "Bash", "Glob", "Grep"],
   "max_concurrency": 4,
   "auth_required": true,
-  "sandbox_mode": "off",
   "sandbox_allowed_domains": ["github.com", "api.github.com", "codeload.github.com", "uploads.github.com", "raw.githubusercontent.com", "objects.githubusercontent.com", "release-assets.githubusercontent.com", "pypi.org", "files.pythonhosted.org", "registry.npmjs.org"]
 }
 ```
@@ -53,28 +52,23 @@ Claude request (`agent` and `prompt` are required):
 {
   "agent": "claude",
   "prompt": "List the Python files",
-  "system_prompt": null,
   "model": null,
   "cwd": "myproject",
   "allowed_tools": ["Read", "Glob"],
-  "disallowed_tools": null,
   "permission_mode": "default",
   "max_turns": 5,
-  "max_budget_usd": 1.0,
   "effort": "low",
   "timeout_seconds": 300,
   "include_messages": true,
-  "sandbox": false
+  "sandbox": true
 }
 ```
 
 - `include_messages`: when `false`, the response omits the transcript (`messages`
-  is `[]`); intended for result-only clients. It has no effect on
-  `/v1/query/stream`.
-- `sandbox`: when `true`, runs Bash inside the fail-closed CLI sandbox. Requires
-  `AGSRV_SANDBOX_MODE=opt-in`; otherwise the request is rejected with 403. If
-  the sandbox cannot start the run fails (502, or an error result). Clients must
-  not retry such a failure with `sandbox: false`. The request is also rejected
+  is `[]`); intended for result-only clients.
+- `sandbox`: defaults to `true`, running Bash inside the fail-closed CLI
+  sandbox. Only explicit `false` opts out for host-control operations. Never
+  retry a failed sandboxed run with `sandbox: false`. Requests are rejected
   with 403 if the effective permission mode (request value, else the server
   default) is `auto` or `bypassPermissions` (incompatible with the sandbox's
   egress allow-list), or if the resolved `cwd` overlaps the shared cache: it is
@@ -83,15 +77,13 @@ Claude request (`agent` and `prompt` are required):
   be established (unknown home, unusable cache directory, missing bundled CLI)
   the response is 503.
 - `cwd`: relative to `AGSRV_WORKSPACE_ROOT`, or absolute inside it.
-- `system_prompt`: when omitted, the run uses the Claude Code preset system
-  prompt. Send a string to replace it.
 - `allowed_tools`: an auto-approve list, not a restriction. It names tools the
   run may use without a permission decision; it does not remove other tools,
   and file edits are still approved under `acceptEdits`. When omitted, the
   server default (`AGSRV_ALLOWED_TOOLS`) applies — a default, not a ceiling.
 - `permission_mode`: `default`, `acceptEdits`, `plan`, `bypassPermissions`
-  (requires server opt-in), `dontAsk`, `auto`.
-- `max_turns`: 1–1000. `max_budget_usd` and `timeout_seconds` must be > 0;
+  (always rejected with 403), `dontAsk`, `auto`.
+- `max_turns`: 1–1000. `timeout_seconds` must be > 0;
   `timeout_seconds` may not exceed `AGSRV_MAX_TIMEOUT_SECONDS`.
 
 If a Claude client disconnects, the run is promptly cancelled and its concurrency
@@ -198,36 +190,60 @@ Returns `plan`, `primary` and `secondary` windows (`used_percent` and
 `resets_at`), `reached_type`, `reset_credits`, and the raw SDK payload in
 `backend`. Missing windows are null.
 
-## `POST /v1/query/stream`
+## Durable asynchronous jobs
 
-Claude request body only (`agent: "claude"`). All validation (auth, `cwd`, permissions, concurrency)
-happens before streaming starts, so those failures are ordinary HTTP errors.
-The response is `text/event-stream`; each SDK message is one event:
+`POST /v1/jobs` accepts the same discriminated Claude/Codex JSON body as
+`/v1/query`. Unlike synchronous queries, the server owns execution after the
+202 response and continues across HTTP disconnects. Example:
 
-```text
-data: {"type": "system", "subtype": "init", "data": {}}
+```http
+POST /v1/jobs
+Authorization: Bearer <AGSRV_API_KEY>
+Idempotency-Key: vm-task-123
+Content-Type: application/json
 
-data: {"type": "assistant", "content": [...]}
-
-data: {"type": "result", "subtype": "success", "result": "..."}
+{"agent":"claude","prompt":"Analyze the repository","cwd":"myproject"}
 ```
 
-If the runner fails or times out mid-stream, one final event is sent and the
-stream ends:
+Returns 202: `{"job_id":"<opaque UUID>","status_url":"/v1/jobs/<id>"}`.
+The optional `Idempotency-Key` (1–128 printable ASCII chars) is scoped to the
+bearer principal. Identical validated requests reuse the job ID even on retries
+after a VM is destroyed. A conflicting payload returns 409; once the terminal
+record expires, key reuse can create a new job.
 
-```text
-data: {"type": "error", "detail": "agent run timed out"}
-```
+`GET /v1/jobs/{job_id}` returns `job_id`, `agent`, `status`,
+`created_at`, `started_at`, `finished_at`, `result`, and `error`.
+Statuses are `queued`, `running`, `succeeded`, `failed`, `cancelled`,
+or `interrupted`. `result` contains the normalized Claude or Codex response
+only on completion. Agent-level errors become `failed` with a retained result;
+transport failures and deadlines have sanitized `error.code` values.
+`POST /v1/jobs/{job_id}/cancel` is idempotent: queued jobs stop immediately,
+running jobs remain nonterminal until their child processes are cleaned up.
 
-Treat a run as successful only when a `result` event arrives. A stream that
-ends without one — including a run whose message stream stops early — closes
-with an `error` event instead. During idle periods the stream sends an SSE
-comment `: heartbeat` every 15 seconds; clients must ignore comment lines.
-Disconnecting
-from this endpoint cancels the run and releases its slot. The run deadline also
-cancels the run and releases its slot if the client stops reading. For an
-abandoned stream, the run timeout initiates cancellation, but awaited SDK
-shutdown can extend beyond it.
+The job database is SQLite WAL; it must be on durable storage accessible to a
+**single uvicorn worker**. An exclusive lock file alongside the database
+prevents concurrent workers or overlapping instances from taking ownership. The default path is
+`~/.local/state/agsrv/jobs.sqlite3` (overridden by `AGSRV_JOBS_DB_PATH`).
+Nonterminal jobs are limited by `AGSRV_JOBS_MAX_PENDING=32`, canonical
+requests by `AGSRV_JOBS_MAX_PAYLOAD_BYTES=65536`, stored results by
+`AGSRV_JOBS_MAX_RESULT_BYTES=1048576`; saturation gives 429 and
+`Retry-After: 5`. Terminal jobs and idempotency keys are retained for
+`AGSRV_JOBS_RETENTION_SECONDS=86400` (24 hours). Garbage collection is
+performed during API access. Synchronous queries and jobs targeting overlapping
+workspaces cannot execute concurrently. When a result exceeds the configured
+cap, message history is omitted with `messages_truncated: true` while keeping
+the final answer. If the core result is still oversized, a minimal summary is
+stored with `result_truncated: true` so the original execution outcome is not
+misreported. Extremely small caps that cannot fit this summary result in
+`failed` / `result_too_large`. The bearer token is the caller identity: **all clients sharing
+the same API key can read the same jobs**; use separate server credentials and
+instances if isolation between clients is needed. No raw internal errors or
+credentials are included in job status.
+
+The in-process scheduler **does not guarantee completion across a server
+restart**. On restart both queued and running jobs become `interrupted`
+without replaying side effects; completed results remain until expiry.
+The old SSE stream endpoint is deliberately removed.
 
 ## Errors
 
@@ -235,9 +251,12 @@ shutdown can extend beyond it.
 | ------ | ---------------------------------------------------------------------- |
 | 400    | `cwd` missing or not a directory; `timeout_seconds` above server max   |
 | 401    | Missing or incorrect bearer token                                      |
-| 403    | `cwd` outside workspace root; `bypassPermissions` not enabled; `sandbox: true` while `AGSRV_SANDBOX_MODE=off`, with an egress-expanding permission mode (`auto`, `bypassPermissions`), or with a `cwd` overlapping the shared cache (`~/.cache` outside `~/.cache/agsrv-sandbox`, or an ancestor such as the home directory) |
+| 403    | `cwd` outside workspace root; `bypassPermissions` always forbidden; with an egress-expanding permission mode (`auto`, `bypassPermissions`), or with a `cwd` overlapping the shared cache (`~/.cache` outside `~/.cache/agsrv-sandbox`, or an ancestor such as the home directory) |
+| 409    | Idempotency-Key reused with a different job payload                  |
+| 413    | Durable job payload too large                                         |
+| 404    | Job not found or not authorized for this caller                       |
 | 422    | Invalid body (empty prompt, unknown/stateful fields, bad ranges)       |
-| 429    | Concurrency limit reached (decided before sandbox setup, so it takes precedence over sandbox-setup 503s) |
+| 429    | Concurrency or pending-job capacity reached (jobs include Retry-After) |
 | 502    | SDK/CLI failure, or the run ended without a result message             |
 | 503    | `AGSRV_API_KEY` not configured and unauthenticated access not allowed; sandbox prerequisites unavailable or Codex disabled/unavailable |
 | 504    | Run exceeded its timeout                                               |

@@ -17,18 +17,15 @@ class QueryRequest(BaseModel):
 
     agent: Literal["claude"]
     prompt: str = Field(min_length=1)
-    system_prompt: str | None = None
     model: str | None = None
     cwd: str | None = None
     allowed_tools: list[str] | None = None
-    disallowed_tools: list[str] | None = None
     permission_mode: PermissionMode | None = None
     max_turns: int | None = Field(default=None, ge=1, le=1000)
-    max_budget_usd: float | None = Field(default=None, gt=0)
     effort: EffortLevel | None = None
     timeout_seconds: float | None = Field(default=None, gt=0)
     include_messages: bool = True
-    sandbox: bool = False
+    sandbox: bool = True
 
 
 class CodexOptions(BaseModel):
@@ -94,5 +91,4 @@ class InfoResponse(BaseModel):
     default_allowed_tools: list[str]
     max_concurrency: int
     auth_required: bool
-    sandbox_mode: str
     sandbox_allowed_domains: list[str]

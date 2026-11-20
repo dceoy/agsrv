@@ -98,7 +98,7 @@ EGRESS_EXPANDING_MODES = frozenset({"auto", "bypassPermissions"})
 def check_sandbox_request(
     settings: Settings, requested: bool, permission_mode: str | None = None
 ) -> None:
-    """Reject sandboxed runs that are disabled or could widen network egress.
+    """Reject sandboxed runs that could widen network egress.
 
     Args:
         settings: Server settings.
@@ -107,16 +107,10 @@ def check_sandbox_request(
             default applies when omitted.
 
     Raises:
-        HTTPException: 403 if the sandbox is requested while disabled, or if the
-            effective permission mode can expand network egress.
+        HTTPException: 403 if the effective permission mode can expand egress.
     """
     if not requested:
         return
-    if settings.sandbox_mode == "off":
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "sandbox is disabled (AGSRV_SANDBOX_MODE=off)",
-        )
     mode = permission_mode or settings.permission_mode
     if mode in EGRESS_EXPANDING_MODES:
         raise HTTPException(
@@ -151,7 +145,7 @@ def check_sandbox_cwd(cwd: Path, home: Path) -> None:
 
 
 def check_permission_mode(settings: Settings, requested: str | None) -> str:
-    """Reject ``bypassPermissions`` unless explicitly enabled.
+    """Reject the unsafe ``bypassPermissions`` mode unconditionally.
 
     Args:
         settings: Server settings.
@@ -164,9 +158,9 @@ def check_permission_mode(settings: Settings, requested: str | None) -> str:
         HTTPException: 403 if bypassPermissions is not allowed.
     """
     mode = requested or settings.permission_mode
-    if mode == "bypassPermissions" and not settings.allow_bypass_permissions:
+    if mode == "bypassPermissions":
         raise HTTPException(
             status.HTTP_403_FORBIDDEN,
-            "bypassPermissions is disabled (AGSRV_ALLOW_BYPASS_PERMISSIONS)",
+            "bypassPermissions is not supported",
         )
     return mode

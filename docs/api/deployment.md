@@ -30,8 +30,7 @@ AGSRV_ALLOW_UNAUTHENTICATED=true uv run uvicorn agsrv.main:app --host 127.0.0.1 
 
 4. Run uvicorn on loopback or a private interface, and expose it only through
    TLS (a reverse proxy) or a private network such as Tailscale or an SSH
-   tunnel (`ssh -L 8000:127.0.0.1:8000 server`). Disable proxy response
-   buffering for `/v1/query/stream` (agsrv sends `X-Accel-Buffering: no`).
+   tunnel (`ssh -L 8000:127.0.0.1:8000 server`).
 
 5. Run it as an unprivileged user that owns only the workspace directory.
    Workspace confinement limits the starting `cwd`, not what `Bash` can reach.
@@ -39,7 +38,9 @@ AGSRV_ALLOW_UNAUTHENTICATED=true uv run uvicorn agsrv.main:app --host 127.0.0.1 
    `AGSRV_API_KEY` and `ANTHROPIC_API_KEY` from its own environment — the
    API key is effectively a shell as this user (see the README security
    model). The concurrency limit is per process: running uvicorn with
-   `--workers N` multiplies `AGSRV_MAX_CONCURRENCY` by N.
+   `--workers N` multiplies `AGSRV_MAX_CONCURRENCY` by N. The durable job
+   queue currently requires **exactly one worker** for a database. Store
+   `AGSRV_JOBS_DB_PATH` on persistent storage with restricted permissions.
 
 ### systemd unit
 
@@ -60,9 +61,10 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 ```
 
-### Bash sandbox (optional)
+### Bash sandbox (enabled by default)
 
-Runs that send `sandbox: true` execute Bash inside the Claude CLI sandbox.
+Claude runs use the fail-closed CLI Bash sandbox by default. Explicit
+`sandbox: false` is reserved for host-control tasks that must bypass it.
 
 - Prerequisites on the host: `bwrap` (bubblewrap), `socat`, and `rg` (ripgrep).
 - Sandboxed runs are pinned to the CLI bundled with the installed
@@ -78,26 +80,35 @@ Runs that send `sandbox: true` execute Bash inside the Claude CLI sandbox.
   a real directory owned by the service user (symlinks are rejected). Its mode
   is set to and verified as exactly 0700, and `~/.cache` itself must not be
   group- or other-writable; otherwise requests fail with 503.
-- `AGSRV_SANDBOX_MODE` accepts exactly `off` or `opt-in`; anything else aborts
-  startup.
 - The sandbox is fail-closed. On Ubuntu releases that ship the
   `bwrap-userns-restrict` AppArmor profile, the sandbox's seccomp helper cannot
   start, so `sandbox: true` requests fail until the host policy is adjusted
   (for example with a dedicated, AppArmor-profiled copy of `bwrap` placed first
   on the service `PATH`). Do not weaken this by disabling the sandbox checks.
 
-To enable it:
+Before deployment, run an acceptance probe with the default (sandboxed) run:
 
-1. Set `AGSRV_SANDBOX_MODE=opt-in` (optionally
-   `AGSRV_SANDBOX_ALLOWED_DOMAINS`) and restart the service.
-2. Run an acceptance probe with `sandbox: true`: `echo ok` succeeds; writes
+1. Verify `AGSRV_SANDBOX_ALLOWED_DOMAINS` permits only required hosts.
+2. Run a request without a `sandbox` field: `echo ok` succeeds; writes
    outside the working directory and the sandbox cache are denied; secret
    directories such as `~/.ssh` are unreadable; `env` shows no
    `AGSRV_API_KEY`; `curl` to a non-allow-listed host is denied; and
    `systemctl --user status` fails.
 
-Clients must never retry a failed `sandbox: true` request with
+Clients must never retry a failed default sandbox request with
 `sandbox: false`; that would reintroduce fail-open behaviour.
+
+### Durable jobs
+
+Use the same long-lived API key on replacement Muse VMs and submit jobs with a
+stable `Idempotency-Key`. Poll `GET /v1/jobs/{job_id}` without holding open a
+connection. Back up the SQLite WAL database (including its WAL file) and avoid
+multi-worker uvicorn: an exclusive sibling lock file rejects concurrent
+processes sharing the database. Synchronous queries share the same workspace
+lease as queued jobs. Jobs are in-process: a server restart marks uncompleted
+jobs `interrupted` and never retries them automatically. Default completed-job
+retention is 24 hours. All holders of the same bearer token can inspect jobs
+created with that token; do not share credentials across untrusted tenants.
 
 ### Client smoke test
 

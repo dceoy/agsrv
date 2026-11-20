@@ -3,16 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from contextlib import aclosing, asynccontextmanager, suppress
 from typing import TYPE_CHECKING, Annotated, Any, TypeVar, cast
 
-import anyio
-from claude_agent_sdk import ResultError, ResultMessage
-from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import Response, StreamingResponse
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi.responses import Response
 from pydantic import Field
 
 from agsrv import codex_agent
@@ -22,9 +19,9 @@ from agsrv.agent import (
     SdkAgentRunner,
     build_options,
     collect_result,
-    message_to_dict,
 )
 from agsrv.config import Settings
+from agsrv.jobs import JobManager
 from agsrv.sandbox import SandboxSetupError, service_home
 from agsrv.schemas import (
     CodexQueryRequest,
@@ -42,19 +39,17 @@ from agsrv.security import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator, Coroutine
+    from collections.abc import AsyncGenerator, Coroutine
 
     from claude_agent_sdk import ClaudeAgentOptions, Message
-    from starlette.types import Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 DISCONNECT_POLL_INTERVAL = 0.1
-HEARTBEAT_INTERVAL = 15.0
 CODEX_PROBE_TIMEOUT = 10.0
 
-# Keep detached cleanup alive if the response task is externally cancelled.
+# Keep detached Codex cleanup alive if the request task is cancelled.
 _pump_tasks: set[asyncio.Task[Any]] = set()
 
 T = TypeVar("T")
@@ -116,33 +111,6 @@ async def _prepare(
     return options, timeout, semaphore
 
 
-def _error_event(detail: str) -> str:
-    return f"data: {json.dumps({'type': 'error', 'detail': detail})}\n\n"
-
-
-async def _stream_events(stream: AsyncIterator[Message]) -> AsyncGenerator[str]:
-    """Serialize SDK messages and close the stream.
-
-    Yields:
-        Serialized SSE events.
-
-    Raises:
-        ResultError: If no result was received.
-    """
-    seen_result = False
-    async with aclosing(cast("AsyncGenerator[Message]", stream)) as messages:
-        try:
-            async for message in messages:
-                if isinstance(message, ResultMessage):
-                    seen_result = True
-                yield f"data: {json.dumps(message_to_dict(message))}\n\n"  # ruff: ignore[yield-in-context-manager-in-async-generator]  # closed by the pump
-        except ResultError:
-            if not seen_result:
-                raise
-    if not seen_result:
-        yield _error_event("agent stream ended without a result message")
-
-
 class _SlotLease:
     """Release an acquired semaphore slot at most once."""
 
@@ -156,92 +124,6 @@ class _SlotLease:
         if not self.released:
             self.released = True
             self.semaphore.release()
-
-
-async def _events(  # ruff: ignore[complex-structure]  # pump and consumer share lifecycle
-    agent_runner: AgentRunner,
-    prompt: str,
-    options: ClaudeAgentOptions,
-    run_timeout: float,
-    lease: _SlotLease,
-) -> AsyncIterator[str]:
-    """Pump events with a deadline independent of response consumption.
-
-    Yields:
-        Serialized SSE events.
-    """
-    lease.claimed = True
-    queue: asyncio.Queue[str | None] = asyncio.Queue(maxsize=1)
-    started = False
-    closing = False
-
-    async def pump() -> None:
-        nonlocal closing, started
-        started = True
-        terminal: str | None = None
-        try:
-            async with asyncio.timeout(run_timeout):
-                stream = agent_runner.stream(prompt, options)
-                async with aclosing(_stream_events(stream)) as serialized:
-                    async for event in serialized:
-                        await queue.put(event)
-        except TimeoutError:
-            terminal = _error_event("agent run timed out")
-        except Exception:
-            logger.exception("agent execution failed")
-            terminal = _error_event("agent execution failed")
-        finally:
-            lease.release()
-        if closing:
-            return
-        if terminal is not None:
-            await queue.put(terminal)
-        await queue.put(None)
-
-    task = asyncio.create_task(pump())
-    _pump_tasks.add(task)
-    task.add_done_callback(_pump_tasks.discard)
-    try:
-        while True:
-            try:
-                event = await asyncio.wait_for(queue.get(), HEARTBEAT_INTERVAL)
-            except TimeoutError:
-                yield ": heartbeat\n\n"
-                continue
-            if event is None:
-                break
-            yield event
-    finally:
-        closing = True
-        task.cancel()
-        with anyio.CancelScope(shield=True), suppress(asyncio.CancelledError):
-            await asyncio.shield(task)
-        if not started:
-            lease.release()
-
-
-class _ClosingStreamingResponse(StreamingResponse):
-    """Close the event generator even when sending the response is cancelled."""
-
-    def __init__(self, content: AsyncIterator[str], *, lease: _SlotLease) -> None:
-        super().__init__(
-            content,
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
-        self.lease = lease
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        """Run the response and await generator cleanup on every exit."""
-        try:
-            await super().__call__(scope, receive, send)
-        finally:
-            try:
-                with anyio.CancelScope(shield=True):
-                    await cast("AsyncGenerator[str]", self.body_iterator).aclose()
-            finally:
-                if not self.lease.claimed:
-                    self.lease.release()
 
 
 @asynccontextmanager
@@ -364,6 +246,19 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
         )
     await semaphore.acquire()
     lease = _SlotLease(semaphore)
+
+    async def execute() -> dict[str, Any]:
+        async with request.app.state.jobs.workspace(cwd):
+            return await codex_agent.run_codex(
+                prompt=body.prompt,
+                cwd=str(cwd),
+                model=body.model,
+                effort=body.effort,
+                sandbox=body.options.sandbox,
+                network_access=body.options.network_access,
+                binary=settings.codex_bin,
+            )
+
     try:
         async with asyncio.timeout(timeout):
             if not await _codex_available(request.app, lease=lease):
@@ -371,18 +266,7 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
                     status.HTTP_503_SERVICE_UNAVAILABLE,
                     "Codex is disabled or unavailable",
                 )
-            return await _await_codex(
-                codex_agent.run_codex(
-                    prompt=body.prompt,
-                    cwd=str(cwd),
-                    model=body.model,
-                    effort=body.effort,
-                    sandbox=body.options.sandbox,
-                    network_access=body.options.network_access,
-                    binary=settings.codex_bin,
-                ),
-                lease,
-            )
+            return await _await_codex(execute(), lease)
     except TimeoutError as exc:
         raise HTTPException(
             status.HTTP_504_GATEWAY_TIMEOUT, "agent run timed out"
@@ -453,7 +337,6 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:
             default_allowed_tools=list(settings.allowed_tools),
             max_concurrency=settings.max_concurrency,
             auth_required=bool(settings.api_key and settings.api_key.strip()),
-            sandbox_mode=settings.sandbox_mode,
             sandbox_allowed_domains=list(settings.sandbox_allowed_domains),
         )
 
@@ -468,7 +351,7 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:
                     "sandbox": True,
                     "network_access": False,
                     "rate_limits": False,
-                    "streaming": True,
+                    "streaming": False,
                 },
             },
             "codex": {
@@ -514,7 +397,7 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:
     _ = (health, info, agents, rate_limits)
 
 
-def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure]
+def _add_query_routes(app: FastAPI) -> None:
     """Register the agent execution routes."""
 
     @app.post(
@@ -551,7 +434,7 @@ def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure]
 
         async def watch_disconnect() -> None:
             nonlocal client_gone
-            while not await request.is_disconnected():  # ruff: ignore[async-busy-wait]  # ASGI disconnect polling
+            while not await request.is_disconnected():  # ASGI disconnect polling  # ruff: ignore[async-busy-wait]
                 await asyncio.sleep(DISCONNECT_POLL_INTERVAL)
             logger.info("client disconnected; cancelling agent run")
             client_gone = True
@@ -560,13 +443,15 @@ def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure]
         watcher = asyncio.create_task(watch_disconnect())
         try:
             async with asyncio.timeout(timeout):
-                stream = agent_runner.stream(body.prompt, options)
-                async with aclosing(
-                    cast("AsyncGenerator[Message]", stream)
-                ) as messages:
-                    return await collect_result(
-                        messages, include_messages=body.include_messages
-                    )
+                cwd = resolve_cwd(request.app.state.settings, body.cwd)
+                async with request.app.state.jobs.workspace(cwd):
+                    stream = agent_runner.stream(body.prompt, options)
+                    async with aclosing(
+                        cast("AsyncGenerator[Message]", stream)
+                    ) as messages:
+                        return await collect_result(
+                            messages, include_messages=body.include_messages
+                        )
         except asyncio.CancelledError:
             if client_gone and task.uncancel() == 0:
                 return Response(status_code=499)
@@ -590,29 +475,53 @@ def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure]
             finally:
                 semaphore.release()
 
-    @app.post("/v1/query/stream", dependencies=[Auth])
-    async def run_query_stream(  # pyright: ignore[reportUnusedFunction]
-        body: QueryRequest, request: Request
-    ) -> StreamingResponse:
-        """Run one ephemeral agent query and stream messages as SSE.
+    _ = run_query
 
-        Args:
-            body: Query request.
-            request: Incoming request.
 
-        Returns:
-            Server-sent events, one per SDK message.
-        """
-        options, timeout, semaphore = await _prepare(request, body)
-        agent_runner: AgentRunner = request.app.state.runner
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncGenerator[None]:
+    """Open the durable queue and stop all owned jobs on shutdown."""
+    app.state.jobs.start()
+    try:
+        yield
+    finally:
+        await app.state.jobs.stop()
 
-        lease = _SlotLease(semaphore)
-        return _ClosingStreamingResponse(
-            _events(agent_runner, body.prompt, options, timeout, lease),
-            lease=lease,
+
+def _add_job_routes(app: FastAPI) -> None:
+    """Register durable polling and cancellation endpoints."""
+
+    @app.post("/v1/jobs", dependencies=[Auth], status_code=status.HTTP_202_ACCEPTED)
+    async def submit_job(  # pyright: ignore[reportUnusedFunction]
+        body: Annotated[QueryRequest | CodexQueryRequest, Field(discriminator="agent")],
+        request: Request,
+        idempotency_key: Annotated[str | None, Header()] = None,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        return cast(
+            "dict[str, Any]",
+            request.app.state.jobs.submit(body, authorization, idempotency_key),
         )
 
-    _ = (run_query, run_query_stream)
+    @app.get("/v1/jobs/{job_id}", dependencies=[Auth])
+    async def get_job(  # pyright: ignore[reportUnusedFunction]
+        job_id: str,
+        request: Request,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        return cast("dict[str, Any]", request.app.state.jobs.get(job_id, authorization))
+
+    @app.post("/v1/jobs/{job_id}/cancel", dependencies=[Auth])
+    async def cancel_job(  # pyright: ignore[reportUnusedFunction]
+        job_id: str,
+        request: Request,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        return cast(
+            "dict[str, Any]", request.app.state.jobs.cancel(job_id, authorization)
+        )
+
+    _ = (submit_job, get_job, cancel_job)
 
 
 def create_app(
@@ -632,6 +541,7 @@ def create_app(
         title="agsrv",
         description="Stateless HTTP API for remote Claude Code execution.",
         version=VERSION,
+        lifespan=_lifespan,
     )
     app.state.settings = settings
     app.state.runner = runner or SdkAgentRunner()
@@ -640,8 +550,10 @@ def create_app(
     app.state.codex_probe_lock = asyncio.Lock()
     app.state.codex_probe_expires = 0.0
     app.state.codex_healthy = False
+    app.state.jobs = JobManager(app)
     _add_meta_routes(app, settings)
     _add_query_routes(app)
+    _add_job_routes(app)
     return app
 
 
