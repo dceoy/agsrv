@@ -310,7 +310,7 @@ async def _codex_query_with_disconnect(
             await watcher
 
 
-def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[complex-structure]
+def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[complex-structure,too-many-statements]
     """Register the health and info routes."""
 
     @app.get("/health")
@@ -368,8 +368,12 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
             },
         }
 
-    @app.get("/v1/agents/claude/rate-limits", dependencies=[Auth])
-    async def claude_rate_limits(request: Request) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+    @app.get(
+        "/v1/agents/claude/rate-limits",
+        dependencies=[Auth],
+        response_model=dict[str, Any],
+    )
+    async def claude_rate_limits(request: Request) -> dict[str, Any] | Response:  # pyright: ignore[reportUnusedFunction]
         body = QueryRequest(
             agent="claude",
             prompt="/usage",
@@ -379,6 +383,17 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
         )
         options, timeout, semaphore = await _prepare(request, body)
         options.tools = []
+        task = cast("asyncio.Task[object]", asyncio.current_task())
+        client_gone = False
+
+        async def watch_disconnect() -> None:
+            nonlocal client_gone
+            while not await request.is_disconnected():  # ruff: ignore[async-busy-wait]
+                await asyncio.sleep(DISCONNECT_POLL_INTERVAL)
+            client_gone = True
+            task.cancel()
+
+        watcher = asyncio.create_task(watch_disconnect())
         try:  # ruff: ignore[too-many-statements-in-try-clause]
             async with asyncio.timeout(timeout):
                 cwd = resolve_cwd(settings, body.cwd)
@@ -395,6 +410,10 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
                     **parse_usage(result.result or ""),
                     "backend": result.model_dump(mode="json"),
                 }
+        except asyncio.CancelledError:
+            if client_gone and task.uncancel() == 0:
+                return Response(status_code=499)
+            raise
         except TimeoutError as exc:
             raise HTTPException(
                 status.HTTP_504_GATEWAY_TIMEOUT, "Claude rate limits timed out"
@@ -405,7 +424,12 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
                 status.HTTP_502_BAD_GATEWAY, "Claude rate limits failed"
             ) from exc
         finally:
-            semaphore.release()
+            watcher.cancel()
+            try:
+                with suppress(asyncio.CancelledError):
+                    await watcher
+            finally:
+                semaphore.release()
 
     @app.get("/v1/agents/codex/rate-limits", dependencies=[Auth])
     async def rate_limits() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]

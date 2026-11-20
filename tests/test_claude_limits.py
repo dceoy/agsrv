@@ -3,21 +3,27 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 from unittest.mock import MagicMock
 
+import pytest
 from claude_agent_sdk import ResultMessage
+from fastapi import Request
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
+from agsrv import main
 from agsrv.claude_limits import parse_usage
 from agsrv.config import Settings
-from agsrv.main import create_app
-from tests.test_main import FakeRunner
+from agsrv.main import VERSION, create_app
+from tests.test_main import CleanupRunner, FakeRunner
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from collections.abc import AsyncGenerator
 
 
 NOW = datetime(2026, 11, 20, 18, 0, tzinfo=UTC)
@@ -118,3 +124,99 @@ def test_endpoint(tmp_path: Path) -> None:
         ]
         is True
     )
+
+
+def test_dst_rollover_and_gap() -> None:
+    """Compare instants across DST and reject nonexistent local reset times."""
+    rollover = parse_usage(
+        "Current session: 12% used · resets Nov 1, 12:15am (America/New_York)",
+        datetime(2026, 11, 1, 16, 45, tzinfo=UTC),
+    )
+    assert rollover["five_hour"]["resets_at"] == "2027-11-01T00:15:00-04:00"
+    gap = parse_usage(
+        "Current session: 12% used · resets Mar 8, 2:30am (America/New_York)",
+        datetime(2026, 3, 8, 5, 0, tzinfo=UTC),
+    )
+    assert gap["five_hour"] == {"used_percent": 12, "resets_at": None}
+
+
+def test_invalid_percentages_and_timezone() -> None:
+    """Malformed lines cannot suppress other valid usage windows."""
+    for invalid in ("101", "9" * 4301):
+        raw = f"Current session: {invalid}% used\nCurrent week (Opus): 100% used"
+        result = parse_usage(raw, NOW)
+        assert result["five_hour"] is None
+        assert result["seven_day_opus"]["used_percent"] == 100
+        assert not parse_usage(f"Current session: {invalid}% used", NOW)["available"]
+    raw = f"Current session: 0% used · resets Dec 1, 1:00pm ({'x' * 300})"
+    assert parse_usage(raw, NOW)["five_hour"] == {
+        "used_percent": 0,
+        "resets_at": "2026-12-01T13:00:00+00:00",
+    }
+
+
+def test_documented_info_version() -> None:
+    """The REST example tracks the running API version."""
+    docs = Path("docs/api/rest-api.md").read_text(encoding="utf-8")
+    assert f'"version": "{VERSION}"' in docs
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("waiting", "external"), [(False, False), (True, False), (False, True)]
+)
+async def test_disconnect_quota_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, waiting: bool, external: bool
+) -> None:
+    """Disconnect cancels either workspace waiting or an active usage stream."""
+    runner = CleanupRunner()
+    app = create_app(
+        Settings(api_key="key", workspace_root=tmp_path, max_concurrency=1), runner
+    )
+    original_prepare = main._prepare  # pyright: ignore[reportPrivateUsage]
+
+    async def prepare(request: Request, body: Any) -> Any:  # ruff: ignore[any-type]
+        body.sandbox = False
+        return await original_prepare(request, body)
+
+    monkeypatch.setattr(main, "_prepare", prepare)
+    monkeypatch.setattr(main, "DISCONNECT_POLL_INTERVAL", 0.01)
+    disconnected = False
+
+    async def receive() -> dict[str, str]:
+        if disconnected:
+            return {"type": "http.disconnect"}
+        await asyncio.Event().wait()
+        return {"type": "http.disconnect"}
+
+    endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if isinstance(route, APIRoute) and route.path == "/v1/agents/claude/rate-limits"
+    )
+    request = Request({"type": "http", "app": app}, receive)
+    async with app.state.jobs.workspace(tmp_path) if waiting else _empty_context():
+        task = asyncio.create_task(endpoint(request))
+        if waiting:
+            while not app.state.semaphore.locked():  # ruff: ignore[async-busy-wait]
+                await asyncio.sleep(0.01)
+        else:
+            await asyncio.wait_for(runner.started.wait(), 1)
+        if external:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 1)
+        else:
+            disconnected = True
+            response = await asyncio.wait_for(task, 1)
+            assert response.status_code == 499
+        assert not app.state.semaphore.locked()
+        if waiting:
+            assert not runner.started.is_set()
+        else:
+            assert runner.closed.is_set()
+
+
+@asynccontextmanager
+async def _empty_context() -> AsyncGenerator[None, None]:
+    yield

@@ -8,13 +8,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+_MAX_PERCENT = 100
 _LABELS = {
     "Current session": "five_hour",
     "Current week (all models)": "seven_day",
     "Current week (Opus)": "seven_day_opus",
     "Current week (Sonnet)": "seven_day_sonnet",
 }
-_LINE = re.compile(r"^(.+?):\s*(\d+)% used(?:\s*·\s*resets\s*(.*))?\s*$")
+_LINE = re.compile(r"^(.+?):\s*(\d{1,3})% used(?:\s*·\s*resets\s*(.*))?\s*$")
 _ZONE = re.compile(r"\s*\(([^()]*)\)\s*$")
 
 
@@ -22,7 +23,7 @@ def _reset(value: str, now: datetime) -> str | None:
     zone_match = _ZONE.search(value)
     zone = UTC
     if zone_match:
-        with suppress(ZoneInfoNotFoundError, ValueError):
+        with suppress(ZoneInfoNotFoundError, ValueError, OSError):
             zone = ZoneInfo(zone_match.group(1))
         value = value[: zone_match.start()]
     local_now = now.astimezone(zone)
@@ -30,9 +31,13 @@ def _reset(value: str, now: datetime) -> str | None:
         result = datetime.strptime(  # timezone is attached below
             f"{value.strip()} {local_now.year}", "%b %d, %I:%M%p %Y"
         ).replace(tzinfo=zone)
-        if result < local_now - timedelta(hours=12):
+        if result.astimezone(UTC) < now.astimezone(UTC) - timedelta(hours=12):
             result = result.replace(year=result.year + 1)
     except ValueError:
+        return None
+    if result.astimezone(UTC).astimezone(zone).replace(tzinfo=None) != result.replace(
+        tzinfo=None
+    ):
         return None
     return result.isoformat()
 
@@ -51,7 +56,7 @@ def parse_usage(raw: str, now: datetime | None = None) -> dict[str, Any]:
     windows: dict[str, Any] = dict.fromkeys(_LABELS.values())
     for line in raw.splitlines():
         match = _LINE.match(line.strip())
-        if match and match.group(1) in _LABELS:
+        if match and match.group(1) in _LABELS and int(match.group(2)) <= _MAX_PERCENT:
             windows[_LABELS[match.group(1)]] = {
                 "used_percent": int(match.group(2)),
                 "resets_at": _reset(match.group(3) or "", now),
