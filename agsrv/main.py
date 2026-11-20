@@ -12,15 +12,14 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import Response
 from pydantic import Field
 
-from agsrv import codex_agent
-from agsrv.agent import (
+from agsrv import codex
+from agsrv.claude import (
     AgentExecutionError,
     AgentRunner,
     SdkAgentRunner,
     build_options,
     collect_result,
 )
-from agsrv.claude_limits import parse_usage
 from agsrv.config import Settings
 from agsrv.jobs import JobManager
 from agsrv.sandbox import SandboxSetupError, service_home
@@ -38,6 +37,7 @@ from agsrv.security import (
     check_sandbox_request,
     resolve_cwd,
 )
+from agsrv.usage import parse_usage
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Coroutine
@@ -178,7 +178,7 @@ async def _timed_probe(app: FastAPI, lease: _SlotLease) -> bool:
     Raises:
         asyncio.CancelledError: If the caller is cancelled.
     """
-    task = asyncio.create_task(codex_agent.probe(app.state.settings.codex_bin))
+    task = asyncio.create_task(codex.probe(app.state.settings.codex_bin))
     try:
         done, _ = await asyncio.wait({task}, timeout=CODEX_PROBE_TIMEOUT)
     except asyncio.CancelledError:
@@ -250,7 +250,7 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
 
     async def execute() -> dict[str, Any]:
         async with request.app.state.jobs.workspace(cwd):
-            return await codex_agent.run_codex(
+            return await codex.run_codex(
                 prompt=body.prompt,
                 cwd=str(cwd),
                 model=body.model,
@@ -444,7 +444,7 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
                         "Codex is disabled or unavailable",
                     )
                 return await _await_codex(
-                    codex_agent.read_rate_limits(settings.codex_bin), lease
+                    codex.read_rate_limits(settings.codex_bin), lease
                 )
         except TimeoutError as exc:
             raise HTTPException(

@@ -17,9 +17,9 @@ from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
 from agsrv import main
-from agsrv.claude_limits import parse_usage
 from agsrv.config import Settings
 from agsrv.main import VERSION, create_app
+from agsrv.usage import parse_usage
 from tests.test_main import CleanupRunner, FakeRunner
 
 if TYPE_CHECKING:
