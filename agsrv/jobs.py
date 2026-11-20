@@ -51,12 +51,20 @@ def _now() -> str:
 
 
 def _principal(authorization: str | None) -> str:
-    """Identify the authenticated bearer principal without persisting its key."""
+    """Identify the authenticated bearer principal without persisting its key.
+
+    Returns:
+        SHA-256 principal identifier.
+    """
     return hashlib.sha256((authorization or "anonymous").encode()).hexdigest()
 
 
 def _canonical(body: QueryRequest | CodexQueryRequest) -> str:
-    """Serialize validated requests in a stable canonical representation."""
+    """Serialize validated requests in a stable canonical representation.
+
+    Returns:
+        Canonical JSON string.
+    """
     return json.dumps(
         body.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
     )
@@ -151,7 +159,8 @@ class JobManager:
         ):
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST,
-                f"timeout_seconds exceeds server maximum {settings.max_timeout_seconds}",
+                "timeout_seconds exceeds server maximum "
+                f"{settings.max_timeout_seconds}",
             )
         if isinstance(body, QueryRequest):
             check_permission_mode(settings, body.permission_mode)
