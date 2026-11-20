@@ -426,8 +426,12 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
         finally:
             watcher.cancel()
             try:
-                with suppress(asyncio.CancelledError):
+                cancelling = task.cancelling()
+                try:
                     await watcher
+                except asyncio.CancelledError:
+                    if task.cancelling() > cancelling:
+                        raise
             finally:
                 semaphore.release()
 

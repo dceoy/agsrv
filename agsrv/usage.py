@@ -28,17 +28,28 @@ def _reset(value: str, now: datetime) -> str | None:
         value = value[: zone_match.start()]
     local_now = now.astimezone(zone)
     try:
-        result = datetime.strptime(  # timezone is attached below
+        result = datetime.strptime(
             f"{value.strip()} {local_now.year}", "%b %d, %I:%M%p %Y"
         ).replace(tzinfo=zone)
+        local_reset = result.replace(tzinfo=None)
         if result.astimezone(UTC) < now.astimezone(UTC) - timedelta(hours=12):
-            result = result.replace(year=result.year + 1)
+            local_reset = local_reset.replace(year=local_reset.year + 1)
     except ValueError:
         return None
-    if result.astimezone(UTC).astimezone(zone).replace(tzinfo=None) != result.replace(
-        tzinfo=None
-    ):
+    candidates = [
+        candidate
+        for fold in (0, 1)
+        if (candidate := local_reset.replace(tzinfo=zone, fold=fold))
+        .astimezone(UTC)
+        .astimezone(zone)
+        .replace(tzinfo=None)
+        == local_reset
+    ]
+    if not candidates:
         return None
+    result = candidates[0]
+    if result.astimezone(UTC) < now.astimezone(UTC) < candidates[-1].astimezone(UTC):
+        result = candidates[-1]
     return result.isoformat()
 
 

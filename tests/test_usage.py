@@ -220,3 +220,54 @@ async def test_disconnect_quota_request(
 @asynccontextmanager
 async def _empty_context() -> AsyncGenerator[None, None]:
     yield
+
+
+@pytest.mark.parametrize(
+    ("hour", "expected"),
+    [(6, "2026-11-01T01:30:00-05:00"), (5, "2026-11-01T01:30:00-04:00")],
+)
+def test_ambiguous_reset(hour: int, expected: str) -> None:
+    """Choose the upcoming occurrence during the repeated hour."""
+    result = parse_usage(
+        "Current session: 12% used · resets Nov 1, 1:30am (America/New_York)",
+        datetime(2026, 11, 1, hour, 10, tzinfo=UTC),
+    )
+    assert result["five_hour"]["resets_at"] == expected
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_watcher_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Caller cancellation during watcher cleanup propagates and releases capacity."""
+    runner = FakeRunner(delay=0.05)
+    app = create_app(Settings(workspace_root=tmp_path, max_concurrency=1), runner)
+    original_prepare = main._prepare  # pyright: ignore[reportPrivateUsage]
+    cleanup_started = asyncio.Event()
+
+    async def prepare(request: Request, body: Any) -> Any:  # ruff: ignore[any-type]
+        body.sandbox = False
+        return await original_prepare(request, body)
+
+    async def disconnected(_request: Request) -> bool:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cleanup_started.set()
+            await asyncio.Event().wait()
+            raise
+        return False
+
+    monkeypatch.setattr(main, "_prepare", prepare)
+    monkeypatch.setattr(Request, "is_disconnected", disconnected)
+    endpoint = next(
+        route.endpoint
+        for route in app.routes
+        if isinstance(route, APIRoute) and route.path == "/v1/agents/claude/rate-limits"
+    )
+    task = asyncio.create_task(endpoint(Request({"type": "http", "app": app})))
+    await asyncio.wait_for(cleanup_started.wait(), 1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, 1)
+    assert not app.state.semaphore.locked()
