@@ -277,7 +277,6 @@ def test_job_admission_failure_cases(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Enforce shutdown, sandbox initialization, and key validation failures."""
-
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
         body = QueryRequest(agent="claude", prompt="x", sandbox=False)
@@ -291,9 +290,12 @@ def test_job_admission_failure_cases(
             raise SandboxSetupError(msg)
 
         monkeypatch.setattr("agsrv.jobs.service_home", no_home)
-        assert client.post(
-            "/v1/jobs", headers=AUTH, json={"agent": "claude", "prompt": "x"}
-        ).status_code == 503
+        assert (
+            client.post(
+                "/v1/jobs", headers=AUTH, json={"agent": "claude", "prompt": "x"}
+            ).status_code
+            == 503
+        )
 
         app.state.jobs.stopping = True
         assert client.post("/v1/jobs", headers=AUTH, json=BODY).status_code == 503
@@ -301,7 +303,6 @@ def test_job_admission_failure_cases(
 
 def test_cancel_without_tracked_task(tmp_path: Path) -> None:
     """Cancel a stored queued job even when no in-memory task exists."""
-
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
         principal = hashlib.sha256(b"Bearer secret").hexdigest()
@@ -320,9 +321,7 @@ def test_cancel_without_tracked_task(tmp_path: Path) -> None:
 
 def test_disabled_codex_and_missing_claude_result(tmp_path: Path) -> None:
     """Classify terminal failures without leaking backend internals."""
-    with TestClient(
-        create_app(_settings(tmp_path, codex_enabled=False))
-    ) as client:
+    with TestClient(create_app(_settings(tmp_path, codex_enabled=False))) as client:
         job_id = client.post(
             "/v1/jobs", headers=AUTH, json={"agent": "codex", "prompt": "x"}
         ).json()["job_id"]
@@ -359,7 +358,6 @@ def test_sandbox_runtime_setup_failure(
 @pytest.mark.asyncio
 async def test_orphaned_run_and_unstarted_manager_stop(tmp_path: Path) -> None:
     """A non-existent record cannot start, and uninitialized shutdown is safe."""
-
     app = create_app(_settings(tmp_path))
     manager = app.state.jobs
     manager.start()
@@ -379,9 +377,12 @@ def test_shutdown_interrupts_active_jobs(tmp_path: Path) -> None:
     with TestClient(app) as client:
         job_id = client.post("/v1/jobs", headers=AUTH, json=BODY).json()["job_id"]
     with sqlite3.connect(app.state.jobs.path) as db:
-        assert db.execute(
-            "SELECT status FROM jobs WHERE job_id=?", (job_id,)
-        ).fetchone()[0] == "interrupted"
+        assert (
+            db.execute("SELECT status FROM jobs WHERE job_id=?", (job_id,)).fetchone()[
+                0
+            ]
+            == "interrupted"
+        )
 
 
 def test_cancel_queued_workspace_job(tmp_path: Path) -> None:
@@ -390,14 +391,15 @@ def test_cancel_queued_workspace_job(tmp_path: Path) -> None:
     with TestClient(app) as client:
         first = client.post("/v1/jobs", headers=AUTH, json=BODY).json()["job_id"]
         for _ in range(100):
-            if client.get(f"/v1/jobs/{first}", headers=AUTH).json()["status"] == "running":
+            if (
+                client.get(f"/v1/jobs/{first}", headers=AUTH).json()["status"]
+                == "running"
+            ):
                 break
             time.sleep(0.005)
         second = client.post(
             "/v1/jobs", headers=AUTH, json={**BODY, "prompt": "other"}
         ).json()["job_id"]
-        assert client.post(
-            f"/v1/jobs/{second}/cancel", headers=AUTH
-        ).status_code == 200
+        assert client.post(f"/v1/jobs/{second}/cancel", headers=AUTH).status_code == 200
         assert _wait(client, second)["status"] == "cancelled"
         assert _wait(client, first)["status"] == "succeeded"
