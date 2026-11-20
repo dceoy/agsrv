@@ -567,3 +567,13 @@ async def test_cancel_workspace_waiter_before_acquisition(tmp_path: Path) -> Non
         task.cancel()
         await task
     await manager.stop()
+
+
+def test_reused_app_lifespan_reacquires_database_lock(tmp_path: Path) -> None:
+    """Restarting the same ASGI app must reacquire the owner lock."""
+    app = create_app(_settings(tmp_path), FakeRunner())
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+    with TestClient(app) as client:
+        job_id = client.post("/v1/jobs", headers=AUTH, json=BODY).json()["job_id"]
+        assert _wait(client, job_id)["status"] == "succeeded"
