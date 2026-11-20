@@ -550,6 +550,7 @@ def test_oversized_results_preserve_success(
             assert outcome["result"]["agent"] == "claude"
             assert outcome["result"]["result_truncated"] is True
 
+
 @pytest.mark.asyncio
 async def test_cancel_workspace_waiter_before_acquisition(tmp_path: Path) -> None:
     """Cancelled waiters never release another execution's workspace lease."""
