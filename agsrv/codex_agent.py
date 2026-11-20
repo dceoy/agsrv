@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager, suppress
+from contextlib import aclosing, asynccontextmanager, suppress
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any, cast
 
 from openai_codex import (
@@ -18,13 +19,19 @@ from openai_codex import (
 from openai_codex._initialize_metadata import (  # ruff: ignore[import-private-name]
     validate_initialize_metadata,
 )
-from openai_codex.generated.v2_all import GetAccountRateLimitsResponse
+from openai_codex._run import _collect_async_turn_result  # pyright: ignore[reportPrivateUsage]  # ruff: ignore[import-private-name]
+from openai_codex.generated.v2_all import (
+    GetAccountRateLimitsResponse,
+    TurnCompletedNotification,
+    TurnStatus,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
 
+    from openai_codex._run import TurnResult  # pyright: ignore[reportPrivateUsage]
     from openai_codex.generated.v2_all import ReasoningEffort
-    from openai_codex.models import JsonObject
+    from openai_codex.models import JsonObject, Notification
 
 
 def decline_approval(method: str, params: JsonObject | None) -> JsonObject:
@@ -150,6 +157,46 @@ async def read_rate_limits(binary: str | None) -> dict[str, Any]:
     }
 
 
+async def collect_turn(handle: AsyncTurnHandle) -> TurnResult:
+    """Collect SDK results without discarding failed terminal turns.
+
+    Returns:
+        The SDK-collected result with its original terminal status and error.
+    """
+    terminal: TurnCompletedNotification | None = None
+
+    async def events() -> AsyncGenerator[Notification, None]:
+        nonlocal terminal
+        async with aclosing(
+            cast("AsyncGenerator[Notification, None]", handle.stream())
+        ) as stream:
+            async for event in stream:
+                output = event
+                payload = event.payload
+                if (
+                    isinstance(payload, TurnCompletedNotification)
+                    and payload.turn.id == handle.id
+                ):
+                    terminal = payload
+                    if payload.turn.status == TurnStatus.failed:
+                        # The SDK raises after collecting a failed turn.
+                        turn = payload.turn.model_copy(
+                            update={"status": TurnStatus.completed}
+                        )
+                        output = replace(
+                            event, payload=payload.model_copy(update={"turn": turn})
+                        )
+                yield output  # ruff: ignore[yield-in-context-manager-in-async-generator]
+
+    async with aclosing(events()) as stream:
+        result = await _collect_async_turn_result(stream, turn_id=handle.id)
+    # The collector only returns when it receives a matching terminal event.
+    terminal = cast("TurnCompletedNotification", terminal)
+    result.status = terminal.turn.status
+    result.error = terminal.turn.error
+    return result
+
+
 async def run_codex(
     *,
     prompt: str,
@@ -201,24 +248,26 @@ async def run_codex(
                 },
                 for_handle=True,
             )
-            result = await AsyncTurnHandle(
+            handle = AsyncTurnHandle(
                 client, thread.id, turn.turn.id, _subscription=subscription
-            ).run()
+            )
         else:
-            result = await AsyncThread(client, thread.id).run(
+            handle = await AsyncThread(client, thread.id).turn(
                 prompt,
                 cwd=cwd,
                 approval_mode=ApprovalMode.deny_all,
                 sandbox=Sandbox(sandbox),
                 effort=cast("ReasoningEffort | None", effort),
             )
+        result = await collect_turn(handle)
         items = [item.model_dump(mode="json", by_alias=True) for item in result.items]
         commands = [item for item in items if item.get("type") == "commandExecution"]
         return {
             "agent": "codex",
             "result": result.final_response,
             "model": getattr(thread, "model", None),
-            "is_error": result.error is not None,
+            "is_error": result.status != TurnStatus.completed
+            or result.error is not None,
             "duration_ms": result.duration_ms or 0,
             "usage": result.usage.model_dump(mode="json") if result.usage else None,
             "backend": {

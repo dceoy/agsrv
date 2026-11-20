@@ -16,7 +16,12 @@ import pytest
 from fastapi.responses import Response
 from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
-from openai_codex.models import InitializeResponse
+from openai_codex.generated.v2_all import (
+    ItemCompletedNotification,
+    TurnCompletedNotification,
+    TurnStatus,
+)
+from openai_codex.models import InitializeResponse, Notification
 from starlette.requests import Request
 
 from agsrv import codex_agent, main
@@ -25,6 +30,7 @@ from agsrv.main import create_app
 from agsrv.schemas import CodexQueryRequest
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
     from pathlib import Path
 
 
@@ -111,14 +117,18 @@ async def test_run(
         duration_ms=10,
         usage=None,
         id="turn",
-        status=SimpleNamespace(value="completed"),
+        status=TurnStatus.completed,
     )
     run = AsyncMock(return_value=result)
+    monkeypatch.setattr(codex_agent, "collect_turn", run)
     monkeypatch.setattr(
-        codex_agent, "AsyncTurnHandle", MagicMock(return_value=SimpleNamespace(run=run))
+        codex_agent, "AsyncTurnHandle", MagicMock(return_value=SimpleNamespace())
     )
+    thread_turn = AsyncMock()
     monkeypatch.setattr(
-        codex_agent, "AsyncThread", MagicMock(return_value=SimpleNamespace(run=run))
+        codex_agent,
+        "AsyncThread",
+        MagicMock(return_value=SimpleNamespace(turn=thread_turn)),
     )
     response = await codex_agent.run_codex(
         prompt="hi",
@@ -142,7 +152,78 @@ async def test_run(
             "networkAccess": True,
         }
     else:
-        assert run.call_args.kwargs["approval_mode"].value == "deny_all"
+        assert thread_turn.call_args.kwargs["approval_mode"].value == "deny_all"
+
+
+@pytest.mark.parametrize("network", [False, True])
+@pytest.mark.parametrize(
+    "status", ["failed", "interrupted", "completed", "missing", "completed_error"]
+)
+def test_terminal_results_endpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, network: bool, status: str
+) -> None:
+    """Typed SDK events preserve terminal results through the HTTP endpoint."""
+    client = FakeClient()
+    monkeypatch.setattr(codex_agent, "make_client", MagicMock(return_value=client))
+    monkeypatch.setattr(codex_agent, "probe", AsyncMock(return_value=True))
+    item = ItemCompletedNotification.model_validate({
+        "threadId": "t",
+        "turnId": "turn",
+        "completedAtMs": 1,
+        "item": {
+            "type": "commandExecution",
+            "id": "c",
+            "command": "pwd",
+            "cwd": "/workspace",
+            "commandActions": [],
+            "status": "completed",
+        },
+    })
+    terminal = TurnCompletedNotification.model_validate({
+        "threadId": "t",
+        "turn": {
+            "id": "turn",
+            "items": [],
+            "status": "completed"
+            if status in {"missing", "completed_error"}
+            else status,
+            "error": {"message": "failed"}
+            if status in {"failed", "completed_error"}
+            else None,
+        },
+    })
+
+    async def stream() -> AsyncGenerator[Notification, None]:  # ruff: ignore[unused-async]
+        yield Notification("item/completed", item)
+        if status != "missing":
+            yield Notification("turn/completed", terminal)
+
+    handle = SimpleNamespace(id="turn", stream=stream)
+    monkeypatch.setattr(codex_agent, "AsyncTurnHandle", MagicMock(return_value=handle))
+    monkeypatch.setattr(
+        codex_agent,
+        "AsyncThread",
+        MagicMock(return_value=SimpleNamespace(turn=AsyncMock(return_value=handle))),
+    )
+    app = create_app(Settings(api_key="key", workspace_root=tmp_path))
+    response = TestClient(app).post(
+        "/v1/query",
+        headers={"Authorization": "Bearer key"},
+        json={"agent": "codex", "prompt": "hi", "options": {"network_access": network}},
+    )
+    if status == "missing":
+        assert response.status_code == 502
+        return
+    assert response.status_code == 200
+    result = response.json()
+    assert result["is_error"] is (status != "completed")
+    assert result["model"] == "actual"
+    assert result["usage"] is None
+    assert result["backend"]["id"] == "turn"
+    assert result["backend"]["status"] == (
+        "completed" if status == "completed_error" else status
+    )
+    assert result["backend"]["commands"][0]["command"] == "pwd"
 
 
 def test_endpoints(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
