@@ -246,6 +246,19 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
         )
     await semaphore.acquire()
     lease = _SlotLease(semaphore)
+
+    async def execute() -> dict[str, Any]:
+        async with request.app.state.jobs.workspace(cwd):
+            return await codex_agent.run_codex(
+                prompt=body.prompt,
+                cwd=str(cwd),
+                model=body.model,
+                effort=body.effort,
+                sandbox=body.options.sandbox,
+                network_access=body.options.network_access,
+                binary=settings.codex_bin,
+            )
+
     try:
         async with asyncio.timeout(timeout):
             if not await _codex_available(request.app, lease=lease):
@@ -253,18 +266,7 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
                     status.HTTP_503_SERVICE_UNAVAILABLE,
                     "Codex is disabled or unavailable",
                 )
-            return await _await_codex(
-                codex_agent.run_codex(
-                    prompt=body.prompt,
-                    cwd=str(cwd),
-                    model=body.model,
-                    effort=body.effort,
-                    sandbox=body.options.sandbox,
-                    network_access=body.options.network_access,
-                    binary=settings.codex_bin,
-                ),
-                lease,
-            )
+            return await _await_codex(execute(), lease)
     except TimeoutError as exc:
         raise HTTPException(
             status.HTTP_504_GATEWAY_TIMEOUT, "agent run timed out"
@@ -441,13 +443,15 @@ def _add_query_routes(app: FastAPI) -> None:
         watcher = asyncio.create_task(watch_disconnect())
         try:
             async with asyncio.timeout(timeout):
-                stream = agent_runner.stream(body.prompt, options)
-                async with aclosing(
-                    cast("AsyncGenerator[Message]", stream)
-                ) as messages:
-                    return await collect_result(
-                        messages, include_messages=body.include_messages
-                    )
+                cwd = resolve_cwd(request.app.state.settings, body.cwd)
+                async with request.app.state.jobs.workspace(cwd):
+                    stream = agent_runner.stream(body.prompt, options)
+                    async with aclosing(
+                        cast("AsyncGenerator[Message]", stream)
+                    ) as messages:
+                        return await collect_result(
+                            messages, include_messages=body.include_messages
+                        )
         except asyncio.CancelledError:
             if client_gone and task.uncancel() == 0:
                 return Response(status_code=499)
