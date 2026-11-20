@@ -21,6 +21,7 @@ from agsrv.agent import (
     collect_result,
 )
 from agsrv.config import Settings
+from agsrv.jobs import JobManager
 from agsrv.sandbox import SandboxSetupError, service_home
 from agsrv.schemas import (
     CodexQueryRequest,
