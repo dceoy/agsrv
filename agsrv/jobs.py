@@ -150,6 +150,7 @@ class JobManager:
             self._lock_file = None
             raise
         self.started = True
+        self.stopping = False
 
     def _gc(self, db: sqlite3.Connection) -> None:
         """Expire only terminal records; their idempotency keys expire with them."""
@@ -515,3 +516,4 @@ class JobManager:
             if self._lock_file is not None:
                 self._lock_file.close()
                 self._lock_file = None
+            self.started = False
