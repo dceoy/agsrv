@@ -109,7 +109,9 @@ class Settings:
     codex_bin: str | None = None
     codex_enabled: bool = True
     codex_max_concurrency: int = 2
-    jobs_db_path: Path = field(default_factory=lambda: Path.home() / ".local/state/agsrv/jobs.sqlite3")
+    jobs_db_path: Path = field(
+        default_factory=lambda: Path.home() / ".local/state/agsrv/jobs.sqlite3"
+    )
     jobs_max_pending: int = 32
     jobs_retention_seconds: int = 86400
     jobs_max_payload_bytes: int = 65536
@@ -142,9 +144,22 @@ class Settings:
             codex_max_concurrency=int(
                 os.environ.get("AGSRV_CODEX_MAX_CONCURRENCY", "2")
             ),
-            jobs_db_path=Path(os.environ.get("AGSRV_JOBS_DB_PATH", str(Path.home() / ".local/state/agsrv/jobs.sqlite3"))).expanduser().resolve(),
+            jobs_db_path=Path(
+                os.environ.get(
+                    "AGSRV_JOBS_DB_PATH",
+                    str(Path.home() / ".local/state/agsrv/jobs.sqlite3"),
+                )
+            )
+            .expanduser()
+            .resolve(),
             jobs_max_pending=int(os.environ.get("AGSRV_JOBS_MAX_PENDING", "32")),
-            jobs_retention_seconds=int(os.environ.get("AGSRV_JOBS_RETENTION_SECONDS", "86400")),
-            jobs_max_payload_bytes=int(os.environ.get("AGSRV_JOBS_MAX_PAYLOAD_BYTES", "65536")),
-            jobs_max_result_bytes=int(os.environ.get("AGSRV_JOBS_MAX_RESULT_BYTES", "1048576")),
+            jobs_retention_seconds=int(
+                os.environ.get("AGSRV_JOBS_RETENTION_SECONDS", "86400")
+            ),
+            jobs_max_payload_bytes=int(
+                os.environ.get("AGSRV_JOBS_MAX_PAYLOAD_BYTES", "65536")
+            ),
+            jobs_max_result_bytes=int(
+                os.environ.get("AGSRV_JOBS_MAX_RESULT_BYTES", "1048576")
+            ),
         )
