@@ -508,10 +508,11 @@ def test_sync_codex_query_shares_job_workspace_lock(
 
 
 @pytest.mark.parametrize(
-    ("max_bytes", "answer", "expected_flag"),
+    ("max_bytes", "answer", "expected_flag", "with_messages"),
     [
-        (350, "done", "messages_truncated"),
-        (100, "x" * 2048, "result_truncated"),
+        (350, "done", "messages_truncated", True),
+        (100, "x" * 2048, "result_truncated", True),
+        (100, "x" * 2048, "result_truncated", False),
     ],
 )
 def test_oversized_results_preserve_success(
@@ -520,18 +521,21 @@ def test_oversized_results_preserve_success(
     max_bytes: int,
     answer: str,
     expected_flag: str,
+    with_messages: bool,
 ) -> None:
     """A completed coding run must not become failed due to an oversized transcript."""
     app = create_app(_settings(tmp_path, jobs_max_result_bytes=max_bytes))
 
     async def oversized_result(_body: object, _cwd: object) -> dict[str, Any]:
         await asyncio.sleep(0)
-        return {
+        result: dict[str, Any] = {
             "agent": "claude",
             "is_error": False,
             "result": answer,
-            "messages": [{"text": "z" * 2048}],
         }
+        if with_messages:
+            result["messages"] = [{"text": "z" * 2048}]
+        return result
 
     monkeypatch.setattr(app.state.jobs, "_execute", oversized_result)
     with TestClient(app) as client:
@@ -545,3 +549,21 @@ def test_oversized_results_preserve_success(
         else:
             assert outcome["result"]["agent"] == "claude"
             assert outcome["result"]["result_truncated"] is True
+
+@pytest.mark.asyncio
+async def test_cancel_workspace_waiter_before_acquisition(tmp_path: Path) -> None:
+    """Cancelled waiters never release another execution's workspace lease."""
+    manager = create_app(_settings(tmp_path)).state.jobs
+    manager.start()
+    async with manager.workspace(tmp_path):
+        task = asyncio.create_task(
+            manager._run(  # pyright: ignore[reportPrivateUsage]
+                "not-yet-running",
+                QueryRequest(agent="claude", prompt="x", sandbox=False),
+                tmp_path,
+            )
+        )
+        await asyncio.sleep(0)
+        task.cancel()
+        await task
+    await manager.stop()
