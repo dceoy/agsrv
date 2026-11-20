@@ -215,7 +215,7 @@
 <a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a>curl<span class="w"> </span>-sS<span class="w"> </span>http://localhost:8000/v1/query<span class="w"> </span><span class="se">\</span>
 <a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="w">  </span>-H<span class="w"> </span><span class="s2">"Authorization: Bearer </span><span class="nv">$AGSRV_API_KEY</span><span class="s2">"</span><span class="w"> </span><span class="se">\</span>
 <a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="w">  </span>-H<span class="w"> </span><span class="s2">"Content-Type: application/json"</span><span class="w"> </span><span class="se">\</span>
-<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="w">  </span>-d<span class="w"> </span><span class="s1">'{"prompt": "Reply with the single word: pong", "max_turns": 1}'</span>
+<a id="__codelineno-4-6" name="__codelineno-4-6" href="#__codelineno-4-6"></a><span class="w">  </span>-d<span class="w"> </span><span class="s1">'{"agent": "claude", "prompt": "Reply with the single word: pong", "max_turns": 1}'</span>
 </code></pre></div>
 <p>A <code>200</code> response with <code>"result": "pong"</code> confirms authentication, Claude
 credentials, and the SDK/CLI path all work.</p></div>

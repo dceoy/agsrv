@@ -116,9 +116,9 @@
 <p>Stateless HTTP API for remote Claude Code execution powered by Claude Agent SDK.</p>
 <h2 id="capabilities">Capabilities<a class="headerlink" href="#capabilities" title="Permanent link">&para;</a></h2>
 <ul>
-<li><code>POST /v1/query</code>: run one ephemeral agent query and receive the result and
-  full message transcript as JSON.</li>
-<li><code>POST /v1/query/stream</code>: the same run streamed as Server-Sent Events.</li>
+<li><code>POST /v1/query</code>: run one ephemeral agent query and receive the result as JSON,
+  with an optional Claude message transcript.</li>
+<li><code>POST /v1/query/stream</code>: a Claude run streamed as Server-Sent Events.</li>
 <li><code>GET /v1/info</code> and <code>GET /health</code>.</li>
 <li>Bearer-token authentication, workspace confinement, opt-in
   <code>bypassPermissions</code>, concurrency and timeout limits.</li>
@@ -214,5 +214,5 @@
 
 <!--
 MkDocs version : 1.6.1
-Build Date UTC : 2026-11-19 13:44:02.491156+00:00
+Build Date UTC : 2026-11-20 12:13:16.000789+00:00
 -->
