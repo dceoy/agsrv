@@ -264,8 +264,9 @@ async def test_probe_coalesces_and_times_out(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("query_deadline", [False, True])
 async def test_probe_timeout_releases_waiters_but_keeps_slot(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, query_deadline: bool
 ) -> None:
     """A blocked SDK start retains capacity until its late child is closed."""
     app = create_app(
@@ -300,14 +301,26 @@ async def test_probe_timeout_releases_waiters_but_keeps_slot(
         base_url="http://test",
         headers={"Authorization": "Bearer key"},
     ) as http:
-        first = asyncio.create_task(http.get("/v1/agents"))
+        if query_deadline:
+            first = asyncio.create_task(
+                http.post(
+                    "/v1/query",
+                    json={"agent": "codex", "prompt": "x", "timeout_seconds": 0.02},
+                )
+            )
+        else:
+            first = asyncio.create_task(http.get("/v1/agents"))
         try:
             assert await asyncio.to_thread(started.wait, 1)
             second = asyncio.create_task(http.get("/v1/agents"))
-            responses = await asyncio.wait_for(asyncio.gather(first, second), 0.5)
-            assert all(
-                not response.json()["codex"]["healthy"] for response in responses
+            first_response, second_response = await asyncio.wait_for(
+                asyncio.gather(first, second), 0.5
             )
+            if query_deadline:
+                assert first_response.status_code == 504
+            else:
+                assert not first_response.json()["codex"]["healthy"]
+            assert not second_response.json()["codex"]["healthy"]
             assert not release.is_set()
             assert app.state.codex_semaphore.locked()
             assert (await http.get("/v1/agents/codex/rate-limits")).status_code == 429
@@ -319,7 +332,47 @@ async def test_probe_timeout_releases_waiters_but_keeps_slot(
             if not app.state.codex_semaphore.locked():
                 break
             await asyncio.sleep(0.01)
-        assert not app.state.codex_semaphore.locked()
+        assert app.state.codex_semaphore._value == 1  # pyright: ignore[reportPrivateUsage]
+        assert not main._pump_tasks  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_cancelled_probe_consumes_late_start_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A late startup failure is consumed without an orphaned future exception."""
+    app = create_app(Settings(workspace_root=tmp_path))
+    client = codex_agent.make_client(None)
+    started = threading.Event()
+    release = threading.Event()
+    errors: list[dict[str, object]] = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+
+    def start() -> NoReturn:
+        started.set()
+        release.wait()
+        raise FileNotFoundError
+
+    monkeypatch.setattr(client._client._sync, "start", start)  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(codex_agent, "make_client", MagicMock(return_value=client))
+    loop.set_exception_handler(lambda _loop, context: errors.append(context))
+    task = asyncio.create_task(main._codex_available(app))  # pyright: ignore[reportPrivateUsage]
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        for _ in range(100):
+            if not main._pump_tasks:  # pyright: ignore[reportPrivateUsage]
+                break
+            await asyncio.sleep(0.01)
+        assert not main._pump_tasks  # pyright: ignore[reportPrivateUsage]
+        assert not errors
+    finally:
+        release.set()
+        loop.set_exception_handler(previous_handler)
 
 
 @pytest.mark.asyncio
@@ -394,7 +447,9 @@ async def test_codex_deadline_and_disconnect(
             CodexQueryRequest(agent="codex", prompt="x", timeout_seconds=0.01), request
         )
     assert error.value.status_code == 504
-    assert closed.is_set()
+    await asyncio.wait_for(closed.wait(), 1)
+    await asyncio.sleep(0)
+    app.state.codex_probe_expires = 0
     started.clear()
     closed.clear()
     monkeypatch.setattr(main, "DISCONNECT_POLL_INTERVAL", 0.01)
@@ -408,9 +463,12 @@ async def test_codex_deadline_and_disconnect(
     response = await asyncio.wait_for(task, 1)
     assert isinstance(response, Response)
     assert response.status_code == 499
-    assert closed.is_set()
+    await asyncio.wait_for(closed.wait(), 1)
+    await asyncio.sleep(0)
     assert not app.state.codex_semaphore.locked()
+    app.state.codex_probe_expires = 0
     disconnected = False
+    request = Request({"type": "http", "app": app}, receive)
     started.clear()
     task = asyncio.create_task(
         main._codex_query_with_disconnect(  # pyright: ignore[reportPrivateUsage]

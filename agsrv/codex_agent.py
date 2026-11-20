@@ -84,7 +84,8 @@ async def client_context(binary: str | None) -> AsyncGenerator[AsyncCodex, None]
             )
 
     try:
-        await asyncio.shield(start)
+        await asyncio.wait({start})
+        start.result()
         payload = await client._client.initialize()  # pyright: ignore[reportPrivateUsage]  # ruff: ignore[private-member-access]
         client._init = validate_initialize_metadata(payload)  # pyright: ignore[reportPrivateUsage]  # ruff: ignore[private-member-access]
         client._initialized = True  # pyright: ignore[reportPrivateUsage]  # ruff: ignore[private-member-access]

@@ -275,11 +275,16 @@ async def _codex_available(app: FastAPI, *, lease: _SlotLease | None = None) -> 
     async with app.state.codex_probe_lock:
         now = time.monotonic()
         if now >= app.state.codex_probe_expires:
-            if lease is None:
-                async with _codex_slot(app) as acquired:
-                    app.state.codex_healthy = await _timed_probe(settings, acquired)
-            else:
-                app.state.codex_healthy = await _timed_probe(settings, lease)
+            try:
+                if lease is None:
+                    async with _codex_slot(app) as acquired:
+                        app.state.codex_healthy = await _timed_probe(settings, acquired)
+                else:
+                    app.state.codex_healthy = await _timed_probe(settings, lease)
+            except asyncio.CancelledError:
+                app.state.codex_healthy = False
+                app.state.codex_probe_expires = time.monotonic() + 30
+                raise
             app.state.codex_probe_expires = time.monotonic() + 30
     return cast("bool", app.state.codex_healthy)
 
@@ -297,15 +302,16 @@ async def _timed_probe(settings: Settings, lease: _SlotLease) -> bool:
     try:
         done, _ = await asyncio.wait({task}, timeout=CODEX_PROBE_TIMEOUT)
     except asyncio.CancelledError:
-        task.cancel()
-        while not task.done():
-            with suppress(asyncio.CancelledError):
-                await asyncio.shield(task)
-        with suppress(asyncio.CancelledError):
-            task.result()
+        _detach_probe(task, lease)
         raise
     if done:
         return task.result()
+    _detach_probe(task, lease)
+    return False
+
+
+def _detach_probe(task: asyncio.Task[bool], lease: _SlotLease) -> None:
+    """Transfer capacity to a cancelled probe until its cleanup finishes."""
     lease.claimed = True
     _pump_tasks.add(task)
 
@@ -317,7 +323,6 @@ async def _timed_probe(settings: Settings, lease: _SlotLease) -> bool:
 
     task.add_done_callback(finished)
     task.cancel()
-    return False
 
 
 async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, Any]:
