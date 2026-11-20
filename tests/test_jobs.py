@@ -6,11 +6,9 @@ import asyncio
 import sqlite3
 import time
 from dataclasses import replace
-from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from claude_agent_sdk import Message
 from fastapi.testclient import TestClient
 
 from agsrv.config import Settings
@@ -19,6 +17,9 @@ from tests.test_main import FakeRunner, canned
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+    from pathlib import Path
+
+    from claude_agent_sdk import Message
 
     from claude_agent_sdk import ClaudeAgentOptions
 
@@ -196,14 +197,14 @@ def test_restart_reconciles_without_replay(tmp_path: Path) -> None:
                VALUES ('orphan', ?, 'hash', '{}', 'claude', ?, 'running', ?)""",
             ("ignored", str(tmp_path), now),
         )
-    with TestClient(create_app(settings, FakeRunner())):
-        with sqlite3.connect(settings.jobs_db_path) as db:
-            assert (
-                db.execute("SELECT status FROM jobs WHERE job_id='orphan'").fetchone()[
-                    0
-                ]
-                == "interrupted"
-            )
+    with (
+        TestClient(create_app(settings, FakeRunner())),
+        sqlite3.connect(settings.jobs_db_path) as db,
+    ):
+        assert (
+            db.execute("SELECT status FROM jobs WHERE job_id='orphan'").fetchone()[0]
+            == "interrupted"
+        )
 
 
 def test_retention_expires_keys(tmp_path: Path) -> None:
@@ -228,6 +229,7 @@ class MeteredRunner(FakeRunner):
     async def stream(
         self, prompt: str, options: ClaudeAgentOptions
     ) -> AsyncIterator[Message]:
+        """Yield metered agent events while tracking concurrent runs."""
         self.active += 1
         self.peak = max(self.peak, self.active)
         try:
@@ -255,6 +257,7 @@ def test_codex_jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Codex uses its own execution adapter and captures normalized metadata."""
 
     async def fake_codex(**_kwargs: object) -> dict[str, Any]:
+        await asyncio.sleep(0)
         return {"agent": "codex", "result": "done", "is_error": False}
 
     monkeypatch.setattr("agsrv.jobs.codex_agent.run_codex", fake_codex)
