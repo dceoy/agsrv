@@ -11,11 +11,9 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 import sqlite3
 from contextlib import aclosing, closing
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
@@ -34,6 +32,7 @@ from agsrv.security import (
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
+    from pathlib import Path
 
     from claude_agent_sdk import Message
     from fastapi import FastAPI
@@ -42,6 +41,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 TERMINAL = frozenset({"succeeded", "failed", "cancelled", "interrupted"})
+MAX_IDEMPOTENCY_KEY_LENGTH = 128
 RETRY_AFTER = {"Retry-After": "5"}
 
 
@@ -64,6 +64,7 @@ class JobManager:
     """SQLite-backed, bounded in-process scheduler for asynchronous agent runs."""
 
     def __init__(self, app: FastAPI) -> None:
+        """Create a scheduler for the supplied application."""
         self.app = app
         settings: Settings = app.state.settings
         self.path = settings.jobs_db_path
@@ -117,7 +118,7 @@ class JobManager:
                 (_now(),),
             )
             db.commit()
-        os.chmod(self.path, 0o600)
+        self.path.chmod(0o600)
         self.started = True
 
     def _gc(self, db: sqlite3.Connection) -> None:
@@ -133,7 +134,14 @@ class JobManager:
         )
 
     def _validate(self, body: QueryRequest | CodexQueryRequest) -> Path:
-        """Validate execution policy before creating a durable record."""
+        """Validate execution policy before creating a durable record.
+
+        Returns:
+            Resolved workspace path.
+
+        Raises:
+            HTTPException: If the execution policy is invalid.
+        """
         settings: Settings = self.app.state.settings
         cwd = resolve_cwd(settings, body.cwd)
         if body.timeout_seconds is not None and (
@@ -162,12 +170,19 @@ class JobManager:
         authorization: str | None,
         idempotency_key: str | None,
     ) -> dict[str, Any]:
-        """Atomically deduplicate and enqueue a bounded job."""
+        """Atomically deduplicate and enqueue a bounded job.
+
+        Returns:
+            Accepted job identifier and polling URL.
+
+        Raises:
+            HTTPException: If validation or queue capacity checks fail.
+        """
         self.start()
         if self.stopping:
             raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "server stopping")
         if idempotency_key is not None and (
-            not 1 <= len(idempotency_key) <= 128
+            not 1 <= len(idempotency_key) <= MAX_IDEMPOTENCY_KEY_LENGTH
             or not idempotency_key.isascii()
             or not idempotency_key.isprintable()
         ):
@@ -186,7 +201,7 @@ class JobManager:
             self._gc(db)
             existing = (
                 db.execute(
-                    "SELECT job_id, payload_hash FROM jobs "
+                    "SELECT job_id, payload_hash, status FROM jobs "
                     "WHERE caller=? AND idempotency_key=?",
                     (caller, idempotency_key),
                 ).fetchone()
@@ -198,7 +213,7 @@ class JobManager:
                     raise HTTPException(
                         status.HTTP_409_CONFLICT, "Idempotency-Key payload mismatch"
                     )
-                return self._accepted(existing["job_id"])
+                return self._accepted(existing["job_id"], existing["status"])
             pending = db.execute(
                 "SELECT COUNT(*) FROM jobs WHERE status IN ('queued','running')"
             ).fetchone()[0]
@@ -228,12 +243,13 @@ class JobManager:
         task = asyncio.create_task(self._run(job_id, body, cwd))
         self.tasks[job_id] = task
         task.add_done_callback(lambda _: self.tasks.pop(job_id, None))
-        return self._accepted(job_id)
+        return self._accepted(job_id, "queued")
 
     @staticmethod
-    def _accepted(job_id: str) -> dict[str, Any]:
+    def _accepted(job_id: str, state: str) -> dict[str, Any]:
         return {
             "job_id": job_id,
+            "status": state,
             "status_url": f"/v1/jobs/{job_id}",
         }
 
@@ -268,11 +284,19 @@ class JobManager:
         }
 
     def get(self, job_id: str, authorization: str | None) -> dict[str, Any]:
-        """Retrieve a job only within its authenticated bearer scope."""
+        """Retrieve a job only within its authenticated bearer scope.
+
+        Returns:
+            Public job status and result.
+        """
         return self._public(self._row(job_id, authorization))
 
     def cancel(self, job_id: str, authorization: str | None) -> dict[str, Any]:
-        """Request cancellation; queued jobs are cancelled atomically."""
+        """Request cancellation; queued jobs are cancelled atomically.
+
+        Returns:
+            The current public job status.
+        """
         row = self._row(job_id, authorization)
         if row["status"] in TERMINAL:
             return self._public(row)
@@ -351,7 +375,8 @@ class JobManager:
                     )
                 return result.model_dump(mode="json")
         if not settings.codex_enabled:
-            raise RuntimeError("Codex unavailable")
+            msg = "Codex unavailable"
+            raise RuntimeError(msg)
         async with self.app.state.codex_semaphore:
             return await codex_agent.run_codex(
                 prompt=body.prompt,
@@ -367,7 +392,7 @@ class JobManager:
         self, job_id: str, body: QueryRequest | CodexQueryRequest, cwd: Path
     ) -> None:
         acquired = False
-        try:
+        try:  # ruff: ignore[too-many-statements-in-try-clause]
             timeout = body.timeout_seconds or self.app.state.settings.max_timeout_seconds
             async with asyncio.timeout(timeout):
                 await self._acquire_workspace(cwd)
