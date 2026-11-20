@@ -1,4 +1,4 @@
-"""Bash sandbox settings for opt-in sandboxed agent runs.
+"""Bash sandbox settings for default-on sandboxed agent runs.
 
 CLI schema keys beyond the SDK TypedDict are forwarded verbatim; verified
 against bundled CLI 2.1.325/2.1.327.
