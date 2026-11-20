@@ -41,7 +41,8 @@ class FakeClient:
         self.request = AsyncMock()
         self._client = self
         self._sync = self
-        self.start = AsyncMock()
+        self.start = MagicMock()
+        self._proc = None
         self.initialize = AsyncMock(return_value=InitializeResponse(userAgent="test/1"))
 
     def close(self) -> None:
@@ -474,3 +475,91 @@ def test_metadata_capacity_timeout_and_schema(
     ]["200"]["content"]["application/json"]["schema"]
     assert schema["discriminator"]["propertyName"] == "agent"
     assert len(schema["oneOf"]) == 2
+
+
+def test_start_with_busy_default_executor(tmp_path: Path) -> None:
+    """Startup does not wait behind unrelated default executor work."""
+    binary = tmp_path / "silent-codex"
+    marker = tmp_path / "started"
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        "import time\n"
+        f"open({str(marker)!r}, 'w').close()\n"
+        "time.sleep(30)\n"
+    )
+    binary.chmod(0o755)
+    release = threading.Event()
+    occupied = threading.Event()
+
+    def block() -> None:
+        occupied.set()
+        release.wait()
+
+    async def exercise() -> None:
+        loop = asyncio.get_running_loop()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            loop.set_default_executor(executor)
+            loop.run_in_executor(None, block)
+            assert occupied.wait(1)
+            try:
+                started = time.monotonic()
+                with pytest.raises(TimeoutError):
+                    async with asyncio.timeout(0.2):
+                        await codex_agent.probe(str(binary))
+                assert time.monotonic() - started < 1
+                assert marker.exists()
+            finally:
+                release.set()
+
+    asyncio.run(exercise())
+
+
+def test_blocked_writer_child_is_killed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A full stdin pipe cannot prevent the transport from reaping the child."""
+    binary = tmp_path / "blocked-codex"
+    initialized = tmp_path / "initialized"
+    binary.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys, time\n"
+        "request = json.loads(sys.stdin.readline())\n"
+        "print(json.dumps({'id': request['id'], 'result': "
+        "{'userAgent': 'test/1'}}), flush=True)\n"
+        "sys.stdin.readline()\n"
+        f"open({str(initialized)!r}, 'w').close()\n"
+        "time.sleep(30)\n"
+    )
+    binary.chmod(0o755)
+    client = codex_agent.make_client(str(binary))
+    sync = client._client._sync  # pyright: ignore[reportPrivateUsage]
+    close = sync.close
+    processes: list[subprocess.Popen[str] | None] = []
+
+    def record_close() -> None:
+        processes.append(sync._proc)  # pyright: ignore[reportPrivateUsage]
+        close()
+
+    monkeypatch.setattr(sync, "close", record_close)
+    monkeypatch.setattr(codex_agent, "make_client", MagicMock(return_value=client))
+
+    async def exercise() -> None:
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            async with asyncio.timeout(0.2):
+                await codex_agent.run_codex(
+                    prompt="x",
+                    cwd=str(tmp_path),
+                    model="x" * 1_000_000,
+                    effort=None,
+                    sandbox="read-only",
+                    network_access=False,
+                    binary=str(binary),
+                )
+        assert time.monotonic() - started < 2
+        assert initialized.exists()
+        assert len(processes) == 1
+        assert processes[0] is not None
+        assert processes[0].poll() is not None
+
+    asyncio.run(exercise())

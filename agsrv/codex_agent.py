@@ -62,16 +62,25 @@ async def client_context(binary: str | None) -> AsyncGenerator[AsyncCodex, None]
         asyncio.CancelledError: If cancelled during cleanup.
     """
     client = make_client(binary)
-    start = asyncio.create_task(client._client.start())  # pyright: ignore[reportPrivateUsage]  # ruff: ignore[private-member-access]
+    sync = client._client._sync  # pyright: ignore[reportPrivateUsage]  # ruff: ignore[private-member-access]
+    startup_executor = ThreadPoolExecutor(max_workers=1)
+    start = asyncio.get_running_loop().run_in_executor(startup_executor, sync.start)
 
     async def cleanup() -> None:
         with suppress(Exception):
             await start
+        startup_executor.shutdown(wait=True)
+        # Kill first: SDK close closes stdin before signaling, and a writer may
+        # hold its lock while blocked on a full pipe.
+        proc = sync._proc  # pyright: ignore[reportPrivateUsage]  # ruff: ignore[private-member-access]
+        if proc is not None:
+            with suppress(ProcessLookupError):
+                proc.kill()
         # A stalled SDK RPC must not prevent its transport from closing.
         with ThreadPoolExecutor(max_workers=1) as executor:
             await asyncio.get_running_loop().run_in_executor(
                 executor,
-                client._client._sync.close,  # pyright: ignore[reportPrivateUsage]  # ruff: ignore[private-member-access]
+                sync.close,
             )
 
     try:
