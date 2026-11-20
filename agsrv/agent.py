@@ -222,24 +222,17 @@ def build_options(
         ),
         # Stateless and hermetic runs: the CLI must not persist a resumable
         # session transcript, and host/project settings (hooks, MCP servers,
-        # permission rules) must not leak into runs. A request's system
-        # prompt replaces the Claude Code preset; it never adds sources.
+        # permission rules) must not leak into runs.
         "setting_sources": [],
         "extra_args": {"no-session-persistence": None},
         "env": {"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"},
         "strict_mcp_config": True,
-        "system_prompt": (
-            request.system_prompt
-            if request.system_prompt is not None
-            else {"type": "preset", "preset": "claude_code"}
-        ),
+        "system_prompt": {"type": "preset", "preset": "claude_code"},
     }
     model = request.model or settings.default_model
     optional: dict[str, Any] = {
         "model": model,
-        "disallowed_tools": request.disallowed_tools,
         "max_turns": request.max_turns,
-        "max_budget_usd": request.max_budget_usd,
         "effort": request.effort,
     }
     kwargs.update({k: v for k, v in optional.items() if v is not None})
