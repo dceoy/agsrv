@@ -103,7 +103,9 @@ Clients must never retry a failed default sandbox request with
 Use the same long-lived API key on replacement Muse VMs and submit jobs with a
 stable `Idempotency-Key`. Poll `GET /v1/jobs/{job_id}` without holding open a
 connection. Back up the SQLite WAL database (including its WAL file) and avoid
-multi-worker uvicorn. Jobs are in-process: a server restart marks uncompleted
+multi-worker uvicorn: an exclusive sibling lock file rejects concurrent
+processes sharing the database. Synchronous queries share the same workspace
+lease as queued jobs. Jobs are in-process: a server restart marks uncompleted
 jobs `interrupted` and never retries them automatically. Default completed-job
 retention is 24 hours. All holders of the same bearer token can inspect jobs
 created with that token; do not share credentials across untrusted tenants.
