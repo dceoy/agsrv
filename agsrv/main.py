@@ -7,7 +7,7 @@ import json
 import logging
 import time
 from contextlib import aclosing, asynccontextmanager, suppress
-from typing import TYPE_CHECKING, Annotated, Any, cast
+from typing import TYPE_CHECKING, Annotated, Any, TypeVar, cast
 
 import anyio
 from claude_agent_sdk import ResultError, ResultMessage
@@ -42,7 +42,7 @@ from agsrv.security import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator
+    from collections.abc import AsyncGenerator, AsyncIterator, Coroutine
 
     from claude_agent_sdk import ClaudeAgentOptions, Message
     from starlette.types import Receive, Scope, Send
@@ -56,6 +56,8 @@ CODEX_PROBE_TIMEOUT = 10.0
 
 # Keep detached cleanup alive if the response task is externally cancelled.
 _pump_tasks: set[asyncio.Task[Any]] = set()
+
+T = TypeVar("T")
 
 Auth = Depends(auth_dependency)
 
@@ -302,27 +304,44 @@ async def _timed_probe(settings: Settings, lease: _SlotLease) -> bool:
     try:
         done, _ = await asyncio.wait({task}, timeout=CODEX_PROBE_TIMEOUT)
     except asyncio.CancelledError:
-        _detach_probe(task, lease)
+        _detach_codex(task, lease)
         raise
     if done:
         return task.result()
-    _detach_probe(task, lease)
+    _detach_codex(task, lease)
     return False
 
 
-def _detach_probe(task: asyncio.Task[bool], lease: _SlotLease) -> None:
-    """Transfer capacity to a cancelled probe until its cleanup finishes."""
+def _detach_codex(task: asyncio.Task[Any], lease: _SlotLease) -> None:
+    """Transfer capacity to a cancelled operation until its cleanup finishes."""
     lease.claimed = True
     _pump_tasks.add(task)
 
-    def finished(probe: asyncio.Task[bool]) -> None:
-        _pump_tasks.discard(probe)
+    def finished(operation: asyncio.Task[Any]) -> None:
+        _pump_tasks.discard(operation)
         lease.release()
         with suppress(asyncio.CancelledError):
-            probe.exception()
+            operation.exception()
 
     task.add_done_callback(finished)
     task.cancel()
+
+
+async def _await_codex(operation: Coroutine[Any, Any, T], lease: _SlotLease) -> T:
+    """Run an operation while allowing its cleanup to outlive the caller.
+
+    Returns:
+        The operation result.
+
+    Raises:
+        asyncio.CancelledError: If the caller is cancelled.
+    """
+    task = asyncio.create_task(operation)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        _detach_codex(task, lease)
+        raise
 
 
 async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, Any]:
@@ -348,14 +367,17 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
                     status.HTTP_503_SERVICE_UNAVAILABLE,
                     "Codex is disabled or unavailable",
                 )
-            return await codex_agent.run_codex(
-                prompt=body.prompt,
-                cwd=str(cwd),
-                model=body.model,
-                effort=body.effort,
-                sandbox=body.options.sandbox,
-                network_access=body.options.network_access,
-                binary=settings.codex_bin,
+            return await _await_codex(
+                codex_agent.run_codex(
+                    prompt=body.prompt,
+                    cwd=str(cwd),
+                    model=body.model,
+                    effort=body.effort,
+                    sandbox=body.options.sandbox,
+                    network_access=body.options.network_access,
+                    binary=settings.codex_bin,
+                ),
+                lease,
             )
     except TimeoutError as exc:
         raise HTTPException(
@@ -470,7 +492,9 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:
                         status.HTTP_503_SERVICE_UNAVAILABLE,
                         "Codex is disabled or unavailable",
                     )
-                return await codex_agent.read_rate_limits(settings.codex_bin)
+                return await _await_codex(
+                    codex_agent.read_rate_limits(settings.codex_bin), lease
+                )
         except TimeoutError as exc:
             raise HTTPException(
                 status.HTTP_504_GATEWAY_TIMEOUT, "Codex rate limits timed out"

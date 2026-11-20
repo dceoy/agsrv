@@ -418,6 +418,74 @@ async def test_probe_timeout_releases_waiters_but_keeps_slot(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("query", [False, True])
+async def test_warm_cache_start_timeout_keeps_slot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, query: bool
+) -> None:
+    """Both operations return at their deadline while late startup is reaped."""
+    app = create_app(
+        Settings(
+            workspace_root=tmp_path,
+            codex_max_concurrency=1,
+            max_timeout_seconds=0.05,
+            api_key="key",
+        )
+    )
+    app.state.codex_healthy = True
+    app.state.codex_probe_expires = time.monotonic() + 30
+    client = codex_agent.make_client(None)
+    started = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+    processes: list[subprocess.Popen[str]] = []
+    sync = client._client._sync  # pyright: ignore[reportPrivateUsage]
+
+    def start() -> None:
+        started.set()
+        release.wait()
+        process = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"], text=True
+        )
+        processes.append(process)
+        sync._proc = process  # pyright: ignore[reportPrivateUsage]
+
+    def close() -> None:
+        processes[0].wait(timeout=1)
+        closed.set()
+
+    monkeypatch.setattr(sync, "start", start)
+    monkeypatch.setattr(sync, "close", close)
+    monkeypatch.setattr(codex_agent, "make_client", MagicMock(return_value=client))
+    async with AsyncClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        headers={"Authorization": "Bearer key"},
+    ) as http:
+        if query:
+            request = http.post("/v1/query", json={"agent": "codex", "prompt": "x"})
+        else:
+            request = http.get("/v1/agents/codex/rate-limits")
+        first = asyncio.create_task(request)
+        try:
+            assert await asyncio.to_thread(started.wait, 1)
+            response = await asyncio.wait_for(first, 0.25)
+            assert response.status_code == 504
+            assert not release.is_set()
+            assert app.state.codex_semaphore.locked()
+            assert (await http.get("/v1/agents/codex/rate-limits")).status_code == 429
+        finally:
+            release.set()
+        assert await asyncio.to_thread(closed.wait, 1)
+        assert processes[0].poll() is not None
+        for _ in range(100):
+            if not app.state.codex_semaphore.locked():
+                break
+            await asyncio.sleep(0.01)
+        assert app.state.codex_semaphore._value == 1  # pyright: ignore[reportPrivateUsage]
+        assert not main._pump_tasks  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
 async def test_cancelled_probe_consumes_late_start_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
