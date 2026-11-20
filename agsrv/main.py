@@ -8,7 +8,7 @@ import time
 from contextlib import aclosing, asynccontextmanager, suppress
 from typing import TYPE_CHECKING, Annotated, Any, TypeVar, cast
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import Response
 from pydantic import Field
 
@@ -21,6 +21,7 @@ from agsrv.agent import (
     collect_result,
 )
 from agsrv.config import Settings
+from agsrv.jobs import JobManager
 from agsrv.sandbox import SandboxSetupError, service_home
 from agsrv.schemas import (
     CodexQueryRequest,
@@ -182,6 +183,7 @@ async def _timed_probe(app: FastAPI, lease: _SlotLease) -> bool:
     except asyncio.CancelledError:
         _detach_codex(task, lease)
         app.state.codex_healthy = False
+    app.state.jobs = JobManager(app)
         expires = time.monotonic() + 30
         app.state.codex_probe_expires = expires
 
@@ -473,6 +475,50 @@ def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure]
     _ = run_query
 
 
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncGenerator[None]:
+    """Open the durable queue and stop all owned jobs on shutdown."""
+    app.state.jobs.start()
+    try:
+        yield
+    finally:
+        await app.state.jobs.stop()
+
+
+def _add_job_routes(app: FastAPI) -> None:
+    """Register durable polling and cancellation endpoints."""
+
+    @app.post("/v1/jobs", dependencies=[Auth], status_code=status.HTTP_202_ACCEPTED)
+    async def submit_job(  # pyright: ignore[reportUnusedFunction]
+        body: Annotated[QueryRequest | CodexQueryRequest, Field(discriminator="agent")],
+        request: Request,
+        idempotency_key: Annotated[str | None, Header()] = None,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        return cast("dict[str, Any]", request.app.state.jobs.submit(
+            body, authorization, idempotency_key
+        ))
+
+    @app.get("/v1/jobs/{job_id}", dependencies=[Auth])
+    async def get_job(  # pyright: ignore[reportUnusedFunction]
+        job_id: str,
+        request: Request,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        return cast("dict[str, Any]", request.app.state.jobs.get(job_id, authorization))
+
+    @app.post("/v1/jobs/{job_id}/cancel", dependencies=[Auth])
+    async def cancel_job(  # pyright: ignore[reportUnusedFunction]
+        job_id: str,
+        request: Request,
+        authorization: Annotated[str | None, Header()] = None,
+    ) -> dict[str, Any]:
+        return cast("dict[str, Any]", request.app.state.jobs.cancel(job_id, authorization))
+
+    _ = (submit_job, get_job, cancel_job)
+
+
 def create_app(
     settings: Settings | None = None, runner: AgentRunner | None = None
 ) -> FastAPI:
@@ -490,6 +536,7 @@ def create_app(
         title="agsrv",
         description="Stateless HTTP API for remote Claude Code execution.",
         version=VERSION,
+        lifespan=_lifespan,
     )
     app.state.settings = settings
     app.state.runner = runner or SdkAgentRunner()
@@ -500,6 +547,7 @@ def create_app(
     app.state.codex_healthy = False
     _add_meta_routes(app, settings)
     _add_query_routes(app)
+    _add_job_routes(app)
     return app
 
 
