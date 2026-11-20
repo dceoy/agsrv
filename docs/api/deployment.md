@@ -109,7 +109,7 @@ curl -sS http://localhost:8000/v1/info -H "Authorization: Bearer $AGSRV_API_KEY"
 curl -sS http://localhost:8000/v1/query \
   -H "Authorization: Bearer $AGSRV_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "Reply with the single word: pong", "max_turns": 1}'
+  -d '{"agent": "claude", "prompt": "Reply with the single word: pong", "max_turns": 1}'
 ```
 
 A `200` response with `"result": "pong"` confirms authentication, Claude

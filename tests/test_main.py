@@ -215,7 +215,9 @@ def test_health() -> None:
 def test_query_success(tmp_path: Path) -> None:
     """Verify a successful query and transcript serialization."""
     client, runner = client_for(make_settings(tmp_path))
-    response = client.post("/v1/query", json={"prompt": "hi"}, headers=AUTH)
+    response = client.post(
+        "/v1/query", json={"agent": "claude", "prompt": "hi"}, headers=AUTH
+    )
     assert response.status_code == 200
     body = response.json()
     assert body["result"] == "done"
@@ -239,7 +241,9 @@ def test_query_without_messages(tmp_path: Path) -> None:
     """Result-only queries omit the transcript."""
     client, _ = client_for(make_settings(tmp_path))
     response = client.post(
-        "/v1/query", json={"prompt": "hi", "include_messages": False}, headers=AUTH
+        "/v1/query",
+        json={"agent": "claude", "prompt": "hi", "include_messages": False},
+        headers=AUTH,
     )
     assert response.status_code == 200
     body = response.json()
@@ -260,7 +264,9 @@ def test_query_agent_error_is_200(tmp_path: Path) -> None:
         session_id="s",
     )
     client, _ = client_for(make_settings(tmp_path), FakeRunner([result]))
-    response = client.post("/v1/query", json={"prompt": "hi"}, headers=AUTH)
+    response = client.post(
+        "/v1/query", json={"agent": "claude", "prompt": "hi"}, headers=AUTH
+    )
     assert response.status_code == 200
     assert response.json()["is_error"] is True
 
@@ -269,26 +275,46 @@ def test_auth_matrix(tmp_path: Path) -> None:
     """Verify the authentication matrix."""
     disabled = make_settings(tmp_path, api_key=None)
     client, _ = client_for(disabled)
-    assert client.post("/v1/query", json={"prompt": "x"}).status_code == 503
+    assert (
+        client.post("/v1/query", json={"agent": "claude", "prompt": "x"}).status_code
+        == 503
+    )
     assert client.get("/v1/info").status_code == 503
 
     for blank in ("", "   "):
         settings = replace(make_settings(tmp_path), api_key=blank)
         client, _ = client_for(settings)
-        assert client.post("/v1/query", json={"prompt": "x"}).status_code == 503
+        assert (
+            client.post(
+                "/v1/query", json={"agent": "claude", "prompt": "x"}
+            ).status_code
+            == 503
+        )
 
     open_settings = make_settings(tmp_path, api_key=None, allow_unauthenticated=True)
     client, _ = client_for(open_settings)
-    assert client.post("/v1/query", json={"prompt": "x"}).status_code == 200
+    assert (
+        client.post("/v1/query", json={"agent": "claude", "prompt": "x"}).status_code
+        == 200
+    )
 
     client, _ = client_for(make_settings(tmp_path))
-    assert client.post("/v1/query", json={"prompt": "x"}).status_code == 401
+    assert (
+        client.post("/v1/query", json={"agent": "claude", "prompt": "x"}).status_code
+        == 401
+    )
     wrong = {"Authorization": "Bearer nope"}
     assert (
-        client.post("/v1/query", json={"prompt": "x"}, headers=wrong).status_code == 401
+        client.post(
+            "/v1/query", json={"agent": "claude", "prompt": "x"}, headers=wrong
+        ).status_code
+        == 401
     )
     assert (
-        client.post("/v1/query", json={"prompt": "x"}, headers=AUTH).status_code == 200
+        client.post(
+            "/v1/query", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+        ).status_code
+        == 200
     )
 
 
@@ -300,7 +326,9 @@ def test_cwd(tmp_path: Path) -> None:
 
     def post(cwd: str) -> int:
         return client.post(
-            "/v1/query", json={"prompt": "x", "cwd": cwd}, headers=AUTH
+            "/v1/query",
+            json={"agent": "claude", "prompt": "x", "cwd": cwd},
+            headers=AUTH,
         ).status_code
 
     assert post("/") == 403
@@ -326,7 +354,9 @@ def test_cwd_symlinks_and_malformed(tmp_path: Path) -> None:
 
     def post(cwd: str) -> int:
         return client.post(
-            "/v1/query", json={"prompt": "x", "cwd": cwd}, headers=AUTH
+            "/v1/query",
+            json={"agent": "claude", "prompt": "x", "cwd": cwd},
+            headers=AUTH,
         ).status_code
 
     assert post("escape") == 403
@@ -346,18 +376,22 @@ def test_cwd_containment_precedes_directory_check(
 
     monkeypatch.setattr(Path, "is_dir", fail_is_dir)
     response = client.post(
-        "/v1/query", json={"prompt": "x", "cwd": "../outside"}, headers=AUTH
+        "/v1/query",
+        json={"agent": "claude", "prompt": "x", "cwd": "../outside"},
+        headers=AUTH,
     )
     assert response.status_code == 403
     assert response.json() == {"detail": "cwd is outside the workspace root"}
-    response = client.post("/v1/query", json={"prompt": "x", "cwd": "."}, headers=AUTH)
+    response = client.post(
+        "/v1/query", json={"agent": "claude", "prompt": "x", "cwd": "."}, headers=AUTH
+    )
     assert response.status_code == 400
     assert response.json() == {"detail": "cwd is not a valid path"}
 
 
 def test_bypass_permissions(tmp_path: Path) -> None:
     """Verify bypassPermissions is opt-in."""
-    payload = {"prompt": "x", "permission_mode": "bypassPermissions"}
+    payload = {"agent": "claude", "prompt": "x", "permission_mode": "bypassPermissions"}
     client, _ = client_for(make_settings(tmp_path))
     assert client.post("/v1/query", json=payload, headers=AUTH).status_code == 403
     client, _ = client_for(make_settings(tmp_path, allow_bypass_permissions=True))
@@ -368,13 +402,16 @@ def test_validation(tmp_path: Path) -> None:
     """Verify request validation."""
     client, _ = client_for(make_settings(tmp_path, max_timeout_seconds=10))
     assert (
-        client.post("/v1/query", json={"prompt": ""}, headers=AUTH).status_code == 422
+        client.post(
+            "/v1/query", json={"agent": "claude", "prompt": ""}, headers=AUTH
+        ).status_code
+        == 422
     )
-    stateful = {"prompt": "x", "resume": "abc"}
+    stateful = {"agent": "claude", "prompt": "x", "resume": "abc"}
     assert client.post("/v1/query", json=stateful, headers=AUTH).status_code == 422
-    bad_sandbox = {"prompt": "x", "sandbox": "maybe"}
+    bad_sandbox = {"agent": "claude", "prompt": "x", "sandbox": "maybe"}
     assert client.post("/v1/query", json=bad_sandbox, headers=AUTH).status_code == 422
-    too_long = {"prompt": "x", "timeout_seconds": 11}
+    too_long = {"agent": "claude", "prompt": "x", "timeout_seconds": 11}
     assert client.post("/v1/query", json=too_long, headers=AUTH).status_code == 400
 
 
@@ -382,18 +419,22 @@ def test_runner_failures(tmp_path: Path) -> None:
     """Verify 502 and 504 mappings."""
     settings = make_settings(tmp_path)
     client, _ = client_for(settings, FakeRunner(fail_after=1))
-    response = client.post("/v1/query", json={"prompt": "x"}, headers=AUTH)
+    response = client.post(
+        "/v1/query", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+    )
     assert response.status_code == 502
     assert response.json() == {"detail": "agent execution failed"}
 
     no_result = FakeRunner(canned()[:2])
     client, _ = client_for(settings, no_result)
-    response = client.post("/v1/query", json={"prompt": "x"}, headers=AUTH)
+    response = client.post(
+        "/v1/query", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+    )
     assert response.status_code == 502
     assert response.json() == {"detail": "agent stream ended without a result message"}
 
     client, _ = client_for(settings, FakeRunner(delay=1.0))
-    slow = {"prompt": "x", "timeout_seconds": 0.05}
+    slow = {"agent": "claude", "prompt": "x", "timeout_seconds": 0.05}
     assert client.post("/v1/query", json=slow, headers=AUTH).status_code == 504
 
 
@@ -401,10 +442,15 @@ def test_concurrency_limit(tmp_path: Path) -> None:
     """Verify 429 when no capacity is available."""
     client, _ = client_for(make_settings(tmp_path, max_concurrency=0))
     assert (
-        client.post("/v1/query", json={"prompt": "x"}, headers=AUTH).status_code == 429
+        client.post(
+            "/v1/query", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+        ).status_code
+        == 429
     )
     assert (
-        client.post("/v1/query/stream", json={"prompt": "x"}, headers=AUTH).status_code
+        client.post(
+            "/v1/query/stream", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+        ).status_code
         == 429
     )
 
@@ -414,7 +460,9 @@ def test_semaphore_released(tmp_path: Path) -> None:
     client, _ = client_for(make_settings(tmp_path, max_concurrency=1))
     for _ in range(2):
         assert (
-            client.post("/v1/query", json={"prompt": "x"}, headers=AUTH).status_code
+            client.post(
+                "/v1/query", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+            ).status_code
             == 200
         )
     client, _ = client_for(
@@ -422,7 +470,9 @@ def test_semaphore_released(tmp_path: Path) -> None:
     )
     for _ in range(2):
         assert (
-            client.post("/v1/query", json={"prompt": "x"}, headers=AUTH).status_code
+            client.post(
+                "/v1/query", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+            ).status_code
             == 502
         )
 
@@ -446,7 +496,9 @@ def parse_sse(text: str) -> list[dict[str, Any]]:
 def test_stream_success(tmp_path: Path) -> None:
     """Verify SSE output."""
     client, _ = client_for(make_settings(tmp_path))
-    response = client.post("/v1/query/stream", json={"prompt": "x"}, headers=AUTH)
+    response = client.post(
+        "/v1/query/stream", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+    )
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
     assert response.headers["cache-control"] == "no-cache"
@@ -465,23 +517,32 @@ def test_stream_errors(tmp_path: Path) -> None:
     """Verify stream errors and auth."""
     settings = make_settings(tmp_path)
     client, _ = client_for(settings, FakeRunner(fail_after=2))
-    response = client.post("/v1/query/stream", json={"prompt": "x"}, headers=AUTH)
+    response = client.post(
+        "/v1/query/stream", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+    )
     events = parse_sse(response.text)
     assert [e["type"] for e in events] == ["system", "assistant", "error"]
     assert events[-1]["detail"] == "agent execution failed"
 
     client, _ = client_for(settings, FakeRunner(delay=1.0))
-    slow = {"prompt": "x", "timeout_seconds": 0.05}
+    slow = {"agent": "claude", "prompt": "x", "timeout_seconds": 0.05}
     events = parse_sse(client.post("/v1/query/stream", json=slow, headers=AUTH).text)
     assert events == [{"type": "error", "detail": "agent run timed out"}]
 
-    assert client.post("/v1/query/stream", json={"prompt": "x"}).status_code == 401
+    assert (
+        client.post(
+            "/v1/query/stream", json={"agent": "claude", "prompt": "x"}
+        ).status_code
+        == 401
+    )
 
 
 def test_stream_without_result(tmp_path: Path) -> None:
     """Verify a stream ending without a result emits an error event."""
     client, _ = client_for(make_settings(tmp_path), FakeRunner(canned()[:1]))
-    response = client.post("/v1/query/stream", json={"prompt": "x"}, headers=AUTH)
+    response = client.post(
+        "/v1/query/stream", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+    )
     events = parse_sse(response.text)
     assert [e["type"] for e in events] == ["system", "error"]
     assert "without a result" in events[-1]["detail"]
@@ -491,7 +552,9 @@ def test_stream_releases_slot(tmp_path: Path) -> None:
     """Verify a finished stream releases its concurrency slot."""
     client, _ = client_for(make_settings(tmp_path, max_concurrency=1))
     for _ in range(2):
-        response = client.post("/v1/query/stream", json={"prompt": "x"}, headers=AUTH)
+        response = client.post(
+            "/v1/query/stream", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+        )
         assert response.status_code == 200
 
 
@@ -533,10 +596,14 @@ async def test_concurrency_in_flight(tmp_path: Path) -> None:
     transport = httpx.ASGITransport(app=test_app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         first = asyncio.create_task(
-            client.post("/v1/query", json={"prompt": "x"}, headers=AUTH)
+            client.post(
+                "/v1/query", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+            )
         )
         await runner.started.wait()
-        second = await client.post("/v1/query", json={"prompt": "x"}, headers=AUTH)
+        second = await client.post(
+            "/v1/query", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+        )
         assert second.status_code == 429
         runner.release.set()
         assert (await first).status_code == 200
@@ -547,7 +614,7 @@ def test_info(tmp_path: Path) -> None:
     client, _ = client_for(make_settings(tmp_path, default_model="m1"))
     body = client.get("/v1/info", headers=AUTH).json()
     assert body == {
-        "version": "0.2.1",
+        "version": "0.2.0",
         "stateless": True,
         "default_model": "m1",
         "workspace_root": str(tmp_path.resolve()),
@@ -574,6 +641,9 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
         "AGSRV_MAX_TIMEOUT_SECONDS",
         "AGSRV_SANDBOX_MODE",
         "AGSRV_SANDBOX_ALLOWED_DOMAINS",
+        "AGSRV_CODEX_BIN",
+        "AGSRV_CODEX_ENABLED",
+        "AGSRV_CODEX_MAX_CONCURRENCY",
     ):
         monkeypatch.delenv(name, raising=False)
     settings = Settings.from_env()
@@ -588,6 +658,9 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert settings.max_timeout_seconds == pytest.approx(3600.0)
     assert settings.sandbox_mode == "off"
     assert settings.sandbox_allowed_domains == DEFAULT_SANDBOX_ALLOWED_DOMAINS
+    assert settings.codex_bin is None
+    assert settings.codex_enabled is True
+    assert settings.codex_max_concurrency == 2
     assert Settings().workspace_root == Path.cwd().resolve()
 
 
@@ -604,6 +677,9 @@ def test_settings_from_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     monkeypatch.setenv("AGSRV_MAX_TIMEOUT_SECONDS", "12.5")
     monkeypatch.setenv("AGSRV_SANDBOX_MODE", "opt-in")
     monkeypatch.setenv("AGSRV_SANDBOX_ALLOWED_DOMAINS", " GitHub.com , *.example.org,,")
+    monkeypatch.setenv("AGSRV_CODEX_BIN", "/usr/bin/codex")
+    monkeypatch.setenv("AGSRV_CODEX_ENABLED", "false")
+    monkeypatch.setenv("AGSRV_CODEX_MAX_CONCURRENCY", "3")
     settings = Settings.from_env()
     assert settings.api_key == "k"
     assert settings.allow_unauthenticated is True
@@ -616,6 +692,9 @@ def test_settings_from_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     assert settings.max_timeout_seconds == pytest.approx(12.5)
     assert settings.sandbox_mode == "opt-in"
     assert settings.sandbox_allowed_domains == ("github.com", "*.example.org")
+    assert settings.codex_bin == "/usr/bin/codex"
+    assert settings.codex_enabled is False
+    assert settings.codex_max_concurrency == 3
 
 
 @pytest.mark.parametrize(
@@ -717,7 +796,9 @@ def test_settings_api_key_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_build_options(tmp_path: Path) -> None:
     """Verify defaults versus overrides."""
     settings = make_settings(tmp_path, default_model="dm")
-    options = build_options(QueryRequest(prompt="x"), settings, tmp_path)
+    options = build_options(
+        QueryRequest(agent="claude", prompt="x"), settings, tmp_path
+    )
     assert options.model == "dm"
     assert options.permission_mode == "acceptEdits"
     assert options.allowed_tools == ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
@@ -732,6 +813,7 @@ def test_build_options(tmp_path: Path) -> None:
     assert options.continue_conversation is False
 
     request = QueryRequest(
+        agent="claude",
         prompt="x",
         model="o",
         system_prompt="sp",
@@ -870,21 +952,30 @@ def test_result_error_responses(tmp_path: Path) -> None:
     )
     messages = [canned()[0], result]
     client, _ = client_for(make_settings(tmp_path), ResultErrorRunner(messages))
-    response = client.post("/v1/query", json={"prompt": "x"}, headers=AUTH)
+    response = client.post(
+        "/v1/query", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+    )
     assert response.status_code == 200
     assert response.json()["is_error"] is True
     assert [m["type"] for m in response.json()["messages"]] == ["system", "result"]
     events = parse_sse(
-        client.post("/v1/query/stream", json={"prompt": "x"}, headers=AUTH).text
+        client.post(
+            "/v1/query/stream", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+        ).text
     )
     assert [e["type"] for e in events] == ["system", "result"]
     assert events[-1]["is_error"] is True
     client, _ = client_for(make_settings(tmp_path), ResultErrorRunner([]))
     assert (
-        client.post("/v1/query", json={"prompt": "x"}, headers=AUTH).status_code == 502
+        client.post(
+            "/v1/query", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+        ).status_code
+        == 502
     )
     events = parse_sse(
-        client.post("/v1/query/stream", json={"prompt": "x"}, headers=AUTH).text
+        client.post(
+            "/v1/query/stream", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+        ).text
     )
     assert events == [{"type": "error", "detail": "agent execution failed"}]
 
@@ -923,7 +1014,9 @@ async def test_stream_cleanup_with_stalled_consumer(
     )
     request = Request({"type": "http", "app": test_app})
     endpoint = cast("Callable[..., Awaitable[StreamingResponse]]", route.endpoint)
-    response = await endpoint(QueryRequest(prompt="x", timeout_seconds=0.05), request)
+    response = await endpoint(
+        QueryRequest(agent="claude", prompt="x", timeout_seconds=0.05), request
+    )
     stream = cast("AsyncGenerator[str]", response.body_iterator)
     assert parse_sse(await anext(stream))[0]["type"] == "system"
     await asyncio.wait_for(runner.started.wait(), 1)
@@ -1018,7 +1111,7 @@ async def test_asgi_disconnect_waits_for_cleanup(
             request_sent = True
             return {
                 "type": "http.request",
-                "body": b'{"prompt":"x"}',
+                "body": b'{"agent": "claude", "prompt":"x"}',
                 "more_body": False,
             }
         await first_event.wait()
@@ -1052,7 +1145,7 @@ async def test_asgi_disconnect_waits_for_cleanup(
     transport = httpx.ASGITransport(app=test_app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
-            "/v1/query/stream", json={"prompt": "x"}, headers=AUTH
+            "/v1/query/stream", json={"agent": "claude", "prompt": "x"}, headers=AUTH
         )
     assert response.status_code == 200
     assert parse_sse(response.text)[-1]["type"] == "result"
@@ -1096,7 +1189,7 @@ async def test_asgi_external_cancel_holds_slot_until_cleanup(
             request_sent = True
             return {
                 "type": "http.request",
-                "body": b'{"prompt":"x"}',
+                "body": b'{"agent": "claude", "prompt":"x"}',
                 "more_body": False,
             }
         await first_event.wait()
@@ -1154,7 +1247,7 @@ async def test_asgi_cancel_inside_send_cleans_up(tmp_path: Path) -> None:
             request_sent = True
             return {
                 "type": "http.request",
-                "body": b'{"prompt":"x"}',
+                "body": b'{"agent": "claude", "prompt":"x"}',
                 "more_body": False,
             }
         await asyncio.Event().wait()
@@ -1206,7 +1299,9 @@ def test_stream_heartbeat(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     """A silent run sends comments before its first data event."""
     monkeypatch.setattr("agsrv.main.HEARTBEAT_INTERVAL", 0.01)
     client, _ = client_for(make_settings(tmp_path), FakeRunner(delay=0.05))
-    response = client.post("/v1/query/stream", json={"prompt": "x"}, headers=AUTH)
+    response = client.post(
+        "/v1/query/stream", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+    )
     assert response.text.startswith(": heartbeat\n\n")
     assert parse_sse(response.text)[-1]["type"] == "result"
 
@@ -1232,7 +1327,9 @@ async def test_query_disconnect_cancels_and_releases(
     )
     endpoint = cast("Callable[..., Coroutine[Any, Any, Any]]", route.endpoint)
     request = Request({"type": "http", "app": test_app}, receive)
-    first = asyncio.create_task(endpoint(QueryRequest(prompt="x"), request))
+    first = asyncio.create_task(
+        endpoint(QueryRequest(agent="claude", prompt="x"), request)
+    )
     await asyncio.wait_for(runner.started.wait(), 1)
     disconnected = True
     result = await asyncio.wait_for(first, 1)
@@ -1241,7 +1338,9 @@ async def test_query_disconnect_cancels_and_releases(
     runner.release.set()
     transport = httpx.ASGITransport(app=test_app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.post("/v1/query", json={"prompt": "x"}, headers=AUTH)
+        response = await client.post(
+            "/v1/query", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+        )
     assert response.status_code == 200
 
 
@@ -1259,7 +1358,7 @@ async def test_query_asgi_disconnect_returns_499(tmp_path: Path) -> None:
             request_sent = True
             return {
                 "type": "http.request",
-                "body": b'{"prompt":"x"}',
+                "body": b'{"agent": "claude", "prompt":"x"}',
                 "more_body": False,
             }
         await runner.started.wait()
@@ -1325,7 +1424,9 @@ async def test_query_external_cancel_propagates(
     )
     endpoint = cast("Callable[..., Coroutine[Any, Any, Any]]", route.endpoint)
     request = Request({"type": "http", "app": test_app}, receive)
-    task = asyncio.create_task(endpoint(QueryRequest(prompt="x"), request))
+    task = asyncio.create_task(
+        endpoint(QueryRequest(agent="claude", prompt="x"), request)
+    )
     await asyncio.wait_for(runner.started.wait(), 1)
     if not disconnect:
         task.cancel()
@@ -1352,7 +1453,7 @@ async def test_query_disconnect_coalesced_external_cancel(tmp_path: Path) -> Non
     endpoint = cast("Callable[..., Coroutine[Any, Any, Any]]", route.endpoint)
     task = asyncio.create_task(
         endpoint(
-            QueryRequest(prompt="x"),
+            QueryRequest(agent="claude", prompt="x"),
             Request({"type": "http", "app": test_app}, receive),
         )
     )
@@ -1387,7 +1488,7 @@ async def test_stream_header_send_failure_releases_slot(
             request_sent = True
             return {
                 "type": "http.request",
-                "body": b'{"prompt":"x"}',
+                "body": b'{"agent": "claude", "prompt":"x"}',
                 "more_body": False,
             }
         await asyncio.Event().wait()
@@ -1422,7 +1523,7 @@ async def test_stream_header_send_failure_releases_slot(
     transport = httpx.ASGITransport(app=test_app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
-            "/v1/query/stream", json={"prompt": "x"}, headers=AUTH
+            "/v1/query/stream", json={"agent": "claude", "prompt": "x"}, headers=AUTH
         )
     assert response.status_code == 200
     assert parse_sse(response.text)[-1]["type"] == "result"
@@ -1485,7 +1586,7 @@ def sbx_client(
     )
 
 
-SANDBOX_BODY = {"prompt": "x", "sandbox": True}
+SANDBOX_BODY = {"agent": "claude", "prompt": "x", "sandbox": True}
 
 
 def test_check_sandbox_request() -> None:
@@ -1505,7 +1606,9 @@ def test_sandbox_rejected_when_off(tmp_path: Path) -> None:
     """Verify sandbox requests are rejected when disabled."""
     client, runner = client_for(make_settings(tmp_path))
     response = client.post(
-        "/v1/query", json={"prompt": "x", "sandbox": True}, headers=AUTH
+        "/v1/query",
+        json={"agent": "claude", "prompt": "x", "sandbox": True},
+        headers=AUTH,
     )
     assert response.status_code == 403
     assert response.json() == {"detail": "sandbox is disabled (AGSRV_SANDBOX_MODE=off)"}
@@ -1517,7 +1620,9 @@ def test_sandbox_stream_rejected_when_off(tmp_path: Path) -> None:
     """Verify the stream endpoint rejects sandbox requests when disabled."""
     client, runner = client_for(make_settings(tmp_path))
     response = client.post(
-        "/v1/query/stream", json={"prompt": "x", "sandbox": True}, headers=AUTH
+        "/v1/query/stream",
+        json={"agent": "claude", "prompt": "x", "sandbox": True},
+        headers=AUTH,
     )
     assert response.status_code == 403
     assert runner.stream_calls == 0
@@ -1528,7 +1633,9 @@ def test_sandbox_false_when_off(tmp_path: Path) -> None:
     """Verify an explicit sandbox=false behaves as before."""
     client, runner = client_for(make_settings(tmp_path))
     response = client.post(
-        "/v1/query", json={"prompt": "x", "sandbox": False}, headers=AUTH
+        "/v1/query",
+        json={"agent": "claude", "prompt": "x", "sandbox": False},
+        headers=AUTH,
     )
     assert response.status_code == 200
     assert runner.options is not None
@@ -1566,7 +1673,9 @@ def test_sandbox_stream_opt_in_enabled(sbx: SandboxEnv) -> None:
 def test_sandbox_opt_in_not_requested(tmp_path: Path) -> None:
     """Verify opt-in mode does not sandbox unless requested."""
     client, runner = client_for(make_settings(tmp_path, sandbox_mode="opt-in"))
-    response = client.post("/v1/query", json={"prompt": "x"}, headers=AUTH)
+    response = client.post(
+        "/v1/query", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+    )
     assert response.status_code == 200
     assert runner.options is not None
     assert runner.options.sandbox is None
@@ -1617,7 +1726,9 @@ def test_sandbox_request_mode_overrides_default(sbx: SandboxEnv) -> None:
 def test_unsandboxed_egress_mode_allowed(sbx: SandboxEnv) -> None:
     """Verify the egress guard applies to sandboxed runs only."""
     client, runner = sbx_client(sbx, permission_mode="auto")
-    response = client.post("/v1/query", json={"prompt": "x"}, headers=AUTH)
+    response = client.post(
+        "/v1/query", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+    )
     assert response.status_code == 200
     assert runner.stream_calls == 1
 
@@ -1664,7 +1775,10 @@ def test_unsandboxed_cwd_at_home_allowed(sbx: SandboxEnv) -> None:
     """Verify the cache guard applies to sandboxed runs only."""
     client, runner = sbx_client(sbx, root=sbx.home)
     assert (
-        client.post("/v1/query", json={"prompt": "x"}, headers=AUTH).status_code == 200
+        client.post(
+            "/v1/query", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+        ).status_code
+        == 200
     )
     assert runner.stream_calls == 1
 
@@ -1797,7 +1911,7 @@ def test_sandbox_setup_failure_is_controlled(
         assert response.status_code == 503
         assert "sandbox unavailable" in response.json()["detail"]
     assert runner.stream_calls == 0
-    ok = client.post("/v1/query", json={"prompt": "x"}, headers=AUTH)
+    ok = client.post("/v1/query", json={"agent": "claude", "prompt": "x"}, headers=AUTH)
     assert ok.status_code == 200
 
 
@@ -1886,7 +2000,9 @@ def test_build_options_failure_releases_slot(
     test_app = create_app(make_settings(sbx.workspace, max_concurrency=1), FakeRunner())
     client = TestClient(test_app, raise_server_exceptions=False)
     for _ in range(2):
-        response = client.post("/v1/query", json={"prompt": "x"}, headers=AUTH)
+        response = client.post(
+            "/v1/query", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+        )
         assert response.status_code == 500
 
 

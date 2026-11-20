@@ -1,13 +1,13 @@
 # agsrv
 
-Stateless HTTP API for remote Claude Code execution powered by Claude Agent SDK.
+Stateless HTTP API for remote Claude and Codex execution using their Python SDKs.
 
 [![CI](https://github.com/dceoy/agsrv/actions/workflows/ci.yml/badge.svg)](https://github.com/dceoy/agsrv/actions/workflows/ci.yml)
 
-Each request is one ephemeral `claude_agent_sdk.query()` run. There are no
+Each request is one ephemeral Claude or Codex run. There are no
 sessions, no resume, and no server-side conversation state. A client on another
-machine POSTs a prompt and receives the agent result plus the full message
-transcript, either as one JSON document or as a Server-Sent Events stream.
+machine POSTs a prompt and receives the agent result as JSON. Claude can also
+include a message transcript and supports Server-Sent Events streaming.
 
 ## Endpoints
 
@@ -15,8 +15,10 @@ transcript, either as one JSON document or as a Server-Sent Events stream.
 | ------ | ------------------ | ---- | ------------------------------------------ |
 | GET    | `/health`          | no   | Readiness probe: `{"status": "ok"}`        |
 | GET    | `/v1/info`         | yes  | Server defaults and limits                 |
-| POST   | `/v1/query`        | yes  | Run one agent query, return the transcript |
-| POST   | `/v1/query/stream` | yes  | Same, streamed as SSE                      |
+| GET    | `/v1/agents`       | yes  | Agent capabilities and health              |
+| GET    | `/v1/agents/codex/rate-limits` | yes | Codex account limits              |
+| POST   | `/v1/query`        | yes  | Run one agent query, return the result |
+| POST   | `/v1/query/stream` | yes  | Run one Claude query, streamed as SSE                      |
 
 See [docs/api/rest-api.md](docs/api/rest-api.md) for the full reference.
 
@@ -38,18 +40,21 @@ Client (another machine, via TLS or a private network):
 curl -sS https://agsrv.example.net/v1/query \
   -H "Authorization: Bearer $AGSRV_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "List the files in this directory", "cwd": "myproject", "max_turns": 5}'
+  -d '{"agent": "claude", "prompt": "List the files in this directory", "cwd": "myproject", "max_turns": 5}'
 
 curl -N https://agsrv.example.net/v1/query/stream \
   -H "Authorization: Bearer $AGSRV_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "Summarize README.md"}'
+  -d '{"agent": "claude", "prompt": "Summarize README.md"}'
 ```
 
 ## Configuration
 
 | Variable                          | Default                          | Description                                              |
 | --------------------------------- | -------------------------------- | -------------------------------------------------------- |
+| `AGSRV_CODEX_BIN`                | unset (SDK bundled binary)       | Optional Codex executable path                           |
+| `AGSRV_CODEX_ENABLED`            | `true`                           | Enable Codex                                             |
+| `AGSRV_CODEX_MAX_CONCURRENCY`    | `2`                              | Simultaneous Codex runs                                  |
 | `AGSRV_API_KEY`                  | unset                            | Bearer token clients must send                           |
 | `AGSRV_ALLOW_UNAUTHENTICATED`    | `false`                          | Allow requests with no key configured (local dev only)   |
 | `AGSRV_WORKSPACE_ROOT`           | current directory                | All request `cwd` values must resolve inside this path   |
@@ -77,6 +82,12 @@ and at most 253 characters in total. A single leading `*.` wildcard is allowed;
 embedded wildcards, empty labels (`a..com`), trailing dots, and raw Unicode
 names (use punycode, `xn--...`) abort startup. Entries are checked as ASCII
 before lowercasing, so look-alike characters such as the Kelvin sign are rejected.
+
+Codex requests use `"agent": "codex"` and may set `options.sandbox` to
+`"read-only"` (default) or `"workspace-write"`, and `options.network_access`
+to a boolean (default `false`). Codex threads are ephemeral, approvals are
+denied, and explicit network access uses the SDK’s low-level sandbox policy.
+Rate limits come from `account/rateLimits/read`.
 
 ## Security model
 
@@ -128,12 +139,12 @@ before lowercasing, so look-alike characters such as the Kelvin sign are rejecte
 - **`bypassPermissions` is opt-in** via `AGSRV_ALLOW_BYPASS_PERMISSIONS`.
   It is not a meaningful boundary on its own: with `Bash` auto-approved, the
   default posture is already shell-equivalent.
-- **Client disconnects.** `POST /v1/query` promptly cancels the run and frees
+- **Client disconnects.** Claude `POST /v1/query` promptly cancels the run and frees
   its concurrency slot when the client disconnects. The streaming endpoint
   also cancels the run when its consumer goes away.
 - **Bind and TLS.** Bind to loopback or a private interface and put TLS in front
   (reverse proxy, Tailscale, or an SSH tunnel). The API key travels in a header.
-- **Statelessness.** Request bodies containing `resume`, `session_id`, or any
+- **Claude statelessness.** Request bodies containing `resume`, `session_id`, or any
   other unknown field are rejected with 422. Runs are hermetic: CLI session
   persistence is disabled, so no resumable transcript is written, and host
   and project settings are not loaded (`setting_sources` is empty), so hooks

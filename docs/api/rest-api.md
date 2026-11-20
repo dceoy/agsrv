@@ -5,13 +5,13 @@ FastAPI also serves `/docs` and `/openapi.json`.
 
 ## Statelessness contract
 
-Every request is one ephemeral SDK `query()` run. The server keeps no sessions
+Every request is one ephemeral Claude or Codex run. The server keeps no sessions
 and offers no resume, continue, or fork. The `session_id` in responses is
 informational only and cannot be sent back: request bodies with unknown fields
 (such as `resume` or `session_id`) are rejected with `422`. To continue work,
 include the needed context in the next prompt.
 
-Runs are hermetic. CLI session persistence is disabled, so the CLI writes no
+Claude runs are hermetic. CLI session persistence is disabled, so the CLI writes no
 resumable transcript, and host and project settings are not loaded
 (`setting_sources` is empty): hooks, MCP servers, and permission rules from
 the host's or the workspace's `.claude/settings.json` never enter a run. Auto
@@ -32,7 +32,7 @@ No authentication.
 
 ```json
 {
-  "version": "0.2.1",
+  "version": "0.2.0",
   "stateless": true,
   "default_model": null,
   "workspace_root": "/srv/workspaces",
@@ -47,10 +47,11 @@ No authentication.
 
 ## `POST /v1/query`
 
-Request (only `prompt` is required):
+Claude request (`agent` and `prompt` are required):
 
 ```json
 {
+  "agent": "claude",
   "prompt": "List the Python files",
   "system_prompt": null,
   "model": null,
@@ -93,7 +94,7 @@ Request (only `prompt` is required):
 - `max_turns`: 1–1000. `max_budget_usd` and `timeout_seconds` must be > 0;
   `timeout_seconds` may not exceed `AGSRV_MAX_TIMEOUT_SECONDS`.
 
-If the client disconnects, the run is promptly cancelled and its concurrency
+If a Claude client disconnects, the run is promptly cancelled and its concurrency
 slot is freed. The server internally answers 499 without logging an error; the
 response is not delivered to the disconnected client.
 
@@ -101,6 +102,7 @@ Response:
 
 ```json
 {
+  "agent": "claude",
   "result": "There are 3 Python files.",
   "session_id": "0b0e...",
   "model": "...",
@@ -159,9 +161,46 @@ An agent-level failure (`is_error: true`, e.g. `subtype: "error_max_turns"`) is
 still HTTP `200`. Message types not listed above are emitted as
 `{"type": "<snake_case_class>", "data": {...}}`.
 
+### Codex requests
+
+```json
+{ "agent": "codex", "prompt": "Summarize this project", "cwd": ".",
+  "model": null, "effort": "high", "timeout_seconds": 300,
+  "include_messages": false,
+  "options": { "sandbox": "read-only", "network_access": false } }
+```
+
+`options.sandbox` is `read-only` (default) or `workspace-write`;
+`network_access` defaults to `false`. `cwd` is confined to the same workspace
+root as Claude. `include_messages` is accepted for consistency; Codex returns
+a turn summary rather than a transcript. The response contains `agent`,
+`result`, `model`, `is_error`, `duration_ms`, `usage`, and `backend` with the
+turn ID, status and executed commands. The model comes from thread metadata,
+or is null when unavailable.
+
+Codex threads use `ephemeral=true` (D1) and approval policy `never`, with an
+additional handler that declines all approval requests. Rate limits use the
+typed `account/rateLimits/read` request (D2). For network access the adapter
+uses an explicit low-level sandbox policy; otherwise it uses SDK presets (D3).
+Set `AGSRV_CODEX_ENABLED` (default `true`), `AGSRV_CODEX_BIN` (optional SDK
+binary override), and `AGSRV_CODEX_MAX_CONCURRENCY` (default `2`). A disabled
+or unavailable backend returns 503 without affecting Claude.
+
+## `GET /v1/agents`
+
+Returns `claude` and `codex` objects with `enabled`, `healthy`, `default_model`,
+and `supports` flags for `sandbox`, `network_access`, `rate_limits`, and
+`streaming`. Codex initialization health is cached for approximately 30 seconds.
+
+## `GET /v1/agents/codex/rate-limits`
+
+Returns `plan`, `primary` and `secondary` windows (`used_percent` and
+`resets_at`), `reached_type`, `reset_credits`, and the raw SDK payload in
+`backend`. Missing windows are null.
+
 ## `POST /v1/query/stream`
 
-Same request body. All validation (auth, `cwd`, permissions, concurrency)
+Claude request body only (`agent: "claude"`). All validation (auth, `cwd`, permissions, concurrency)
 happens before streaming starts, so those failures are ordinary HTTP errors.
 The response is `text/event-stream`; each SDK message is one event:
 
@@ -200,7 +239,7 @@ shutdown can extend beyond it.
 | 422    | Invalid body (empty prompt, unknown/stateful fields, bad ranges)       |
 | 429    | Concurrency limit reached (decided before sandbox setup, so it takes precedence over sandbox-setup 503s) |
 | 502    | SDK/CLI failure, or the run ended without a result message             |
-| 503    | `AGSRV_API_KEY` not configured and unauthenticated access not allowed; sandbox prerequisites unavailable (home, cache directory or a group/other-writable `~/.cache`, bundled CLI) |
+| 503    | `AGSRV_API_KEY` not configured and unauthenticated access not allowed; sandbox prerequisites unavailable or Codex disabled/unavailable |
 | 504    | Run exceeded its timeout                                               |
 
 Errors use FastAPI's `{"detail": "..."}` body.

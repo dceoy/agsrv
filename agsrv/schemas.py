@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 # Pydantic resolves these Literal aliases at runtime, so the import cannot
 # move into a TYPE_CHECKING block.
@@ -15,6 +15,7 @@ class QueryRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    agent: Literal["claude"]
     prompt: str = Field(min_length=1)
     system_prompt: str | None = None
     model: str | None = None
@@ -30,9 +31,32 @@ class QueryRequest(BaseModel):
     sandbox: bool = False
 
 
+class CodexOptions(BaseModel):
+    """Codex sandbox settings."""
+
+    model_config = ConfigDict(extra="forbid")
+    sandbox: Literal["read-only", "workspace-write"] = "read-only"
+    network_access: bool = False
+
+
+class CodexQueryRequest(BaseModel):
+    """One ephemeral Codex run."""
+
+    model_config = ConfigDict(extra="forbid")
+    agent: Literal["codex"]
+    prompt: str = Field(min_length=1)
+    model: str | None = None
+    effort: Literal["minimal", "low", "medium", "high", "xhigh"] | None = None
+    cwd: str | None = None
+    timeout_seconds: float | None = Field(default=None, gt=0)
+    include_messages: bool = True
+    options: CodexOptions = Field(default_factory=CodexOptions)
+
+
 class QueryResponse(BaseModel):
     """Final agent result with an optional message transcript."""
 
+    agent: Literal["claude"] = "claude"
     result: str | None
     session_id: str
     model: str | None
@@ -45,6 +69,18 @@ class QueryResponse(BaseModel):
     usage: dict[str, Any] | None
     stop_reason: str | None
     messages: list[dict[str, Any]]
+
+
+class CodexQueryResponse(BaseModel):
+    """Final Codex result and backend metadata."""
+
+    agent: Literal["codex"]
+    result: str | None
+    model: str | None
+    is_error: bool
+    duration_ms: int
+    usage: dict[str, Any] | None
+    backend: dict[str, Any]
 
 
 class InfoResponse(BaseModel):
