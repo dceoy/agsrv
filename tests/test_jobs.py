@@ -19,9 +19,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncIterator
     from pathlib import Path
 
-    from claude_agent_sdk import Message
-
-    from claude_agent_sdk import ClaudeAgentOptions
+    from claude_agent_sdk import ClaudeAgentOptions, Message
 
 AUTH = {"Authorization": "Bearer secret"}
 BODY = {"agent": "claude", "prompt": "inspect", "sandbox": False}
