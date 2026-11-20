@@ -221,15 +221,21 @@ transport failures and deadlines have sanitized `error.code` values.
 running jobs remain nonterminal until their child processes are cleaned up.
 
 The job database is SQLite WAL; it must be on durable storage accessible to a
-**single uvicorn worker**. The default path is
+**single uvicorn worker**. An exclusive lock file alongside the database
+prevents concurrent workers or overlapping instances from taking ownership. The default path is
 `~/.local/state/agsrv/jobs.sqlite3` (overridden by `AGSRV_JOBS_DB_PATH`).
 Nonterminal jobs are limited by `AGSRV_JOBS_MAX_PENDING=32`, canonical
 requests by `AGSRV_JOBS_MAX_PAYLOAD_BYTES=65536`, stored results by
 `AGSRV_JOBS_MAX_RESULT_BYTES=1048576`; saturation gives 429 and
 `Retry-After: 5`. Terminal jobs and idempotency keys are retained for
 `AGSRV_JOBS_RETENTION_SECONDS=86400` (24 hours). Garbage collection is
-performed during API access. Overlapping workspaces cannot execute jobs
-simultaneously. The bearer token is the caller identity: **all clients sharing
+performed during API access. Synchronous queries and jobs targeting overlapping
+workspaces cannot execute concurrently. When a result exceeds the configured
+cap, message history is omitted with `messages_truncated: true` while keeping
+the final answer. If the core result is still oversized, a minimal summary is
+stored with `result_truncated: true` so the original execution outcome is not
+misreported. Extremely small caps that cannot fit this summary result in
+`failed` / `result_too_large`. The bearer token is the caller identity: **all clients sharing
 the same API key can read the same jobs**; use separate server credentials and
 instances if isolation between clients is needed. No raw internal errors or
 credentials are included in job status.
