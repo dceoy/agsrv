@@ -8,13 +8,14 @@ Run exactly one ASGI worker for a given jobs database.
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import hashlib
 import json
 import logging
 import sqlite3
-from contextlib import aclosing, closing
+from contextlib import aclosing, asynccontextmanager, closing
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, BinaryIO, cast
 from uuid import uuid4
 
 from fastapi import HTTPException, status
@@ -86,6 +87,7 @@ class JobManager:
         )
         self.started = False
         self.stopping = False
+        self._lock_file: BinaryIO | None = None
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=10)
@@ -97,38 +99,50 @@ class JobManager:
         if self.started:
             return
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with closing(self._connect()) as db:
-            db.execute("PRAGMA journal_mode=WAL")
-            db.execute(
-                """CREATE TABLE IF NOT EXISTS jobs (
-                    job_id TEXT PRIMARY KEY,
-                    caller TEXT NOT NULL,
-                    idempotency_key TEXT,
-                    payload_hash TEXT NOT NULL,
-                    request_json TEXT NOT NULL,
-                    agent TEXT NOT NULL,
-                    workspace TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    created_at TEXT NOT NULL,
-                    started_at TEXT,
-                    finished_at TEXT,
-                    result_json TEXT,
-                    error_code TEXT,
-                    cancel_requested INTEGER NOT NULL DEFAULT 0
-                )"""
-            )
-            db.execute(
-                """CREATE UNIQUE INDEX IF NOT EXISTS jobs_idempotency
-                   ON jobs (caller, idempotency_key)
-                   WHERE idempotency_key IS NOT NULL"""
-            )
-            db.execute(
-                "UPDATE jobs SET status='interrupted', finished_at=?, "
-                "error_code='server_interrupted' WHERE status IN ('queued','running')",
-                (_now(),),
-            )
-            db.commit()
-        self.path.chmod(0o600)
+        lock = self.path.with_name(self.path.name + ".lock").open("a+b")
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            lock.close()
+            raise RuntimeError("jobs database is owned by another worker") from exc
+        self._lock_file = lock
+        try:
+            with closing(self._connect()) as db:
+                db.execute("PRAGMA journal_mode=WAL")
+                db.execute(
+                    """CREATE TABLE IF NOT EXISTS jobs (
+                        job_id TEXT PRIMARY KEY,
+                        caller TEXT NOT NULL,
+                        idempotency_key TEXT,
+                        payload_hash TEXT NOT NULL,
+                        request_json TEXT NOT NULL,
+                        agent TEXT NOT NULL,
+                        workspace TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        started_at TEXT,
+                        finished_at TEXT,
+                        result_json TEXT,
+                        error_code TEXT,
+                        cancel_requested INTEGER NOT NULL DEFAULT 0
+                    )"""
+                )
+                db.execute(
+                    """CREATE UNIQUE INDEX IF NOT EXISTS jobs_idempotency
+                       ON jobs (caller, idempotency_key)
+                       WHERE idempotency_key IS NOT NULL"""
+                )
+                db.execute(
+                    "UPDATE jobs SET status='interrupted', finished_at=?, "
+                    "error_code='server_interrupted' WHERE status IN ('queued','running')",
+                    (_now(),),
+                )
+                db.commit()
+            self.path.chmod(0o600)
+        except BaseException:
+            lock.close()
+            self._lock_file = None
+            raise
         self.started = True
 
     def _gc(self, db: sqlite3.Connection) -> None:
@@ -347,11 +361,23 @@ class JobManager:
             if result is not None
             else None
         )
-        if (
-            serialized is not None
-            and len(serialized.encode()) > settings.jobs_max_result_bytes
-        ):
-            outcome, code, serialized = "failed", "result_too_large", None
+        if serialized is not None and len(serialized.encode()) > settings.jobs_max_result_bytes:
+            compact = dict(result) if result is not None else {}
+            if "messages" in compact:
+                compact.pop("messages")
+                compact["messages_truncated"] = True
+                serialized = json.dumps(compact, separators=(",", ":"), ensure_ascii=False)
+            if len(serialized.encode()) > settings.jobs_max_result_bytes:
+                serialized = json.dumps(
+                    {
+                        "agent": result.get("agent") if result is not None else None,
+                        "is_error": outcome != "succeeded",
+                        "result_truncated": True,
+                    },
+                    separators=(",", ":"),
+                )
+            if len(serialized.encode()) > settings.jobs_max_result_bytes:
+                outcome, code, serialized = "failed", "result_too_large", None
         with closing(self._connect()) as db:
             db.execute(
                 """UPDATE jobs SET status=?, finished_at=?, result_json=?, error_code=?
@@ -376,6 +402,15 @@ class JobManager:
         async with self.workspace_condition:
             self.workspaces.discard(cwd)
             self.workspace_condition.notify_all()
+
+    @asynccontextmanager
+    async def workspace(self, cwd: Path) -> AsyncGenerator[None]:
+        """Hold a shared exclusive workspace lease for any agent operation."""
+        await self._acquire_workspace(cwd)
+        try:
+            yield
+        finally:
+            await self._release_workspace(cwd)
 
     async def _execute(
         self, body: QueryRequest | CodexQueryRequest, cwd: Path
@@ -448,19 +483,24 @@ class JobManager:
                 await self._release_workspace(cwd)
 
     async def stop(self) -> None:
-        """Wait for cancellation cleanup before releasing server ownership."""
+        """Cancel owned jobs and relinquish the exclusive database lock."""
         self.stopping = True
-        tasks = list(self.tasks.values())
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        if self.started:
-            with closing(self._connect()) as db:
-                db.execute(
-                    "UPDATE jobs SET status='interrupted', finished_at=?, "
-                    "error_code='server_interrupted' "
-                    "WHERE status IN ('queued','running')",
-                    (_now(),),
-                )
-                db.commit()
+        try:
+            tasks = list(self.tasks.values())
+            for task in tasks:
+                task.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if self.started:
+                with closing(self._connect()) as db:
+                    db.execute(
+                        "UPDATE jobs SET status='interrupted', finished_at=?, "
+                        "error_code='server_interrupted' "
+                        "WHERE status IN ('queued','running')",
+                        (_now(),),
+                    )
+                    db.commit()
+        finally:
+            if self._lock_file is not None:
+                self._lock_file.close()
+                self._lock_file = None
