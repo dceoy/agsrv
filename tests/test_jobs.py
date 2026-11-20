@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import pytest
-from claude_agent_sdk import Message, ResultMessage
+from claude_agent_sdk import Message
 from fastapi.testclient import TestClient
 
 from agsrv.config import Settings
@@ -65,13 +65,21 @@ def test_submit_poll_and_idempotency(tmp_path: Path) -> None:
         assert finished["status"] == "succeeded"
         assert finished["agent"] == "claude"
         assert finished["result"]["result"] == "done"
-        assert finished["created_at"] and finished["started_at"] and finished["finished_at"]
+        assert finished["created_at"]
+        assert finished["started_at"]
+        assert finished["finished_at"]
         assert finished["error"] is None
         assert runner.stream_calls == 1
-        assert client.post(
-            f"/v1/jobs/{job_id}/cancel", headers=AUTH
-        ).json()["status"] == "succeeded"
-        assert client.get(f"/v1/jobs/{job_id}", headers={"Authorization": "Bearer other"}).status_code == 401
+        assert (
+            client.post(f"/v1/jobs/{job_id}/cancel", headers=AUTH).json()["status"]
+            == "succeeded"
+        )
+        assert (
+            client.get(
+                f"/v1/jobs/{job_id}", headers={"Authorization": "Bearer other"}
+            ).status_code
+            == 401
+        )
         assert client.get("/v1/jobs/unknown", headers=AUTH).status_code == 404
 
 
@@ -92,9 +100,7 @@ def test_queue_saturation_and_cancellation(tmp_path: Path) -> None:
 
 def test_timeout_and_transport_failure(tmp_path: Path) -> None:
     """Deadlines and SDK failures are sanitized but recorded as failures."""
-    with TestClient(
-        create_app(_settings(tmp_path), FakeRunner(delay=0.2))
-    ) as client:
+    with TestClient(create_app(_settings(tmp_path), FakeRunner(delay=0.2))) as client:
         response = client.post(
             "/v1/jobs", headers=AUTH, json={**BODY, "timeout_seconds": 0.01}
         )
@@ -114,12 +120,8 @@ def test_timeout_and_transport_failure(tmp_path: Path) -> None:
 def test_agent_error_and_size_limit(tmp_path: Path) -> None:
     """Agent-level failures retain normalized results, with a storage size cap."""
     messages = canned()
-    messages[-1] = replace(
-        messages[-1], is_error=True, subtype="error_max_turns"
-    )
-    with TestClient(
-        create_app(_settings(tmp_path), FakeRunner(messages))
-    ) as client:
+    messages[-1] = replace(messages[-1], is_error=True, subtype="error_max_turns")
+    with TestClient(create_app(_settings(tmp_path), FakeRunner(messages))) as client:
         job_id = client.post("/v1/jobs", headers=AUTH, json=BODY).json()["job_id"]
         outcome = _wait(client, job_id)
         assert outcome["status"] == "failed"
@@ -141,16 +143,42 @@ def test_validation_and_auth(tmp_path: Path) -> None:
         create_app(_settings(tmp_path, jobs_max_payload_bytes=300))
     ) as client:
         assert client.post("/v1/jobs", json=BODY).status_code == 401
-        assert client.post("/v1/jobs", headers=AUTH, json={**BODY, "prompt": ""}).status_code == 422
-        assert client.post("/v1/jobs", headers=AUTH, json={**BODY, "timeout_seconds": 4000}).status_code == 400
-        assert client.post("/v1/jobs", headers=AUTH, json={**BODY, "cwd": "../"}).status_code == 403
-        assert client.post("/v1/jobs", headers=AUTH, json={**BODY, "sandbox": "invalid"}).status_code == 422
-        assert client.post(
-            "/v1/jobs", headers={**AUTH, "Idempotency-Key": "é"}, json=BODY
-        ).status_code == 400
-        assert client.post(
-            "/v1/jobs", headers=AUTH, json={**BODY, "prompt": "x" * 1000}
-        ).status_code == 413
+        assert (
+            client.post(
+                "/v1/jobs", headers=AUTH, json={**BODY, "prompt": ""}
+            ).status_code
+            == 422
+        )
+        assert (
+            client.post(
+                "/v1/jobs", headers=AUTH, json={**BODY, "timeout_seconds": 4000}
+            ).status_code
+            == 400
+        )
+        assert (
+            client.post(
+                "/v1/jobs", headers=AUTH, json={**BODY, "cwd": "../"}
+            ).status_code
+            == 403
+        )
+        assert (
+            client.post(
+                "/v1/jobs", headers=AUTH, json={**BODY, "sandbox": "invalid"}
+            ).status_code
+            == 422
+        )
+        assert (
+            client.post(
+                "/v1/jobs", headers={**AUTH, "Idempotency-Key": "é"}, json=BODY
+            ).status_code
+            == 400
+        )
+        assert (
+            client.post(
+                "/v1/jobs", headers=AUTH, json={**BODY, "prompt": "x" * 1000}
+            ).status_code
+            == 413
+        )
 
 
 def test_restart_reconciles_without_replay(tmp_path: Path) -> None:
@@ -170,9 +198,12 @@ def test_restart_reconciles_without_replay(tmp_path: Path) -> None:
         )
     with TestClient(create_app(settings, FakeRunner())):
         with sqlite3.connect(settings.jobs_db_path) as db:
-            assert db.execute(
-                "SELECT status FROM jobs WHERE job_id='orphan'"
-            ).fetchone()[0] == "interrupted"
+            assert (
+                db.execute("SELECT status FROM jobs WHERE job_id='orphan'").fetchone()[
+                    0
+                ]
+                == "interrupted"
+            )
 
 
 def test_retention_expires_keys(tmp_path: Path) -> None:
