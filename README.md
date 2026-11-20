@@ -1,13 +1,13 @@
 # agsrv
 
-Stateless HTTP API for remote Claude and Codex execution using their Python SDKs.
+HTTP API for remote Claude and Codex execution using their Python SDKs.
 
 [![CI](https://github.com/dceoy/agsrv/actions/workflows/ci.yml/badge.svg)](https://github.com/dceoy/agsrv/actions/workflows/ci.yml)
 
-Each request is one ephemeral Claude or Codex run. There are no
-sessions, no resume, and no server-side conversation state. A client on another
-machine POSTs a prompt and receives the agent result as JSON. Claude can also
-include a message transcript and supports Server-Sent Events streaming.
+Each query is one ephemeral Claude or Codex run. There are no resumable agent
+sessions or conversation state. The synchronous API cancels on disconnect; the
+durable job API stores outcomes in SQLite so short-lived clients can submit,
+disconnect, and retrieve the result later.
 
 ## Endpoints
 
@@ -18,7 +18,9 @@ include a message transcript and supports Server-Sent Events streaming.
 | GET    | `/v1/agents`       | yes  | Agent capabilities and health              |
 | GET    | `/v1/agents/codex/rate-limits` | yes | Codex account limits              |
 | POST   | `/v1/query`        | yes  | Run one agent query, return the result |
-| POST   | `/v1/query/stream` | yes  | Run one Claude query, streamed as SSE                      |
+| POST   | `/v1/jobs`        | yes  | Submit a durable asynchronous job (202)  |
+| GET    | `/v1/jobs/{job_id}` | yes | Poll status and terminal result         |
+| POST   | `/v1/jobs/{job_id}/cancel` | yes | Request cancellation             |
 
 See [docs/api/rest-api.md](docs/api/rest-api.md) for the full reference.
 
@@ -42,10 +44,12 @@ curl -sS https://agsrv.example.net/v1/query \
   -H "Content-Type: application/json" \
   -d '{"agent": "claude", "prompt": "List the files in this directory", "cwd": "myproject", "max_turns": 5}'
 
-curl -N https://agsrv.example.net/v1/query/stream \
+curl -sS https://agsrv.example.net/v1/jobs \
   -H "Authorization: Bearer $AGSRV_API_KEY" \
+  -H "Idempotency-Key: muse-vm-task-001" \
   -H "Content-Type: application/json" \
-  -d '{"agent": "claude", "prompt": "Summarize README.md"}'
+  -d '{"agent": "claude", "prompt": "Summarize README.md", "cwd": "myproject"}'
+# Poll GET /v1/jobs/<job_id> from a replacement VM using the same bearer key.
 ```
 
 ## Configuration
@@ -61,10 +65,13 @@ curl -N https://agsrv.example.net/v1/query/stream \
 | `AGSRV_DEFAULT_MODEL`            | unset (SDK default)              | Model used when a request omits `model`                  |
 | `AGSRV_PERMISSION_MODE`          | `acceptEdits`                    | Default permission mode                                  |
 | `AGSRV_ALLOWED_TOOLS`            | `Read,Write,Edit,Bash,Glob,Grep` | Default auto-approve list (not a restriction; see below) |
-| `AGSRV_ALLOW_BYPASS_PERMISSIONS` | `false`                          | Permit requests with `permission_mode=bypassPermissions` |
 | `AGSRV_MAX_CONCURRENCY`          | `4`                              | Simultaneous runs; excess requests get HTTP 429          |
 | `AGSRV_MAX_TIMEOUT_SECONDS`      | `3600`                           | Default and maximum run duration                         |
-| `AGSRV_SANDBOX_MODE`             | `off`                            | Exactly `off` or `opt-in` (case- and whitespace-sensitive; unset means `off`); `opt-in` lets requests send `sandbox: true` |
+| `AGSRV_JOBS_DB_PATH`             | `~/.local/state/agsrv/jobs.sqlite3` | Persistent SQLite database (single worker only) |
+| `AGSRV_JOBS_MAX_PENDING`         | `32`                             | Maximum queued and running jobs (429 when full) |
+| `AGSRV_JOBS_RETENTION_SECONDS`   | `86400`                          | Terminal record and idempotency-key retention (24 h) |
+| `AGSRV_JOBS_MAX_PAYLOAD_BYTES`   | `65536`                          | Maximum canonical request size |
+| `AGSRV_JOBS_MAX_RESULT_BYTES`    | `1048576`                        | Maximum persisted result size |
 | `AGSRV_SANDBOX_ALLOWED_DOMAINS`  | GitHub, PyPI, and npm hosts (see below) | Comma-separated egress allow-list for sandboxed Bash; set-but-empty means no egress |
 
 The default sandbox domains are `github.com`, `api.github.com`,
@@ -72,7 +79,6 @@ The default sandbox domains are `github.com`, `api.github.com`,
 `objects.githubusercontent.com`, `release-assets.githubusercontent.com`,
 `pypi.org`, `files.pythonhosted.org`, and `registry.npmjs.org`.
 
-`AGSRV_SANDBOX_MODE` must be exactly `off` or `opt-in`; any other value
 (including an empty string, `OFF`, `Opt-In`, padded values, or `required`)
 aborts startup. Domain entries are trimmed and lowercased, and empty
 comma-separated entries are dropped (`a.com,,b.com` is two entries; a set but
@@ -93,8 +99,7 @@ Rate limits come from `account/rateLimits/read`.
 
 - **The API key is a shell.** Holding the key is equivalent to running a shell
   as the service user (with the workspace as the starting directory). Protect
-  it accordingly; everything below is defence in depth, not a sandbox (except for runs that
-  set `sandbox: true`, see "Opt-in Bash sandbox").
+  it accordingly; the default Claude Bash sandbox is only one part of defence in depth.
 - **API key required by default.** Without `AGSRV_API_KEY` (or with an empty
   one), execution endpoints return 503 unless
   `AGSRV_ALLOW_UNAUTHENTICATED=true` is set explicitly. Keys are compared in
@@ -108,16 +113,16 @@ Rate limits come from `account/rateLimits/read`.
   environment, including `ANTHROPIC_API_KEY`, the Claude login credentials,
   and `AGSRV_API_KEY` itself. Prompt-injected workspace content can therefore
   exfiltrate them; do not point the service at untrusted workspaces. The
-  opt-in sandbox only narrows the Bash path (see below).
-- **Opt-in Bash sandbox.** With `AGSRV_SANDBOX_MODE=opt-in`, a request may set
-  `sandbox: true` to run Bash and its child processes inside the CLI sandbox:
+  default-on sandbox only narrows the Bash path (see below).
+- **Default-on Bash sandbox.** Claude requests default to `sandbox: true` and
+  run Bash and its child processes inside the CLI sandbox. Set `sandbox: false`
+  only for a deliberate control operation that needs access to the host:
   writes are limited to the working directory, temp, and a dedicated cache
   directory; egress is limited to the allow-list; the systemd/D-Bus user bus is
   unreachable; common secret directories are unreadable; and the API keys are
   unset in the Bash environment. The sandbox is fail-closed
   (`failIfUnavailable`): if it cannot start, the run fails rather than running
-  unsandboxed. A request cannot weaken it; with mode `off`, `sandbox: true` is
-  rejected with 403. A sandboxed request is also rejected with 403 when its
+  unsandboxed. A sandboxed request is also rejected with 403 when its
   effective permission mode (request value, else `AGSRV_PERMISSION_MODE`) is
   `auto` or `bypassPermissions`, because those modes can approve hosts outside
   the allow-list; and when the resolved `cwd` is `~/.cache`, an ancestor of it
@@ -131,17 +136,16 @@ Rate limits come from `account/rateLimits/read`.
   secret files such as the service env file can still be read, and anything
   readable can be exfiltrated to allow-listed hosts (GitHub). The `gh` token
   stays readable so push and PR creation work; use a minimal-scope token.
-  A `required` mode does not exist yet.
+
 - **Workspace confinement.** Request `cwd` is resolved (symlinks included) and
   must stay inside `AGSRV_WORKSPACE_ROOT`. Note this confines the agent's
   starting directory, not what its tools (e.g. `Bash`) can reach; run the server
   as an unprivileged user or in a container for real isolation.
-- **`bypassPermissions` is opt-in** via `AGSRV_ALLOW_BYPASS_PERMISSIONS`.
   It is not a meaningful boundary on its own: with `Bash` auto-approved, the
   default posture is already shell-equivalent.
 - **Client disconnects.** Claude `POST /v1/query` promptly cancels the run and frees
-  its concurrency slot when the client disconnects. The streaming endpoint
-  also cancels the run when its consumer goes away.
+  its concurrency slot when the client disconnects. Durable `/v1/jobs` runs
+  are owned by the server and continue after the client disconnects.
 - **Bind and TLS.** Bind to loopback or a private interface and put TLS in front
   (reverse proxy, Tailscale, or an SSH tunnel). The API key travels in a header.
 - **Claude statelessness.** Request bodies containing `resume`, `session_id`, or any
@@ -154,6 +158,23 @@ Rate limits come from `account/rateLimits/read`.
   The default system prompt is the Claude Code preset. What still persists after
   a run: files the agent creates or edits in the workspace, and ordinary CLI
   bookkeeping under `~/.claude`.
+
+## Durable job contract
+
+`POST /v1/jobs` requires the same validated Claude/Codex request as
+`POST /v1/query`. Provide a stable `Idempotency-Key` on retries: an identical
+request reuses its original `job_id`, while conflicting content returns 409.
+Poll `GET /v1/jobs/{job_id}` until `succeeded`, `failed`, `cancelled`, or
+`interrupted`; cancellation is requested via POST to `/cancel`.
+A result with `is_error: true` is recorded as `failed`. Error codes are
+sanitized. Non-terminal jobs are bounded, and queue saturation returns 429
+with `Retry-After`. Expired terminal records and idempotency keys are removed
+after 24 hours by default. Jobs run in-process and **do not survive process
+termination**: after restart nonterminal records become `interrupted`
+without replaying filesystem or Git side effects. Only one uvicorn worker may
+use a given SQLite database. Jobs for overlapping workspace directories are
+serialized. Shared API keys represent one caller and authorize access to the
+same job records; use a separate server/key for caller isolation.
 
 ## Development
 
