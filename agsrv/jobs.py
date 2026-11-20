@@ -20,10 +20,10 @@ from uuid import uuid4
 
 from fastapi import HTTPException, status
 
-from agsrv import codex_agent
+from agsrv import codex_agent, muse_agent
 from agsrv.agent import AgentExecutionError, build_options, collect_result
 from agsrv.sandbox import SandboxSetupError, service_home
-from agsrv.schemas import CodexQueryRequest, QueryRequest
+from agsrv.schemas import CodexQueryRequest, MuseQueryRequest, QueryRequest
 from agsrv.security import (
     check_permission_mode,
     check_sandbox_cwd,
@@ -60,7 +60,7 @@ def _principal(authorization: str | None) -> str:
     return hashlib.sha256((authorization or "anonymous").encode()).hexdigest()
 
 
-def _canonical(body: QueryRequest | CodexQueryRequest) -> str:
+def _canonical(body: QueryRequest | CodexQueryRequest | MuseQueryRequest) -> str:
     """Serialize validated requests in a stable canonical representation.
 
     Returns:
@@ -83,7 +83,9 @@ class JobManager:
         self.workspaces: set[Path] = set()
         self.workspace_condition = asyncio.Condition()
         self.running_slots = asyncio.Semaphore(
-            settings.max_concurrency + settings.codex_max_concurrency
+            settings.max_concurrency
+            + settings.codex_max_concurrency
+            + settings.muse_max_concurrency
         )
         self.started = False
         self.stopping = False
@@ -164,7 +166,9 @@ class JobManager:
             (cutoff,),
         )
 
-    def _validate(self, body: QueryRequest | CodexQueryRequest) -> Path:
+    def _validate(
+        self, body: QueryRequest | CodexQueryRequest | MuseQueryRequest
+    ) -> Path:
         """Validate execution policy before creating a durable record.
 
         Returns:
@@ -198,7 +202,7 @@ class JobManager:
 
     def submit(
         self,
-        body: QueryRequest | CodexQueryRequest,
+        body: QueryRequest | CodexQueryRequest | MuseQueryRequest,
         authorization: str | None,
         idempotency_key: str | None,
     ) -> dict[str, Any]:
@@ -425,7 +429,7 @@ class JobManager:
             await self._release_workspace(cwd)
 
     async def _execute(
-        self, body: QueryRequest | CodexQueryRequest, cwd: Path
+        self, body: QueryRequest | CodexQueryRequest | MuseQueryRequest, cwd: Path
     ) -> dict[str, Any]:
         settings: Settings = self.app.state.settings
         if isinstance(body, QueryRequest):
@@ -441,22 +445,37 @@ class JobManager:
                         messages, include_messages=body.include_messages
                     )
                 return result.model_dump(mode="json")
-        if not settings.codex_enabled:
-            msg = "Codex unavailable"
+        if isinstance(body, CodexQueryRequest):
+            if not settings.codex_enabled:
+                msg = "Codex unavailable"
+                raise RuntimeError(msg)
+            async with self.app.state.codex_semaphore:
+                return await codex_agent.run_codex(
+                    prompt=body.prompt,
+                    cwd=str(cwd),
+                    model=body.model,
+                    effort=body.effort,
+                    sandbox=body.options.sandbox,
+                    network_access=body.options.network_access,
+                    binary=settings.codex_bin,
+                )
+        if not settings.muse_enabled:
+            msg = "Muse unavailable"
             raise RuntimeError(msg)
-        async with self.app.state.codex_semaphore:
-            return await codex_agent.run_codex(
+        async with self.app.state.muse_semaphore:
+            return await muse_agent.run_muse(
                 prompt=body.prompt,
                 cwd=str(cwd),
-                model=body.model,
+                model=body.model or settings.muse_model,
                 effort=body.effort,
-                sandbox=body.options.sandbox,
-                network_access=body.options.network_access,
-                binary=settings.codex_bin,
+                binary=settings.muse_bin,
             )
 
     async def _run(
-        self, job_id: str, body: QueryRequest | CodexQueryRequest, cwd: Path
+        self,
+        job_id: str,
+        body: QueryRequest | CodexQueryRequest | MuseQueryRequest,
+        cwd: Path,
     ) -> None:
         acquired = False
         try:  # ruff: ignore[too-many-statements-in-try-clause]

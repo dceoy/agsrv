@@ -1,10 +1,10 @@
 # agsrv
 
-HTTP API for remote Claude and Codex execution using their Python SDKs.
+HTTP API for remote Claude, Codex and Muse execution using their Python SDKs.
 
 [![CI](https://github.com/dceoy/agsrv/actions/workflows/ci.yml/badge.svg)](https://github.com/dceoy/agsrv/actions/workflows/ci.yml)
 
-Each query is one ephemeral Claude or Codex run. There are no resumable agent
+Each query is one ephemeral Claude, Codex or Muse run. There are no resumable agent
 sessions or conversation state. The synchronous API cancels on disconnect; the
 durable job API stores outcomes in SQLite so short-lived clients can submit,
 disconnect, and retrieve the result later.
@@ -59,6 +59,10 @@ curl -sS https://agsrv.example.net/v1/jobs \
 | `AGSRV_CODEX_BIN`                | unset (SDK bundled binary)       | Optional Codex executable path                           |
 | `AGSRV_CODEX_ENABLED`            | `true`                           | Enable Codex                                             |
 | `AGSRV_CODEX_MAX_CONCURRENCY`    | `2`                              | Simultaneous Codex runs                                  |
+| `AGSRV_MUSE_BIN`                 | unset (PATH search)              | Optional Muse executable path                            |
+| `AGSRV_MUSE_ENABLED`             | `false`                          | Enable Muse (disabled by default, requires login)        |
+| `AGSRV_MUSE_MAX_CONCURRENCY`     | `2`                              | Simultaneous Muse runs                                   |
+| `AGSRV_MUSE_MODEL`               | unset                            | Default model for Muse runs                              |
 | `AGSRV_API_KEY`                  | unset                            | Bearer token clients must send                           |
 | `AGSRV_ALLOW_UNAUTHENTICATED`    | `false`                          | Allow requests with no key configured (local dev only)   |
 | `AGSRV_WORKSPACE_ROOT`           | current directory                | All request `cwd` values must resolve inside this path   |
@@ -94,6 +98,14 @@ Codex requests use `"agent": "codex"` and may set `options.sandbox` to
 to a boolean (default `false`). Codex threads are ephemeral, approvals are
 denied, and explicit network access uses the SDK’s low-level sandbox policy.
 Rate limits come from `account/rateLimits/read`.
+
+Muse runs (disabled unless `AGSRV_MUSE_ENABLED=true` and the service user is
+logged in to `muse`) use `muse serve --no-session-log --contributor-mode off`
+with a fixed sandbox posture and deny-all approvals. They require the same
+SDK/host version coupling as Codex (`muse-code-sdk==1.4.24` matches `muse 1.4.24`);
+upgrade them together. Sessions are memory-only (`--no-session-log`) and the
+backend fails closed when durability is not ephemeral. `GET /v1/agents` reports
+`muse` health with a cached probe and never leaks paths or credentials.
 
 ## Security model
 
