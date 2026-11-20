@@ -545,6 +545,7 @@ def create_app(
     app.state.codex_probe_lock = asyncio.Lock()
     app.state.codex_probe_expires = 0.0
     app.state.codex_healthy = False
+    app.state.jobs = JobManager(app)
     _add_meta_routes(app, settings)
     _add_query_routes(app)
     _add_job_routes(app)
