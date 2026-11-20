@@ -142,8 +142,7 @@
 <li>
 <p>Run uvicorn on loopback or a private interface, and expose it only through
    TLS (a reverse proxy) or a private network such as Tailscale or an SSH
-   tunnel (<code>ssh -L 8000:127.0.0.1:8000 server</code>). Disable proxy response
-   buffering for <code>/v1/query/stream</code> (agsrv sends <code>X-Accel-Buffering: no</code>).</p>
+   tunnel (<code>ssh -L 8000:127.0.0.1:8000 server</code>).</p>
 </li>
 <li>
 <p>Run it as an unprivileged user that owns only the workspace directory.
@@ -152,7 +151,9 @@
    <code>AGSRV_API_KEY</code> and <code>ANTHROPIC_API_KEY</code> from its own environment — the
    API key is effectively a shell as this user (see the README security
    model). The concurrency limit is per process: running uvicorn with
-   <code>--workers N</code> multiplies <code>AGSRV_MAX_CONCURRENCY</code> by N.</p>
+   <code>--workers N</code> multiplies <code>AGSRV_MAX_CONCURRENCY</code> by N. The durable job
+   queue currently requires <strong>exactly one worker</strong> for a database. Store
+   <code>AGSRV_JOBS_DB_PATH</code> on persistent storage with restricted permissions.</p>
 </li>
 </ol>
 <h3 id="systemd-unit">systemd unit<a class="headerlink" href="#systemd-unit" title="Permanent link">&para;</a></h3>
@@ -171,8 +172,9 @@
 <a id="__codelineno-3-13" name="__codelineno-3-13" href="#__codelineno-3-13"></a><span class="k">[Install]</span>
 <a id="__codelineno-3-14" name="__codelineno-3-14" href="#__codelineno-3-14"></a><span class="na">WantedBy</span><span class="o">=</span><span class="s">multi-user.target</span>
 </code></pre></div>
-<h3 id="bash-sandbox-optional">Bash sandbox (optional)<a class="headerlink" href="#bash-sandbox-optional" title="Permanent link">&para;</a></h3>
-<p>Runs that send <code>sandbox: true</code> execute Bash inside the Claude CLI sandbox.</p>
+<h3 id="bash-sandbox-enabled-by-default">Bash sandbox (enabled by default)<a class="headerlink" href="#bash-sandbox-enabled-by-default" title="Permanent link">&para;</a></h3>
+<p>Claude runs use the fail-closed CLI Bash sandbox by default. Explicit
+<code>sandbox: false</code> is reserved for host-control tasks that must bypass it.</p>
 <ul>
 <li>Prerequisites on the host: <code>bwrap</code> (bubblewrap), <code>socat</code>, and <code>rg</code> (ripgrep).</li>
 <li>Sandboxed runs are pinned to the CLI bundled with the installed
@@ -188,26 +190,33 @@
   a real directory owned by the service user (symlinks are rejected). Its mode
   is set to and verified as exactly 0700, and <code>~/.cache</code> itself must not be
   group- or other-writable; otherwise requests fail with 503.</li>
-<li><code>AGSRV_SANDBOX_MODE</code> accepts exactly <code>off</code> or <code>opt-in</code>; anything else aborts
-  startup.</li>
 <li>The sandbox is fail-closed. On Ubuntu releases that ship the
   <code>bwrap-userns-restrict</code> AppArmor profile, the sandbox's seccomp helper cannot
   start, so <code>sandbox: true</code> requests fail until the host policy is adjusted
   (for example with a dedicated, AppArmor-profiled copy of <code>bwrap</code> placed first
   on the service <code>PATH</code>). Do not weaken this by disabling the sandbox checks.</li>
 </ul>
-<p>To enable it:</p>
+<p>Before deployment, run an acceptance probe with the default (sandboxed) run:</p>
 <ol>
-<li>Set <code>AGSRV_SANDBOX_MODE=opt-in</code> (optionally
-   <code>AGSRV_SANDBOX_ALLOWED_DOMAINS</code>) and restart the service.</li>
-<li>Run an acceptance probe with <code>sandbox: true</code>: <code>echo ok</code> succeeds; writes
+<li>Verify <code>AGSRV_SANDBOX_ALLOWED_DOMAINS</code> permits only required hosts.</li>
+<li>Run a request without a <code>sandbox</code> field: <code>echo ok</code> succeeds; writes
    outside the working directory and the sandbox cache are denied; secret
    directories such as <code>~/.ssh</code> are unreadable; <code>env</code> shows no
    <code>AGSRV_API_KEY</code>; <code>curl</code> to a non-allow-listed host is denied; and
    <code>systemctl --user status</code> fails.</li>
 </ol>
-<p>Clients must never retry a failed <code>sandbox: true</code> request with
+<p>Clients must never retry a failed default sandbox request with
 <code>sandbox: false</code>; that would reintroduce fail-open behaviour.</p>
+<h3 id="durable-jobs">Durable jobs<a class="headerlink" href="#durable-jobs" title="Permanent link">&para;</a></h3>
+<p>Use the same long-lived API key on replacement Muse VMs and submit jobs with a
+stable <code>Idempotency-Key</code>. Poll <code>GET /v1/jobs/{job_id}</code> without holding open a
+connection. Back up the SQLite WAL database (including its WAL file) and avoid
+multi-worker uvicorn: an exclusive sibling lock file rejects concurrent
+processes sharing the database. Synchronous queries share the same workspace
+lease as queued jobs. Jobs are in-process: a server restart marks uncompleted
+jobs <code>interrupted</code> and never retries them automatically. Default completed-job
+retention is 24 hours. All holders of the same bearer token can inspect jobs
+created with that token; do not share credentials across untrusted tenants.</p>
 <h3 id="client-smoke-test">Client smoke test<a class="headerlink" href="#client-smoke-test" title="Permanent link">&para;</a></h3>
 <p>From the client machine (here via an SSH tunnel on <code>localhost:8000</code>):</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a>curl<span class="w"> </span>-sS<span class="w"> </span>http://localhost:8000/health

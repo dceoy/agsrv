@@ -121,7 +121,7 @@
               <ul class="nav flex-column">
               </ul>
             </li>
-            <li class="nav-item" data-bs-level="2"><a href="#post-v1querystream" class="nav-link">POST /v1/query/stream</a>
+            <li class="nav-item" data-bs-level="2"><a href="#durable-asynchronous-jobs" class="nav-link">Durable asynchronous jobs</a>
               <ul class="nav flex-column">
               </ul>
             </li>
@@ -159,7 +159,7 @@ workspace and ordinary CLI bookkeeping under <code>~/.claude</code>.</p>
 </code></pre></div>
 <h2 id="get-v1info"><code>GET /v1/info</code><a class="headerlink" href="#get-v1info" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="p">{</span>
-<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="s2">"0.2.0"</span><span class="p">,</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="s2">"0.3.0"</span><span class="p">,</span>
 <a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">  </span><span class="nt">"stateless"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
 <a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">  </span><span class="nt">"default_model"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
 <a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="w">  </span><span class="nt">"workspace_root"</span><span class="p">:</span><span class="w"> </span><span class="s2">"/srv/workspaces"</span><span class="p">,</span>
@@ -167,37 +167,31 @@ workspace and ordinary CLI bookkeeping under <code>~/.claude</code>.</p>
 <a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="w">  </span><span class="nt">"default_allowed_tools"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"Read"</span><span class="p">,</span><span class="w"> </span><span class="s2">"Write"</span><span class="p">,</span><span class="w"> </span><span class="s2">"Edit"</span><span class="p">,</span><span class="w"> </span><span class="s2">"Bash"</span><span class="p">,</span><span class="w"> </span><span class="s2">"Glob"</span><span class="p">,</span><span class="w"> </span><span class="s2">"Grep"</span><span class="p">],</span>
 <a id="__codelineno-1-8" name="__codelineno-1-8" href="#__codelineno-1-8"></a><span class="w">  </span><span class="nt">"max_concurrency"</span><span class="p">:</span><span class="w"> </span><span class="mi">4</span><span class="p">,</span>
 <a id="__codelineno-1-9" name="__codelineno-1-9" href="#__codelineno-1-9"></a><span class="w">  </span><span class="nt">"auth_required"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
-<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="w">  </span><span class="nt">"sandbox_mode"</span><span class="p">:</span><span class="w"> </span><span class="s2">"off"</span><span class="p">,</span>
-<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="w">  </span><span class="nt">"sandbox_allowed_domains"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"github.com"</span><span class="p">,</span><span class="w"> </span><span class="s2">"api.github.com"</span><span class="p">,</span><span class="w"> </span><span class="s2">"codeload.github.com"</span><span class="p">,</span><span class="w"> </span><span class="s2">"uploads.github.com"</span><span class="p">,</span><span class="w"> </span><span class="s2">"raw.githubusercontent.com"</span><span class="p">,</span><span class="w"> </span><span class="s2">"objects.githubusercontent.com"</span><span class="p">,</span><span class="w"> </span><span class="s2">"release-assets.githubusercontent.com"</span><span class="p">,</span><span class="w"> </span><span class="s2">"pypi.org"</span><span class="p">,</span><span class="w"> </span><span class="s2">"files.pythonhosted.org"</span><span class="p">,</span><span class="w"> </span><span class="s2">"registry.npmjs.org"</span><span class="p">]</span>
-<a id="__codelineno-1-12" name="__codelineno-1-12" href="#__codelineno-1-12"></a><span class="p">}</span>
+<a id="__codelineno-1-10" name="__codelineno-1-10" href="#__codelineno-1-10"></a><span class="w">  </span><span class="nt">"sandbox_allowed_domains"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"github.com"</span><span class="p">,</span><span class="w"> </span><span class="s2">"api.github.com"</span><span class="p">,</span><span class="w"> </span><span class="s2">"codeload.github.com"</span><span class="p">,</span><span class="w"> </span><span class="s2">"uploads.github.com"</span><span class="p">,</span><span class="w"> </span><span class="s2">"raw.githubusercontent.com"</span><span class="p">,</span><span class="w"> </span><span class="s2">"objects.githubusercontent.com"</span><span class="p">,</span><span class="w"> </span><span class="s2">"release-assets.githubusercontent.com"</span><span class="p">,</span><span class="w"> </span><span class="s2">"pypi.org"</span><span class="p">,</span><span class="w"> </span><span class="s2">"files.pythonhosted.org"</span><span class="p">,</span><span class="w"> </span><span class="s2">"registry.npmjs.org"</span><span class="p">]</span>
+<a id="__codelineno-1-11" name="__codelineno-1-11" href="#__codelineno-1-11"></a><span class="p">}</span>
 </code></pre></div>
 <h2 id="post-v1query"><code>POST /v1/query</code><a class="headerlink" href="#post-v1query" title="Permanent link">&para;</a></h2>
 <p>Claude request (<code>agent</code> and <code>prompt</code> are required):</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="p">{</span>
 <a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">  </span><span class="nt">"agent"</span><span class="p">:</span><span class="w"> </span><span class="s2">"claude"</span><span class="p">,</span>
 <a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">  </span><span class="nt">"prompt"</span><span class="p">:</span><span class="w"> </span><span class="s2">"List the Python files"</span><span class="p">,</span>
-<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">  </span><span class="nt">"system_prompt"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
-<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">  </span><span class="nt">"model"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
-<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="w">  </span><span class="nt">"cwd"</span><span class="p">:</span><span class="w"> </span><span class="s2">"myproject"</span><span class="p">,</span>
-<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="w">  </span><span class="nt">"allowed_tools"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"Read"</span><span class="p">,</span><span class="w"> </span><span class="s2">"Glob"</span><span class="p">],</span>
-<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="w">  </span><span class="nt">"disallowed_tools"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
-<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="w">  </span><span class="nt">"permission_mode"</span><span class="p">:</span><span class="w"> </span><span class="s2">"default"</span><span class="p">,</span>
-<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="w">  </span><span class="nt">"max_turns"</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span>
-<a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="w">  </span><span class="nt">"max_budget_usd"</span><span class="p">:</span><span class="w"> </span><span class="mf">1.0</span><span class="p">,</span>
-<a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="w">  </span><span class="nt">"effort"</span><span class="p">:</span><span class="w"> </span><span class="s2">"low"</span><span class="p">,</span>
-<a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="w">  </span><span class="nt">"timeout_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mi">300</span><span class="p">,</span>
-<a id="__codelineno-2-14" name="__codelineno-2-14" href="#__codelineno-2-14"></a><span class="w">  </span><span class="nt">"include_messages"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
-<a id="__codelineno-2-15" name="__codelineno-2-15" href="#__codelineno-2-15"></a><span class="w">  </span><span class="nt">"sandbox"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span>
-<a id="__codelineno-2-16" name="__codelineno-2-16" href="#__codelineno-2-16"></a><span class="p">}</span>
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="w">  </span><span class="nt">"model"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
+<a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="w">  </span><span class="nt">"cwd"</span><span class="p">:</span><span class="w"> </span><span class="s2">"myproject"</span><span class="p">,</span>
+<a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="w">  </span><span class="nt">"allowed_tools"</span><span class="p">:</span><span class="w"> </span><span class="p">[</span><span class="s2">"Read"</span><span class="p">,</span><span class="w"> </span><span class="s2">"Glob"</span><span class="p">],</span>
+<a id="__codelineno-2-7" name="__codelineno-2-7" href="#__codelineno-2-7"></a><span class="w">  </span><span class="nt">"permission_mode"</span><span class="p">:</span><span class="w"> </span><span class="s2">"default"</span><span class="p">,</span>
+<a id="__codelineno-2-8" name="__codelineno-2-8" href="#__codelineno-2-8"></a><span class="w">  </span><span class="nt">"max_turns"</span><span class="p">:</span><span class="w"> </span><span class="mi">5</span><span class="p">,</span>
+<a id="__codelineno-2-9" name="__codelineno-2-9" href="#__codelineno-2-9"></a><span class="w">  </span><span class="nt">"effort"</span><span class="p">:</span><span class="w"> </span><span class="s2">"low"</span><span class="p">,</span>
+<a id="__codelineno-2-10" name="__codelineno-2-10" href="#__codelineno-2-10"></a><span class="w">  </span><span class="nt">"timeout_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mi">300</span><span class="p">,</span>
+<a id="__codelineno-2-11" name="__codelineno-2-11" href="#__codelineno-2-11"></a><span class="w">  </span><span class="nt">"include_messages"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
+<a id="__codelineno-2-12" name="__codelineno-2-12" href="#__codelineno-2-12"></a><span class="w">  </span><span class="nt">"sandbox"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span>
+<a id="__codelineno-2-13" name="__codelineno-2-13" href="#__codelineno-2-13"></a><span class="p">}</span>
 </code></pre></div>
 <ul>
 <li><code>include_messages</code>: when <code>false</code>, the response omits the transcript (<code>messages</code>
-  is <code>[]</code>); intended for result-only clients. It has no effect on
-  <code>/v1/query/stream</code>.</li>
-<li><code>sandbox</code>: when <code>true</code>, runs Bash inside the fail-closed CLI sandbox. Requires
-  <code>AGSRV_SANDBOX_MODE=opt-in</code>; otherwise the request is rejected with 403. If
-  the sandbox cannot start the run fails (502, or an error result). Clients must
-  not retry such a failure with <code>sandbox: false</code>. The request is also rejected
+  is <code>[]</code>); intended for result-only clients.</li>
+<li><code>sandbox</code>: defaults to <code>true</code>, running Bash inside the fail-closed CLI
+  sandbox. Only explicit <code>false</code> opts out for host-control operations. Never
+  retry a failed sandboxed run with <code>sandbox: false</code>. Requests are rejected
   with 403 if the effective permission mode (request value, else the server
   default) is <code>auto</code> or <code>bypassPermissions</code> (incompatible with the sandbox's
   egress allow-list), or if the resolved <code>cwd</code> overlaps the shared cache: it is
@@ -206,15 +200,13 @@ workspace and ordinary CLI bookkeeping under <code>~/.claude</code>.</p>
   be established (unknown home, unusable cache directory, missing bundled CLI)
   the response is 503.</li>
 <li><code>cwd</code>: relative to <code>AGSRV_WORKSPACE_ROOT</code>, or absolute inside it.</li>
-<li><code>system_prompt</code>: when omitted, the run uses the Claude Code preset system
-  prompt. Send a string to replace it.</li>
 <li><code>allowed_tools</code>: an auto-approve list, not a restriction. It names tools the
   run may use without a permission decision; it does not remove other tools,
   and file edits are still approved under <code>acceptEdits</code>. When omitted, the
   server default (<code>AGSRV_ALLOWED_TOOLS</code>) applies — a default, not a ceiling.</li>
 <li><code>permission_mode</code>: <code>default</code>, <code>acceptEdits</code>, <code>plan</code>, <code>bypassPermissions</code>
-  (requires server opt-in), <code>dontAsk</code>, <code>auto</code>.</li>
-<li><code>max_turns</code>: 1–1000. <code>max_budget_usd</code> and <code>timeout_seconds</code> must be &gt; 0;
+  (always rejected with 403), <code>dontAsk</code>, <code>auto</code>.</li>
+<li><code>max_turns</code>: 1–1000. <code>timeout_seconds</code> must be &gt; 0;
   <code>timeout_seconds</code> may not exceed <code>AGSRV_MAX_TIMEOUT_SECONDS</code>.</li>
 </ul>
 <p>If a Claude client disconnects, the run is promptly cancelled and its concurrency
@@ -306,29 +298,53 @@ and <code>supports</code> flags for <code>sandbox</code>, <code>network_access</
 <p>Returns <code>plan</code>, <code>primary</code> and <code>secondary</code> windows (<code>used_percent</code> and
 <code>resets_at</code>), <code>reached_type</code>, <code>reset_credits</code>, and the raw SDK payload in
 <code>backend</code>. Missing windows are null.</p>
-<h2 id="post-v1querystream"><code>POST /v1/query/stream</code><a class="headerlink" href="#post-v1querystream" title="Permanent link">&para;</a></h2>
-<p>Claude request body only (<code>agent: "claude"</code>). All validation (auth, <code>cwd</code>, permissions, concurrency)
-happens before streaming starts, so those failures are ordinary HTTP errors.
-The response is <code>text/event-stream</code>; each SDK message is one event:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a>data: {"type": "system", "subtype": "init", "data": {}}
-<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a>
-<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a>data: {"type": "assistant", "content": [...]}
-<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a>
-<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>data: {"type": "result", "subtype": "success", "result": "..."}
+<h2 id="durable-asynchronous-jobs">Durable asynchronous jobs<a class="headerlink" href="#durable-asynchronous-jobs" title="Permanent link">&para;</a></h2>
+<p><code>POST /v1/jobs</code> accepts the same discriminated Claude/Codex JSON body as
+<code>/v1/query</code>. Unlike synchronous queries, the server owns execution after the
+202 response and continues across HTTP disconnects. Example:</p>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="err">POST /v1/jobs</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="err">Authorization: Bearer &lt;AGSRV_API_KEY&gt;</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="err">Idempotency-Key: vm-task-123</span>
+<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="err">Content-Type: application/json</span>
+<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>
+<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="err">{"agent":"claude","prompt":"Analyze the repository","cwd":"myproject"}</span>
 </code></pre></div>
-<p>If the runner fails or times out mid-stream, one final event is sent and the
-stream ends:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>data: {"type": "error", "detail": "agent run timed out"}
-</code></pre></div>
-<p>Treat a run as successful only when a <code>result</code> event arrives. A stream that
-ends without one — including a run whose message stream stops early — closes
-with an <code>error</code> event instead. During idle periods the stream sends an SSE
-comment <code>: heartbeat</code> every 15 seconds; clients must ignore comment lines.
-Disconnecting
-from this endpoint cancels the run and releases its slot. The run deadline also
-cancels the run and releases its slot if the client stops reading. For an
-abandoned stream, the run timeout initiates cancellation, but awaited SDK
-shutdown can extend beyond it.</p>
+<p>Returns 202: <code>{"job_id":"&lt;opaque UUID&gt;","status_url":"/v1/jobs/&lt;id&gt;"}</code>.
+The optional <code>Idempotency-Key</code> (1–128 printable ASCII chars) is scoped to the
+bearer principal. Identical validated requests reuse the job ID even on retries
+after a VM is destroyed. A conflicting payload returns 409; once the terminal
+record expires, key reuse can create a new job.</p>
+<p><code>GET /v1/jobs/{job_id}</code> returns <code>job_id</code>, <code>agent</code>, <code>status</code>,
+<code>created_at</code>, <code>started_at</code>, <code>finished_at</code>, <code>result</code>, and <code>error</code>.
+Statuses are <code>queued</code>, <code>running</code>, <code>succeeded</code>, <code>failed</code>, <code>cancelled</code>,
+or <code>interrupted</code>. <code>result</code> contains the normalized Claude or Codex response
+only on completion. Agent-level errors become <code>failed</code> with a retained result;
+transport failures and deadlines have sanitized <code>error.code</code> values.
+<code>POST /v1/jobs/{job_id}/cancel</code> is idempotent: queued jobs stop immediately,
+running jobs remain nonterminal until their child processes are cleaned up.</p>
+<p>The job database is SQLite WAL; it must be on durable storage accessible to a
+<strong>single uvicorn worker</strong>. An exclusive lock file alongside the database
+prevents concurrent workers or overlapping instances from taking ownership. The default path is
+<code>~/.local/state/agsrv/jobs.sqlite3</code> (overridden by <code>AGSRV_JOBS_DB_PATH</code>).
+Nonterminal jobs are limited by <code>AGSRV_JOBS_MAX_PENDING=32</code>, canonical
+requests by <code>AGSRV_JOBS_MAX_PAYLOAD_BYTES=65536</code>, stored results by
+<code>AGSRV_JOBS_MAX_RESULT_BYTES=1048576</code>; saturation gives 429 and
+<code>Retry-After: 5</code>. Terminal jobs and idempotency keys are retained for
+<code>AGSRV_JOBS_RETENTION_SECONDS=86400</code> (24 hours). Garbage collection is
+performed during API access. Synchronous queries and jobs targeting overlapping
+workspaces cannot execute concurrently. When a result exceeds the configured
+cap, message history is omitted with <code>messages_truncated: true</code> while keeping
+the final answer. If the core result is still oversized, a minimal summary is
+stored with <code>result_truncated: true</code> so the original execution outcome is not
+misreported. Extremely small caps that cannot fit this summary result in
+<code>failed</code> / <code>result_too_large</code>. The bearer token is the caller identity: <strong>all clients sharing
+the same API key can read the same jobs</strong>; use separate server credentials and
+instances if isolation between clients is needed. No raw internal errors or
+credentials are included in job status.</p>
+<p>The in-process scheduler <strong>does not guarantee completion across a server
+restart</strong>. On restart both queued and running jobs become <code>interrupted</code>
+without replaying side effects; completed results remain until expiry.
+The old SSE stream endpoint is deliberately removed.</p>
 <h2 id="errors">Errors<a class="headerlink" href="#errors" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -348,7 +364,19 @@ shutdown can extend beyond it.</p>
 </tr>
 <tr>
 <td>403</td>
-<td><code>cwd</code> outside workspace root; <code>bypassPermissions</code> not enabled; <code>sandbox: true</code> while <code>AGSRV_SANDBOX_MODE=off</code>, with an egress-expanding permission mode (<code>auto</code>, <code>bypassPermissions</code>), or with a <code>cwd</code> overlapping the shared cache (<code>~/.cache</code> outside <code>~/.cache/agsrv-sandbox</code>, or an ancestor such as the home directory)</td>
+<td><code>cwd</code> outside workspace root; <code>bypassPermissions</code> always forbidden; with an egress-expanding permission mode (<code>auto</code>, <code>bypassPermissions</code>), or with a <code>cwd</code> overlapping the shared cache (<code>~/.cache</code> outside <code>~/.cache/agsrv-sandbox</code>, or an ancestor such as the home directory)</td>
+</tr>
+<tr>
+<td>409</td>
+<td>Idempotency-Key reused with a different job payload</td>
+</tr>
+<tr>
+<td>413</td>
+<td>Durable job payload too large</td>
+</tr>
+<tr>
+<td>404</td>
+<td>Job not found or not authorized for this caller</td>
 </tr>
 <tr>
 <td>422</td>
@@ -356,7 +384,7 @@ shutdown can extend beyond it.</p>
 </tr>
 <tr>
 <td>429</td>
-<td>Concurrency limit reached (decided before sandbox setup, so it takes precedence over sandbox-setup 503s)</td>
+<td>Concurrency or pending-job capacity reached (jobs include Retry-After)</td>
 </tr>
 <tr>
 <td>502</td>
