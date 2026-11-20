@@ -362,7 +362,7 @@ class JobManager:
             else None
         )
         if serialized is not None and len(serialized.encode()) > settings.jobs_max_result_bytes:
-            compact = dict(result) if result is not None else {}
+            compact = dict(cast("dict[str, Any]", result))
             if "messages" in compact:
                 compact.pop("messages")
                 compact["messages_truncated"] = True
@@ -370,7 +370,7 @@ class JobManager:
             if len(serialized.encode()) > settings.jobs_max_result_bytes:
                 serialized = json.dumps(
                     {
-                        "agent": result.get("agent") if result is not None else None,
+                        "agent": compact.get("agent"),
                         "is_error": outcome != "succeeded",
                         "result_truncated": True,
                     },
