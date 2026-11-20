@@ -404,3 +404,133 @@ def test_cancel_queued_workspace_job(tmp_path: Path) -> None:
         assert client.post(f"/v1/jobs/{second}/cancel", headers=AUTH).status_code == 200
         assert _wait(client, second)["status"] == "cancelled"
         assert _wait(client, first)["status"] == "succeeded"
+
+
+def test_job_database_rejects_concurrent_owners(tmp_path: Path) -> None:
+    """A second worker must not interrupt jobs owned by the first."""
+    settings = _settings(tmp_path)
+    first = create_app(settings, FakeRunner(delay=0.2))
+    second = create_app(settings, FakeRunner())
+    with TestClient(first) as client:
+        job_id = client.post("/v1/jobs", headers=AUTH, json=BODY).json()["job_id"]
+        with pytest.raises(RuntimeError, match="owned by another worker"):
+            with TestClient(second):
+                pass
+        assert _wait(client, job_id)["status"] == "succeeded"
+    # A clean shutdown relinquishes ownership for the replacement worker.
+    with TestClient(second) as client:
+        assert client.get("/health").status_code == 200
+
+
+def test_database_lock_released_after_startup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed schema initialization must not strand the ownership lock."""
+    settings = _settings(tmp_path)
+    manager = create_app(settings).state.jobs
+
+    def fail_connection() -> None:
+        msg = "database unavailable"
+        raise sqlite3.OperationalError(msg)
+
+    monkeypatch.setattr(manager, "_connect", fail_connection)
+    with pytest.raises(sqlite3.OperationalError, match="database unavailable"):
+        manager.start()
+    with TestClient(create_app(settings)) as client:
+        assert client.get("/health").status_code == 200
+
+
+def test_sync_claude_query_shares_job_workspace_lock(tmp_path: Path) -> None:
+    """A sync query must not execute concurrently with a job in the same cwd."""
+    runner = MeteredRunner()
+    with TestClient(create_app(_settings(tmp_path), runner)) as client:
+        job_id = client.post("/v1/jobs", headers=AUTH, json=BODY).json()["job_id"]
+        query = client.post("/v1/query", headers=AUTH, json=BODY)
+        assert query.status_code == 200
+        assert _wait(client, job_id)["status"] == "succeeded"
+        assert runner.stream_calls == 2
+        assert runner.peak == 1
+
+
+def test_sync_codex_query_shares_job_workspace_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The detached Codex operation also holds the job workspace lease."""
+    runner = MeteredRunner()
+    codex_active = False
+
+    async def fake_available(*_args: object, **_kwargs: object) -> bool:
+        return True
+
+    async def fake_codex(**_kwargs: object) -> dict[str, Any]:
+        nonlocal codex_active
+        assert runner.active == 0
+        codex_active = True
+        try:
+            await asyncio.sleep(0.08)
+            assert runner.active == 0
+            return {"agent": "codex", "result": "done", "is_error": False}
+        finally:
+            codex_active = False
+
+    class CheckedRunner(MeteredRunner):
+        async def stream(
+            self, prompt: str, options: ClaudeAgentOptions
+        ) -> AsyncIterator[Message]:
+            assert not codex_active
+            async for message in super().stream(prompt, options):
+                assert not codex_active
+                yield message
+
+    runner = CheckedRunner()
+    monkeypatch.setattr("agsrv.main._codex_available", fake_available)
+    monkeypatch.setattr("agsrv.main.codex_agent.run_codex", fake_codex)
+    with TestClient(create_app(_settings(tmp_path), runner)) as client:
+        job_id = client.post("/v1/jobs", headers=AUTH, json=BODY).json()["job_id"]
+        response = client.post(
+            "/v1/query",
+            headers=AUTH,
+            json={"agent": "codex", "prompt": "inspect"},
+        )
+        assert response.status_code == 200
+        assert _wait(client, job_id)["status"] == "succeeded"
+        assert runner.peak == 1
+
+
+@pytest.mark.parametrize(
+    ("max_bytes", "answer", "expected_flag"),
+    [
+        (350, "done", "messages_truncated"),
+        (100, "x" * 2048, "result_truncated"),
+    ],
+)
+def test_oversized_results_preserve_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    max_bytes: int,
+    answer: str,
+    expected_flag: str,
+) -> None:
+    """A completed coding run must not become failed due to an oversized transcript."""
+    app = create_app(_settings(tmp_path, jobs_max_result_bytes=max_bytes))
+
+    async def oversized_result(_body: object, _cwd: object) -> dict[str, Any]:
+        return {
+            "agent": "claude",
+            "is_error": False,
+            "result": answer,
+            "messages": [{"text": "z" * 2048}],
+        }
+
+    monkeypatch.setattr(app.state.jobs, "_execute", oversized_result)
+    with TestClient(app) as client:
+        job_id = client.post("/v1/jobs", headers=AUTH, json=BODY).json()["job_id"]
+        outcome = _wait(client, job_id)
+        assert outcome["status"] == "succeeded"
+        assert outcome["error"] is None
+        assert outcome["result"][expected_flag] is True
+        if expected_flag == "messages_truncated":
+            assert outcome["result"]["result"] == "done"
+        else:
+            assert outcome["result"]["agent"] == "claude"
+            assert outcome["result"]["result_truncated"] is True
