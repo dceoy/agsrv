@@ -21,7 +21,6 @@ from agsrv.agent import (
     collect_result,
 )
 from agsrv.config import Settings
-from agsrv.jobs import JobManager
 from agsrv.sandbox import SandboxSetupError, service_home
 from agsrv.schemas import (
     CodexQueryRequest,
@@ -494,9 +493,10 @@ def _add_job_routes(app: FastAPI) -> None:
         idempotency_key: Annotated[str | None, Header()] = None,
         authorization: Annotated[str | None, Header()] = None,
     ) -> dict[str, Any]:
-        return cast("dict[str, Any]", request.app.state.jobs.submit(
-            body, authorization, idempotency_key
-        ))
+        return cast(
+            "dict[str, Any]",
+            request.app.state.jobs.submit(body, authorization, idempotency_key),
+        )
 
     @app.get("/v1/jobs/{job_id}", dependencies=[Auth])
     async def get_job(  # pyright: ignore[reportUnusedFunction]
@@ -512,7 +512,9 @@ def _add_job_routes(app: FastAPI) -> None:
         request: Request,
         authorization: Annotated[str | None, Header()] = None,
     ) -> dict[str, Any]:
-        return cast("dict[str, Any]", request.app.state.jobs.cancel(job_id, authorization))
+        return cast(
+            "dict[str, Any]", request.app.state.jobs.cancel(job_id, authorization)
+        )
 
     _ = (submit_job, get_job, cancel_job)
 
