@@ -45,7 +45,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 DISCONNECT_POLL_INTERVAL = 0.1
 CODEX_PROBE_TIMEOUT = 10.0
 
