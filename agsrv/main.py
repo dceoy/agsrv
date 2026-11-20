@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 VERSION = "0.2.0"
 DISCONNECT_POLL_INTERVAL = 0.1
 HEARTBEAT_INTERVAL = 15.0
+CODEX_PROBE_TIMEOUT = 10.0
 
 # Keep detached cleanup alive if the response task is externally cancelled.
 _pump_tasks: set[asyncio.Task[None]] = set()
@@ -243,10 +244,17 @@ async def _codex_available(app: FastAPI) -> bool:
         and not await asyncio.to_thread(Path(settings.codex_bin).is_file)
     ):
         return False
-    now = time.monotonic()
-    if now >= app.state.codex_probe_expires:
-        app.state.codex_healthy = await codex_agent.probe(settings.codex_bin)
-        app.state.codex_probe_expires = now + 30
+    async with app.state.codex_probe_lock:
+        now = time.monotonic()
+        if now >= app.state.codex_probe_expires:
+            try:
+                async with asyncio.timeout(CODEX_PROBE_TIMEOUT):
+                    app.state.codex_healthy = await codex_agent.probe(
+                        settings.codex_bin
+                    )
+            except TimeoutError:
+                app.state.codex_healthy = False
+            app.state.codex_probe_expires = time.monotonic() + 30
     return cast("bool", app.state.codex_healthy)
 
 
@@ -259,10 +267,6 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
             status.HTTP_400_BAD_REQUEST,
             f"timeout_seconds exceeds server maximum {settings.max_timeout_seconds}",
         )
-    if not await _codex_available(request.app):
-        raise HTTPException(
-            status.HTTP_503_SERVICE_UNAVAILABLE, "Codex is disabled or unavailable"
-        )
     semaphore: asyncio.Semaphore = request.app.state.codex_semaphore
     if semaphore.locked():
         raise HTTPException(
@@ -271,6 +275,11 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
     await semaphore.acquire()
     try:
         async with asyncio.timeout(timeout):
+            if not await _codex_available(request.app):
+                raise HTTPException(  # ruff: ignore[raise-within-try]
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Codex is disabled or unavailable",
+                )
             return await codex_agent.run_codex(
                 prompt=body.prompt,
                 cwd=str(cwd),
@@ -284,6 +293,8 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
         raise HTTPException(
             status.HTTP_504_GATEWAY_TIMEOUT, "agent run timed out"
         ) from exc
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.exception("Codex execution failed")
         raise HTTPException(
@@ -291,6 +302,32 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
         ) from exc
     finally:
         semaphore.release()
+
+
+async def _codex_query_with_disconnect(
+    body: CodexQueryRequest, request: Request
+) -> dict[str, Any] | Response:
+    task = cast("asyncio.Task[object]", asyncio.current_task())
+    client_gone = False
+
+    async def watch_disconnect() -> None:
+        nonlocal client_gone
+        while not await request.is_disconnected():  # ruff: ignore[async-busy-wait]
+            await asyncio.sleep(DISCONNECT_POLL_INTERVAL)
+        client_gone = True
+        task.cancel()
+
+    watcher = asyncio.create_task(watch_disconnect())
+    try:
+        return await _codex_query(body, request)
+    except asyncio.CancelledError:
+        if client_gone and task.uncancel() == 0:
+            return Response(status_code=499)
+        raise
+    finally:
+        watcher.cancel()
+        with suppress(asyncio.CancelledError):
+            await watcher
 
 
 def _add_meta_routes(app: FastAPI, settings: Settings) -> None:
@@ -391,7 +428,7 @@ def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure]
             asyncio.CancelledError: If cancellation is not solely due to disconnect.
         """
         if isinstance(body, CodexQueryRequest):
-            return await _codex_query(body, request)
+            return await _codex_query_with_disconnect(body, request)
         options, timeout, semaphore = await _prepare(request, body)
         agent_runner: AgentRunner = request.app.state.runner
         task = cast("asyncio.Task[object]", asyncio.current_task())
@@ -486,6 +523,7 @@ def create_app(
     app.state.runner = runner or SdkAgentRunner()
     app.state.semaphore = asyncio.Semaphore(settings.max_concurrency)
     app.state.codex_semaphore = asyncio.Semaphore(settings.codex_max_concurrency)
+    app.state.codex_probe_lock = asyncio.Lock()
     app.state.codex_probe_expires = 0.0
     app.state.codex_healthy = False
     _add_meta_routes(app, settings)

@@ -8,11 +8,14 @@ from typing import TYPE_CHECKING, NoReturn, Self
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi.responses import Response
 from fastapi.testclient import TestClient
+from starlette.requests import Request
 
-from agsrv import codex_agent
+from agsrv import codex_agent, main
 from agsrv.config import Settings
 from agsrv.main import create_app
+from agsrv.schemas import CodexQueryRequest
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -211,3 +214,91 @@ def test_endpoints(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         api_key="key", workspace_root=tmp_path, codex_bin=str(tmp_path / "missing")
     )
     assert client.get("/v1/agents", headers=headers).json()["codex"]["healthy"] is False
+
+
+@pytest.mark.asyncio
+async def test_probe_coalesces_and_times_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent checks share one bounded probe."""
+    app = create_app(Settings(workspace_root=tmp_path))
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def probe(_binary: str | None) -> bool:
+        started.set()
+        await release.wait()
+        return True
+
+    mock = AsyncMock(side_effect=probe)
+    monkeypatch.setattr(codex_agent, "probe", mock)
+    first = asyncio.create_task(main._codex_available(app))  # pyright: ignore[reportPrivateUsage]
+    await started.wait()
+    second = asyncio.create_task(main._codex_available(app))  # pyright: ignore[reportPrivateUsage]
+    release.set()
+    assert await asyncio.gather(first, second) == [True, True]
+    mock.assert_awaited_once()
+    app.state.codex_probe_expires = 0
+    release.clear()
+    monkeypatch.setattr(main, "CODEX_PROBE_TIMEOUT", 0.01)
+    assert not await main._codex_available(app)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_codex_deadline_and_disconnect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Probe time counts toward the deadline and disconnect cancels the run."""
+    app = create_app(Settings(workspace_root=tmp_path, codex_max_concurrency=1))
+    started = asyncio.Event()
+    closed = asyncio.Event()
+    disconnected = False
+
+    async def receive() -> dict[str, str]:
+        if disconnected:
+            return {"type": "http.disconnect"}
+        await asyncio.Event().wait()
+        return {"type": "http.disconnect"}
+
+    async def slow(*_args: object, **_kwargs: object) -> bool:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            closed.set()
+        return True
+
+    request = Request({"type": "http", "app": app}, receive)
+    monkeypatch.setattr(codex_agent, "probe", slow)
+    with pytest.raises(main.HTTPException) as error:
+        await main._codex_query(  # pyright: ignore[reportPrivateUsage]
+            CodexQueryRequest(agent="codex", prompt="x", timeout_seconds=0.01), request
+        )
+    assert error.value.status_code == 504
+    assert closed.is_set()
+    started.clear()
+    closed.clear()
+    monkeypatch.setattr(main, "DISCONNECT_POLL_INTERVAL", 0.01)
+    task = asyncio.create_task(
+        main._codex_query_with_disconnect(  # pyright: ignore[reportPrivateUsage]
+            CodexQueryRequest(agent="codex", prompt="x"), request
+        )
+    )
+    await started.wait()
+    disconnected = True
+    response = await asyncio.wait_for(task, 1)
+    assert isinstance(response, Response)
+    assert response.status_code == 499
+    assert closed.is_set()
+    assert not app.state.codex_semaphore.locked()
+    disconnected = False
+    started.clear()
+    task = asyncio.create_task(
+        main._codex_query_with_disconnect(  # pyright: ignore[reportPrivateUsage]
+            CodexQueryRequest(agent="codex", prompt="x"), request
+        )
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
