@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import sqlite3
 import time
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from agsrv.config import Settings
 from agsrv.main import create_app
+from agsrv.sandbox import SandboxSetupError
+from agsrv.schemas import QueryRequest
 from tests.test_main import FakeRunner, canned
 
 if TYPE_CHECKING:
@@ -268,13 +272,11 @@ def test_codex_jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         assert result["status"] == "succeeded"
         assert result["result"]["agent"] == "codex"
 
+
 def test_job_admission_failure_cases(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Enforce shutdown, sandbox initialization, and key validation failures."""
-    from fastapi import HTTPException  # ruff: ignore[import-outside-toplevel]
-    from agsrv.sandbox import SandboxSetupError  # ruff: ignore[import-outside-toplevel]
-    from agsrv.schemas import QueryRequest  # ruff: ignore[import-outside-toplevel]
 
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
@@ -285,7 +287,8 @@ def test_job_admission_failure_cases(
             assert exc.value.status_code == 400
 
         def no_home() -> Path:
-            raise SandboxSetupError("missing home")
+            msg = "missing home"
+            raise SandboxSetupError(msg)
 
         monkeypatch.setattr("agsrv.jobs.service_home", no_home)
         assert client.post(
@@ -298,11 +301,10 @@ def test_job_admission_failure_cases(
 
 def test_cancel_without_tracked_task(tmp_path: Path) -> None:
     """Cancel a stored queued job even when no in-memory task exists."""
-    import hashlib  # ruff: ignore[import-outside-toplevel]
 
     app = create_app(_settings(tmp_path))
     with TestClient(app) as client:
-        principal = hashlib.sha256("Bearer secret".encode()).hexdigest()
+        principal = hashlib.sha256(b"Bearer secret").hexdigest()
         with sqlite3.connect(app.state.jobs.path) as db:
             db.execute(
                 """INSERT INTO jobs
@@ -341,10 +343,10 @@ def test_sandbox_runtime_setup_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Represent failed sandbox prerequisites as a stable error code."""
-    from agsrv.sandbox import SandboxSetupError  # ruff: ignore[import-outside-toplevel]
 
     def broken(*_args: object, **_kwargs: object) -> None:
-        raise SandboxSetupError("bundled CLI is unavailable")
+        msg = "bundled CLI is unavailable"
+        raise SandboxSetupError(msg)
 
     monkeypatch.setattr("agsrv.jobs.build_options", broken)
     with TestClient(create_app(_settings(tmp_path), FakeRunner())) as client:
@@ -357,7 +359,6 @@ def test_sandbox_runtime_setup_failure(
 @pytest.mark.asyncio
 async def test_orphaned_run_and_unstarted_manager_stop(tmp_path: Path) -> None:
     """A non-existent record cannot start, and uninitialized shutdown is safe."""
-    from agsrv.schemas import QueryRequest  # ruff: ignore[import-outside-toplevel]
 
     app = create_app(_settings(tmp_path))
     manager = app.state.jobs
