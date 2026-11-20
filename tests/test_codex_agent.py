@@ -344,6 +344,17 @@ async def test_probe_coalesces_and_times_out(
     assert not await main._codex_available(app)  # pyright: ignore[reportPrivateUsage]
 
 
+async def assert_probe_cache_after_cleanup(
+    http: AsyncClient, monkeypatch: pytest.MonkeyPatch, *, query_deadline: bool
+) -> None:
+    """Only a caller-interrupted probe is retried after cleanup."""
+    healthy_probe = AsyncMock(return_value=True)
+    monkeypatch.setattr(codex_agent, "probe", healthy_probe)
+    health = await http.get("/v1/agents")
+    assert health.json()["codex"]["healthy"] is query_deadline
+    assert healthy_probe.await_count == int(query_deadline)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("query_deadline", [False, True])
 async def test_probe_timeout_releases_waiters_but_keeps_slot(
@@ -415,6 +426,9 @@ async def test_probe_timeout_releases_waiters_but_keeps_slot(
             await asyncio.sleep(0.01)
         assert app.state.codex_semaphore._value == 1  # pyright: ignore[reportPrivateUsage]
         assert not main._pump_tasks  # pyright: ignore[reportPrivateUsage]
+        await assert_probe_cache_after_cleanup(
+            http, monkeypatch, query_deadline=query_deadline
+        )
 
 
 @pytest.mark.asyncio
@@ -486,8 +500,9 @@ async def test_warm_cache_start_timeout_keeps_slot(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("newer_cache", [False, True])
 async def test_cancelled_probe_consumes_late_start_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, newer_cache: bool
 ) -> None:
     """A late startup failure is consumed without an orphaned future exception."""
     app = create_app(Settings(workspace_root=tmp_path))
@@ -512,6 +527,9 @@ async def test_cancelled_probe_consumes_late_start_failure(
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+        if newer_cache:
+            app.state.codex_probe_expires += 30
+        expiry = app.state.codex_probe_expires
         release.set()
         for _ in range(100):
             if not main._pump_tasks:  # pyright: ignore[reportPrivateUsage]
@@ -519,6 +537,7 @@ async def test_cancelled_probe_consumes_late_start_failure(
             await asyncio.sleep(0.01)
         assert not main._pump_tasks  # pyright: ignore[reportPrivateUsage]
         assert not errors
+        assert app.state.codex_probe_expires == (expiry if newer_cache else 0)
     finally:
         release.set()
         loop.set_exception_handler(previous_handler)

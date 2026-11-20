@@ -277,21 +277,16 @@ async def _codex_available(app: FastAPI, *, lease: _SlotLease | None = None) -> 
     async with app.state.codex_probe_lock:
         now = time.monotonic()
         if now >= app.state.codex_probe_expires:
-            try:
-                if lease is None:
-                    async with _codex_slot(app) as acquired:
-                        app.state.codex_healthy = await _timed_probe(settings, acquired)
-                else:
-                    app.state.codex_healthy = await _timed_probe(settings, lease)
-            except asyncio.CancelledError:
-                app.state.codex_healthy = False
-                app.state.codex_probe_expires = time.monotonic() + 30
-                raise
+            if lease is None:
+                async with _codex_slot(app) as acquired:
+                    app.state.codex_healthy = await _timed_probe(app, acquired)
+            else:
+                app.state.codex_healthy = await _timed_probe(app, lease)
             app.state.codex_probe_expires = time.monotonic() + 30
     return cast("bool", app.state.codex_healthy)
 
 
-async def _timed_probe(settings: Settings, lease: _SlotLease) -> bool:
+async def _timed_probe(app: FastAPI, lease: _SlotLease) -> bool:
     """Release the caller at the deadline while cleanup retains capacity.
 
     Returns:
@@ -300,11 +295,20 @@ async def _timed_probe(settings: Settings, lease: _SlotLease) -> bool:
     Raises:
         asyncio.CancelledError: If the caller is cancelled.
     """
-    task = asyncio.create_task(codex_agent.probe(settings.codex_bin))
+    task = asyncio.create_task(codex_agent.probe(app.state.settings.codex_bin))
     try:
         done, _ = await asyncio.wait({task}, timeout=CODEX_PROBE_TIMEOUT)
     except asyncio.CancelledError:
         _detach_codex(task, lease)
+        app.state.codex_healthy = False
+        expires = time.monotonic() + 30
+        app.state.codex_probe_expires = expires
+
+        def invalidate(_operation: asyncio.Task[bool]) -> None:
+            if app.state.codex_probe_expires == expires:
+                app.state.codex_probe_expires = 0
+
+        task.add_done_callback(invalidate)
         raise
     if done:
         return task.result()
