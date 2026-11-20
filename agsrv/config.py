@@ -102,6 +102,9 @@ class Settings:
         sandbox_mode: ``off`` rejects ``sandbox: true`` requests; ``opt-in`` lets
             requests enable the Bash sandbox.
         sandbox_allowed_domains: Network egress allow-list for sandboxed Bash.
+        codex_bin: Optional path to the Codex executable.
+        codex_enabled: Whether Codex execution is enabled.
+        codex_max_concurrency: Maximum number of simultaneous Codex runs.
     """
 
     api_key: str | None = None
@@ -115,6 +118,9 @@ class Settings:
     max_timeout_seconds: float = 3600.0
     sandbox_mode: SandboxMode = "off"
     sandbox_allowed_domains: tuple[str, ...] = DEFAULT_SANDBOX_ALLOWED_DOMAINS
+    codex_bin: str | None = None
+    codex_enabled: bool = True
+    codex_max_concurrency: int = 2
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -140,4 +146,9 @@ class Settings:
             ),
             sandbox_mode=_env_sandbox_mode(),
             sandbox_allowed_domains=_env_sandbox_domains(),
+            codex_bin=os.environ.get("AGSRV_CODEX_BIN"),
+            codex_enabled=_env_bool("AGSRV_CODEX_ENABLED", default=True),
+            codex_max_concurrency=int(
+                os.environ.get("AGSRV_CODEX_MAX_CONCURRENCY", "2")
+            ),
         )

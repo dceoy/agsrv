@@ -1,6 +1,6 @@
 [project]
 name = "agsrv"
-version = "0.1.0"
+version = "0.2.0"
 description = "Stateless HTTP API for remote multi-agent execution"
 authors = [{name = "dceoy", email = "dceoy@users.noreply.github.com"}]
 maintainers = [{name = "dceoy", email = "dceoy@users.noreply.github.com"}]
@@ -12,6 +12,7 @@ dependencies = [
   "anyio",
   "claude-agent-sdk >= 0.2.182",
   "fastapi >= 0.115.0",
+  "openai-codex>=0.170.0",
   "uvicorn[standard]>=0.54.0",
 ]
 classifiers = [
