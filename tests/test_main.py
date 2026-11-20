@@ -4,12 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import os
-from contextlib import suppress
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-import anyio
 import httpx
 import pytest
 from claude_agent_sdk import (
@@ -57,11 +55,10 @@ from agsrv.security import check_sandbox_request
 
 if TYPE_CHECKING:
     from collections.abc import (
-        AsyncGenerator,
         AsyncIterator,
-        Awaitable,
         Callable,
         Coroutine,
+        MutableMapping,
         Iterator,
     )
 
@@ -402,7 +399,7 @@ def test_validation(tmp_path: Path) -> None:
     )
     stateful = {"agent": "claude", "sandbox": False, "prompt": "x", "resume": "abc"}
     assert client.post("/v1/query", json=stateful, headers=AUTH).status_code == 422
-    bad_sandbox = {"agent": "claude", "sandbox": False, "prompt": "x", "sandbox": "maybe"}
+    bad_sandbox = {"agent": "claude", "prompt": "x", "sandbox": "maybe"}
     assert client.post("/v1/query", json=bad_sandbox, headers=AUTH).status_code == 422
     for key in ("system_prompt", "disallowed_tools", "max_budget_usd"):
         assert client.post(
@@ -1101,9 +1098,7 @@ def sbx_client(
     Returns:
         Client and runner.
     """
-    return client_for(
-        make_settings(root or sbx.workspace, **kwargs)
-    )
+    return client_for(make_settings(root or sbx.workspace, **kwargs))
 
 
 SANDBOX_BODY = {"agent": "claude", "prompt": "x", "sandbox": True}
@@ -1125,7 +1120,7 @@ def test_sandbox_false_when_off(tmp_path: Path) -> None:
     client, runner = client_for(make_settings(tmp_path))
     response = client.post(
         "/v1/query",
-        json={"agent": "claude", "sandbox": False, "prompt": "x", "sandbox": False},
+        json={"agent": "claude", "prompt": "x", "sandbox": False},
         headers=AUTH,
     )
     assert response.status_code == 200
