@@ -650,7 +650,7 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_settings_positional_workspace_root(tmp_path: Path) -> None:
     """Preserve the positional Settings constructor's workspace argument."""
-    settings = Settings("token", False, tmp_path)
+    settings = Settings("token", False, tmp_path)  # ruff: ignore[boolean-positional-value-in-call]
     assert settings.api_key == "token"
     assert settings.allow_unauthenticated is False
     assert settings.workspace_root == tmp_path
