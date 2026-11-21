@@ -578,6 +578,8 @@ def _seal_private(child_fd: int, name: str) -> tuple[int, int]:
         TmpdirError: If the mode is not ``0700`` afterwards.
     """
     # Apply the exact mode on the descriptor (the umask may have narrowed it).
+    # 0o700 owner-only by design; semgrep cannot resolve _PRIVATE_MODE.
+    # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # ruff: ignore[line-too-long, commented-out-code]
     os.fchmod(child_fd, _PRIVATE_MODE)
     info = os.fstat(child_fd)
     if stat.S_IMODE(info.st_mode) != _PRIVATE_MODE:
@@ -651,9 +653,13 @@ def _capture(turn: _Turn) -> str | None:
 
 def _make_removable(child_fd: int) -> None:
     """Let read-only subdirectories be emptied (descriptor-based chmod only)."""
+    # 0o700 owner-only by design; semgrep cannot resolve _PRIVATE_MODE.
+    # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # ruff: ignore[line-too-long, commented-out-code]
     os.fchmod(child_fd, _PRIVATE_MODE)
     for _top, _dirs, _files, dirfd in os.fwalk(".", dir_fd=child_fd):
         with suppress(OSError):
+            # 0o700 owner-only by design; semgrep cannot resolve _PRIVATE_MODE.
+            # nosemgrep: python.lang.security.audit.insecure-file-permissions.insecure-file-permissions  # ruff: ignore[line-too-long, commented-out-code]
             os.fchmod(dirfd, _PRIVATE_MODE)
 
 
