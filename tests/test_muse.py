@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -907,8 +908,12 @@ def test_muse_rate_limits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     assert response.json()["five_hour"]["used_percent"] == 30
     assert response.json()["seven_day"]["used_percent"] == 50
     assert response.json()["raw"] == raw
+    assert client.get(url, headers=headers).json() == response.json()
+    read.assert_awaited_once()
+    app.state.muse_usage_expires = 0
     read.return_value = {}
     assert client.get(url, headers=headers).json()["available"] is False
+    app.state.muse_usage_expires = 0
     read.side_effect = RuntimeError("error")
     assert client.get(url, headers=headers).status_code == 502
     app.state.settings = replace(app.state.settings, muse_enabled=False)
@@ -916,6 +921,47 @@ def test_muse_rate_limits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     app.state.settings = replace(app.state.settings, muse_enabled=True)
     app.state.muse_healthy = False
     assert client.get(url, headers=headers).status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_usage_concurrent_polls_share_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent polls share one host refresh and the cached observation."""
+    monkeypatch.setattr(muse, "probe", AsyncMock(return_value=True))
+    started, release = asyncio.Event(), asyncio.Event()
+    host = MagicMock()
+    host.durability = SimpleNamespace(kind="ephemeral")
+    host.initialize_result = {"sandboxAvailability": "available"}
+    host.close = AsyncMock()
+
+    async def refresh(*args: object) -> dict[str, object]:
+        _ = args
+        started.set()
+        await release.wait()
+        return {"usage": {}}
+
+    host.request = AsyncMock(side_effect=refresh)
+    monkeypatch.setattr(muse.MuseClient, "spawn", AsyncMock(return_value=host))
+    app = create_app(
+        Settings(api_key="key", workspace_root=tmp_path, muse_enabled=True)
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        url = "/v1/agents/muse/rate-limits"
+        headers = {"Authorization": "Bearer key"}
+        first = asyncio.create_task(client.get(url, headers=headers))
+        await started.wait()
+        second = asyncio.create_task(client.get(url, headers=headers))
+        await asyncio.sleep(0)
+        release.set()
+        responses = await asyncio.gather(first, second)
+        assert [response.status_code for response in responses] == [200, 200]
+        assert responses[0].json() == responses[1].json()
+        assert (await client.get(url, headers=headers)).json() == responses[0].json()
+    host.request.assert_awaited_once_with("usage/refresh")
+    host.close.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -1038,6 +1084,7 @@ def test_usage_reader_availability_route(
     assert response.json()["detail"] == "Muse is disabled or unavailable"
     host.request.assert_not_awaited()
     host.initialize_result = {"sandboxAvailability": "available"}
+    app.state.muse_usage_expires = 0
     response = client.get(url, headers=headers)
     assert response.status_code == 200
     assert response.json()["available"] is False
@@ -1102,6 +1149,7 @@ def test_muse_unavailable_and_rate_timeout(
             workspace_root=tmp_path,
             muse_enabled=True,
             max_timeout_seconds=0.05,
+            muse_max_concurrency=1,
         )
     )
     client = TestClient(app)
@@ -1117,8 +1165,22 @@ def test_muse_unavailable_and_rate_timeout(
     )
     app.state.muse_probe_expires = 0
     monkeypatch.setattr(muse, "probe", AsyncMock(return_value=True))
-    monkeypatch.setattr(muse, "read_usage", AsyncMock(side_effect=asyncio.TimeoutError))
+    host = MagicMock()
+    host.durability = SimpleNamespace(kind="ephemeral")
+    host.initialize_result = {"sandboxAvailability": "available"}
+    host.close = AsyncMock()
+
+    async def stalled_refresh(*args: object) -> None:
+        _ = args
+        await asyncio.Event().wait()
+
+    host.request = AsyncMock(side_effect=stalled_refresh)
+    monkeypatch.setattr(muse.MuseClient, "spawn", AsyncMock(return_value=host))
     assert client.get(url, headers=headers).status_code == 504
+    host.request.assert_awaited_once_with("usage/refresh")
+    host.close.assert_awaited_once()
+    assert host not in muse._active_hosts  # pyright: ignore[reportPrivateUsage]
+    assert not app.state.muse_semaphore.locked()
 
 
 @pytest.mark.asyncio
