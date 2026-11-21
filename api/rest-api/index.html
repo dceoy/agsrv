@@ -338,11 +338,12 @@ receives the same admission, disk-space preflight and per-turn <code>TMPDIR</cod
 handling as a query — unlike the Codex route below, which starts no
 workspace turn.</p>
 <h2 id="get-v1agentsmuserate-limits"><code>GET /v1/agents/muse/rate-limits</code><a class="headerlink" href="#get-v1agentsmuserate-limits" title="Permanent link">&para;</a></h2>
-<p>Returns the host's last-observed subscription usage without a model call or a
-session. <code>five_hour</code> and <code>seven_day</code> contain <code>used_percent</code> and an ISO 8601
+<p>Actively refreshes subscription usage via the experimental Muse host
+<code>usage/refresh</code> API without a model call or a session. <code>five_hour</code> and <code>seven_day</code> contain <code>used_percent</code> and an ISO 8601
 <code>resets_at</code>, or null when unavailable. <code>raw</code> and <code>backend</code> preserve the SDK
-payload; <code>fetched_at</code> is the read time. A fresh host may have no cached usage,
-in which case <code>available</code> is false. Disabled or unavailable Muse returns 503;
+payload. Results are cached for 60 seconds, so repeated polls can return the same
+windows and <code>fetched_at</code> even if account usage changes; the timestamp is the read
+time of the cached observation. If the refresh fails or has no usable windows, <code>available</code> is false. Disabled or unavailable Muse returns 503;
 backend failures return 502 and timeouts return 504.</p>
 <h2 id="get-v1agentscodexrate-limits"><code>GET /v1/agents/codex/rate-limits</code><a class="headerlink" href="#get-v1agentscodexrate-limits" title="Permanent link">&para;</a></h2>
 <p>Returns <code>plan</code>, <code>primary</code> and <code>secondary</code> windows (<code>used_percent</code> and
