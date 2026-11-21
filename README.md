@@ -61,6 +61,8 @@ curl -sS https://agsrv.example.net/v1/jobs \
 | `AGSRV_CODEX_MAX_CONCURRENCY`    | `2`                              | Simultaneous Codex runs                                  |
 | `AGSRV_API_KEY`                  | unset                            | Bearer token clients must send                           |
 | `AGSRV_ALLOW_UNAUTHENTICATED`    | `false`                          | Allow requests with no key configured (local dev only)   |
+| `AGSRV_TMP_MIN_FREE_BYTES`      | `536870912`                      | Minimum free bytes on /tmp; 0 disables the check |
+| `AGSRV_WORKSPACE_MIN_FREE_BYTES`| `1073741824`                     | Minimum free bytes on the workspace filesystem; 0 disables the check |
 | `AGSRV_WORKSPACE_ROOT`           | current directory                | All request `cwd` values must resolve inside this path   |
 | `AGSRV_DEFAULT_MODEL`            | unset (SDK default)              | Model used when a request omits `model`                  |
 | `AGSRV_PERMISSION_MODE`          | `acceptEdits`                    | Default permission mode                                  |
@@ -73,6 +75,13 @@ curl -sS https://agsrv.example.net/v1/jobs \
 | `AGSRV_JOBS_MAX_PAYLOAD_BYTES`   | `65536`                          | Maximum canonical request size |
 | `AGSRV_JOBS_MAX_RESULT_BYTES`    | `1048576`                        | Maximum persisted result size |
 | `AGSRV_SANDBOX_ALLOWED_DOMAINS`  | GitHub, PyPI, and npm hosts (see below) | Comma-separated egress allow-list for sandboxed Bash; set-but-empty means no egress |
+
+Each turn uses a private `.agsrv-tmp-<uuid>` directory in its working
+directory as `TMPDIR`. It is removed after the turn, including on errors and
+cancellation. Claude and Codex command environments receive this value. Codex
+read-only sandboxes still enforce their normal write restrictions. Before a turn,
+agsrv checks free space on `/tmp` and the workspace root and returns HTTP 503
+when either enabled threshold is unmet. Queued jobs are checked again at execution.
 
 The default sandbox domains are `github.com`, `api.github.com`,
 `codeload.github.com`, `uploads.github.com`, `raw.githubusercontent.com`,

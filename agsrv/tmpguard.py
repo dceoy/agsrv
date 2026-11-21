@@ -24,7 +24,7 @@ def check_space(settings: "Settings") -> None:
         HTTPException: If free space cannot be established or is insufficient.
     """
     for path, required in (
-        (Path("/tmp"), settings.tmp_min_free_bytes),  # noqa: S108
+        (Path("/tmp"), settings.tmp_min_free_bytes),  # ruff: ignore[hardcoded-temp-file]
         (settings.workspace_root, settings.workspace_min_free_bytes),
     ):
         if required:
@@ -57,5 +57,5 @@ def turn_tmpdir(cwd: Path) -> "Generator[Path, None, None]":
     finally:
         try:
             shutil.rmtree(path)
-        except OSError:
+        except Exception:  # cleanup must never mask the turn result
             logger.exception("Failed to remove turn temporary directory %s", path)

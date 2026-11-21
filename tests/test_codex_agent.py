@@ -138,7 +138,12 @@ async def test_run(
         sandbox=sandbox,
         network_access=network,
         binary=None,
+        tmpdir="/workspace/.agsrv-tmp-test",
     )
+    assert client.thread_start.await_args is not None
+    assert client.thread_start.await_args.args[0]["config"] == {
+        "shell_environment_policy": {"set": {"TMPDIR": "/workspace/.agsrv-tmp-test"}}
+    }
     assert response["model"] == "actual"
     assert response["backend"]["commands"] == [
         {"type": "commandExecution", "command": "pwd"}
