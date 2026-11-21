@@ -120,7 +120,7 @@ creation or deletion onto foreign data. A writer that enumerates the parent and
 swaps the new entry in the instant between `mkdir` and the following `open` is
 not detectable by identity alone; agsrv therefore refuses to adopt anything that
 is not an empty directory owned by the server user, but cannot rule out an
-attacker-owned empty directory being adopted. The workspace root path and
+empty directory planted by a same-user attacker being adopted (deleting it harms nothing, but later contents it receives would be deleted). The workspace root path and
 everything above it are administrator-controlled and trusted. A directory that a
 turn moves away itself is reported and left in place. The Codex child itself is
 not observed live, as noted above.
