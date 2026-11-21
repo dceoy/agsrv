@@ -117,6 +117,10 @@
               <ul class="nav flex-column">
               </ul>
             </li>
+            <li class="nav-item" data-bs-level="2"><a href="#get-v1agentsmuserate-limits" class="nav-link">GET /v1/agents/muse/rate-limits</a>
+              <ul class="nav flex-column">
+              </ul>
+            </li>
             <li class="nav-item" data-bs-level="2"><a href="#get-v1agentscodexrate-limits" class="nav-link">GET /v1/agents/codex/rate-limits</a>
               <ul class="nav flex-column">
               </ul>
@@ -290,10 +294,25 @@ uses an explicit low-level sandbox policy; otherwise it uses SDK presets (D3).
 Set <code>AGSRV_CODEX_ENABLED</code> (default <code>true</code>), <code>AGSRV_CODEX_BIN</code> (optional SDK
 binary override), and <code>AGSRV_CODEX_MAX_CONCURRENCY</code> (default <code>2</code>). A disabled
 or unavailable backend returns 503 without affecting Claude.</p>
+<h3 id="muse-requests">Muse requests<a class="headerlink" href="#muse-requests" title="Permanent link">&para;</a></h3>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="p">{</span><span class="w"> </span><span class="nt">"agent"</span><span class="p">:</span><span class="w"> </span><span class="s2">"muse"</span><span class="p">,</span><span class="w"> </span><span class="nt">"prompt"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Summarize this project"</span><span class="p">,</span><span class="w"> </span><span class="nt">"cwd"</span><span class="p">:</span><span class="w"> </span><span class="s2">"."</span><span class="p">,</span>
+<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="w">  </span><span class="nt">"model"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span><span class="w"> </span><span class="nt">"effort"</span><span class="p">:</span><span class="w"> </span><span class="s2">"high"</span><span class="p">,</span><span class="w"> </span><span class="nt">"timeout_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mi">300</span><span class="p">,</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">  </span><span class="nt">"include_messages"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="w"> </span><span class="p">}</span>
+</code></pre></div>
+<p><code>effort</code> is one of <code>none</code>, <code>minimal</code>, <code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code>, <code>max</code>,
+<code>ultra</code>. Muse uses <code>muse serve --no-session-log --contributor-mode off</code> with a
+fixed sandbox posture (never <code>--disable-sandbox</code> or <code>--trust-workspace</code>), a
+deny-all <code>on_approval</code> handler and approval mode <code>onRequest</code>. Sessions are
+memory-only; if <code>client.durability</code> is not ephemeral the backend fails closed
+and <code>GET /v1/agents</code> reports unhealthy. <code>include_messages</code> is accepted for
+parity but no transcript is returned in v1. The backend is disabled by default
+(<code>AGSRV_MUSE_ENABLED=false</code>) and requires a logged-in <code>muse</code> host matching the
+SDK version (<code>muse-code-sdk==1.4.24</code> with <code>muse 1.4.24</code>); upgrade them
+together. <code>POST /v1/query/stream</code> with <code>agent=muse</code> returns 404 like Codex.</p>
 <h2 id="get-v1agents"><code>GET /v1/agents</code><a class="headerlink" href="#get-v1agents" title="Permanent link">&para;</a></h2>
-<p>Returns <code>claude</code> and <code>codex</code> objects with <code>enabled</code>, <code>healthy</code>, <code>default_model</code>,
+<p>Returns <code>claude</code>, <code>codex</code> and <code>muse</code> objects with <code>enabled</code>, <code>healthy</code>, <code>default_model</code>,
 and <code>supports</code> flags for <code>sandbox</code>, <code>network_access</code>, <code>rate_limits</code>, and
-<code>streaming</code>. Claude and Codex health probes are cached for approximately 30 seconds. Claude uses the local <code>/usage</code> command, without consuming tokens or allowance.</p>
+<code>streaming</code>. Claude and Codex health probes are cached for approximately 30 seconds. Muse initialization follows the same cached (~30s) durability probe pattern. Claude uses the local <code>/usage</code> command, without consuming tokens or allowance.</p>
 <p>Claude is <code>healthy</code> when the CLI is spawnable, the ephemeral <code>/usage</code> run does not
 return an error result, and the bundled CLI's <code>auth status</code> reports
 <code>loggedIn: true</code>. The probe never uses the sandbox. This proves a configured,
@@ -303,20 +322,27 @@ runs). While the Claude concurrency slot is busy, this endpoint returns the last
 cached health value (even if expired) and never responds 429 because of the
 Claude probe. The Codex entry is unaffected: with Codex enabled and its
 concurrency slot busy, this endpoint can still respond 429.</p>
+<h2 id="get-v1agentsmuserate-limits"><code>GET /v1/agents/muse/rate-limits</code><a class="headerlink" href="#get-v1agentsmuserate-limits" title="Permanent link">&para;</a></h2>
+<p>Returns the host's last-observed subscription usage without a model call or a
+session. <code>five_hour</code> and <code>seven_day</code> contain <code>used_percent</code> and an ISO 8601
+<code>resets_at</code>, or null when unavailable. <code>raw</code> and <code>backend</code> preserve the SDK
+payload; <code>fetched_at</code> is the read time. A fresh host may have no cached usage,
+in which case <code>available</code> is false. Disabled or unavailable Muse returns 503;
+backend failures return 502 and timeouts return 504.</p>
 <h2 id="get-v1agentscodexrate-limits"><code>GET /v1/agents/codex/rate-limits</code><a class="headerlink" href="#get-v1agentscodexrate-limits" title="Permanent link">&para;</a></h2>
 <p>Returns <code>plan</code>, <code>primary</code> and <code>secondary</code> windows (<code>used_percent</code> and
 <code>resets_at</code>), <code>reached_type</code>, <code>reset_credits</code>, and the raw SDK payload in
 <code>backend</code>. Missing windows are null.</p>
 <h2 id="durable-asynchronous-jobs">Durable asynchronous jobs<a class="headerlink" href="#durable-asynchronous-jobs" title="Permanent link">&para;</a></h2>
-<p><code>POST /v1/jobs</code> accepts the same discriminated Claude/Codex JSON body as
+<p><code>POST /v1/jobs</code> accepts the same discriminated Claude/Codex/Muse JSON body as
 <code>/v1/query</code>. Unlike synchronous queries, the server owns execution after the
 202 response and continues across HTTP disconnects. Example:</p>
-<div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="err">POST /v1/jobs</span>
-<a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="err">Authorization: Bearer &lt;AGSRV_API_KEY&gt;</span>
-<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="err">Idempotency-Key: vm-task-123</span>
-<a id="__codelineno-5-4" name="__codelineno-5-4" href="#__codelineno-5-4"></a><span class="err">Content-Type: application/json</span>
-<a id="__codelineno-5-5" name="__codelineno-5-5" href="#__codelineno-5-5"></a>
-<a id="__codelineno-5-6" name="__codelineno-5-6" href="#__codelineno-5-6"></a><span class="err">{"agent":"claude","prompt":"Analyze the repository","cwd":"myproject"}</span>
+<div class="highlight"><pre><span></span><code><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="err">POST /v1/jobs</span>
+<a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a><span class="err">Authorization: Bearer &lt;AGSRV_API_KEY&gt;</span>
+<a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a><span class="err">Idempotency-Key: vm-task-123</span>
+<a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a><span class="err">Content-Type: application/json</span>
+<a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>
+<a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a><span class="err">{"agent":"claude","prompt":"Analyze the repository","cwd":"myproject"}</span>
 </code></pre></div>
 <p>Returns 202: <code>{"job_id":"&lt;opaque UUID&gt;","status_url":"/v1/jobs/&lt;id&gt;"}</code>.
 The optional <code>Idempotency-Key</code> (1–128 printable ASCII chars) is scoped to the
@@ -326,7 +352,7 @@ record expires, key reuse can create a new job.</p>
 <p><code>GET /v1/jobs/{job_id}</code> returns <code>job_id</code>, <code>agent</code>, <code>status</code>,
 <code>created_at</code>, <code>started_at</code>, <code>finished_at</code>, <code>result</code>, and <code>error</code>.
 Statuses are <code>queued</code>, <code>running</code>, <code>succeeded</code>, <code>failed</code>, <code>cancelled</code>,
-or <code>interrupted</code>. <code>result</code> contains the normalized Claude or Codex response
+or <code>interrupted</code>. <code>result</code> contains the normalized Claude, Codex or Muse response
 only on completion. Agent-level errors become <code>failed</code> with a retained result;
 transport failures and deadlines have sanitized <code>error.code</code> values.
 <code>POST /v1/jobs/{job_id}/cancel</code> is idempotent: queued jobs stop immediately,
@@ -401,7 +427,7 @@ The old SSE stream endpoint is deliberately removed.</p>
 </tr>
 <tr>
 <td>503</td>
-<td><code>AGSRV_API_KEY</code> not configured and unauthenticated access not allowed; sandbox prerequisites unavailable or Claude or Codex disabled/unavailable</td>
+<td><code>AGSRV_API_KEY</code> not configured and unauthenticated access not allowed; sandbox prerequisites unavailable or Claude, Codex or Muse disabled/unavailable</td>
 </tr>
 <tr>
 <td>504</td>
