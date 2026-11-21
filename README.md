@@ -34,9 +34,11 @@ Server:
 uv sync
 export AGSRV_API_KEY="$(openssl rand -hex 32)"
 export AGSRV_WORKSPACE_ROOT=/srv/workspaces
-# Mandatory since 0.4.0: a service-owned staging directory (mode 0700, outside
-# the workspace root, on the same mount) — without it the server refuses to start.
-sudo mkdir -p /var/lib/agsrv/stage && sudo chmod 700 /var/lib/agsrv/stage
+# Mandatory since 0.4.0: a staging directory owned by the user that runs the
+# server (mode 0700, outside the workspace root, on the same mount), and a
+# writable workspace root — without them the server refuses to start.
+sudo install -d -m 755 -o "$USER" /srv/workspaces
+sudo install -d -m 700 -o "$USER" /var/lib/agsrv/stage
 export AGSRV_TMP_STAGING_DIRS=/srv/workspaces=/var/lib/agsrv/stage
 export ANTHROPIC_API_KEY=...   # or log in with `claude` as the server user
 uv run uvicorn agsrv.main:app --host 127.0.0.1 --port 8000
@@ -60,12 +62,14 @@ curl -sS https://agsrv.example.net/v1/jobs \
 
 ## Configuration
 
-Three settings decide whether the server starts at all: `AGSRV_API_KEY`
-(without it, execution endpoints return 503 unless
-`AGSRV_ALLOW_UNAUTHENTICATED=true`), `AGSRV_WORKSPACE_ROOT`, and
-`AGSRV_TMP_STAGING_DIRS` — the last is mandatory since 0.4.0 and has no
-default; startup fails without a staging directory for the workspace root's
-mount (see the deployment property below).
+Start with three settings. `AGSRV_TMP_STAGING_DIRS` is mandatory since 0.4.0
+and has no default: startup fails without a staging directory for the
+workspace root's mount (see the deployment property below).
+`AGSRV_API_KEY` decides whether the server serves: without it the server
+starts, but execution endpoints return 503 unless
+`AGSRV_ALLOW_UNAUTHENTICATED=true`. `AGSRV_WORKSPACE_ROOT` confines every
+request `cwd`. Other settings can also abort startup when their values are
+invalid (for example `AGSRV_SANDBOX_ALLOWED_DOMAINS`).
 
 | Variable                          | Default                          | Description                                              |
 | --------------------------------- | -------------------------------- | -------------------------------------------------------- |
@@ -99,10 +103,11 @@ directory. Claude receives it as `TMPDIR` in the SDK environment. For Codex, the
 per-turn thread configuration carries
 `shell_environment_policy.set.TMPDIR`; this is verified at the request-payload
 level (a mocked `thread_start` test) and was also observed live on 2026-11-21:
-in the reference deployment a Codex child printed a `TMPDIR` inside its working
-directory during a smoke run. Treat the live behaviour as environment-dependent —
-bubblewrap's socket-directory constraint can block it on other hosts. Codex
-read-only sandboxes still enforce their normal write restrictions. Before a turn, agsrv checks free space on `/tmp`, the
+in the reference deployment a Codex child printed a `TMPDIR` inside its
+working directory during a smoke run. Treat the live behaviour as
+environment-dependent — bubblewrap's socket-directory constraint can prevent
+observing it on other hosts. Codex read-only sandboxes still enforce their
+normal write restrictions. Before a turn, agsrv checks free space on `/tmp`, the
 workspace root and the working directory (measured on the held descriptors, so
 a working directory on a separate mount must pass its own check) and returns
 HTTP 503 when either enabled threshold is unmet. Queued work is checked again,
@@ -146,12 +151,13 @@ unsupported flags or a missing `renameat2` fail closed. Example:
 `AGSRV_WORKSPACE_ROOT=/srv/ws`
 `AGSRV_TMP_STAGING_DIRS=/srv/ws=/var/lib/agsrv/stage`.
 
-The `mount_root` key must be a directory the service can write to on the same
-mount as the staging directory (typically the workspace root); it need not be the
-mount point itself. Keying on the filesystem root `/` fails when the service
-cannot create its probe entries there (for example `Permission denied` on
-`.agsrv-probe-…`). A working shape:
-`AGSRV_TMP_STAGING_DIRS=/home/muse/workspaces=/home/muse/.agsrv-staging`.
+The `mount_root` key must be the workspace root itself or one of its
+ancestors, and a directory the service can write to on the same mount as the
+staging directory; it need not be the mount point itself. Keying on the
+filesystem root `/` fails when the service cannot create its probe entries
+there (for example `Permission denied` on `.agsrv-probe-…`). The example pair
+above is the working shape: the workspace root as key, the staging directory
+as value.
 
 Other writers may share the working directory and can list it, rename or remove
 entries, substitute real directories or symlinks, and change ancestors. Random
@@ -228,9 +234,9 @@ Residual risks:
   administration, service compromise, malicious filesystems and the trusted
   anchors (workspace root, staging directory and their ancestors) are outside
   the model.
-- A live Codex child observing `TMPDIR` was verified in the reference
+- A live Codex child observing `TMPDIR` was observed in the reference
   deployment, as noted above; on other hosts the bubblewrap constraint may
-  still block it.
+  still prevent observing it.
 
 The default sandbox domains are `github.com`, `api.github.com`,
 `codeload.github.com`, `uploads.github.com`, `raw.githubusercontent.com`,
@@ -269,10 +275,11 @@ backend fails closed when durability is not ephemeral. `GET /v1/agents` reports
 availability probes (approximately 30 seconds), and queries return 503 when
 the selected agent is disabled or unavailable. The Claude probe runs the local
 `/usage` command and consumes no tokens or subscription allowance; the Muse
-probe checks that a `muse serve` host starts with ephemeral durability. The
-endpoint never returns 429 because of the Claude probe — while the Claude slot
-is busy it serves the last cached value; with Codex enabled and its slot busy,
-the Codex entry can still produce 429.
+probe checks that a `muse serve` host starts with ephemeral durability and
+sandboxing available. The endpoint never returns 429 because of the Claude
+probe — while the Claude slot is busy it serves the last cached value; the
+Codex entry can still produce 429 (Codex enabled, its slot busy), and so can
+the Muse entry (Muse enabled, its slot busy, its cached probe expired).
 
 Each agent also has a rate-limits route (see the endpoints table): Claude's
 returns the local `/usage` result, Codex's the typed

@@ -195,7 +195,8 @@ and `GET /v1/agents` reports unhealthy. `include_messages` is accepted for
 parity but no transcript is returned in v1. The backend is disabled by default
 (`AGSRV_MUSE_ENABLED=false`) and requires a logged-in `muse` host matching the
 SDK version (`muse-code-sdk==1.4.24` with `muse 1.4.24`); upgrade them
-together. `POST /v1/query/stream` with `agent=muse` returns 404 like Codex.
+together. There is no streaming variant for any agent; all queries are
+request/response.
 
 ## `GET /v1/agents`
 
@@ -211,7 +212,19 @@ still valid server-side (an expired or revoked token can pass until a real turn
 runs). While the Claude concurrency slot is busy, this endpoint returns the last
 cached health value (even if expired) and never responds 429 because of the
 Claude probe. The Codex entry is unaffected: with Codex enabled and its
-concurrency slot busy, this endpoint can still respond 429.
+concurrency slot busy, this endpoint can still respond 429. The same applies
+to the Muse entry when Muse is enabled, its slot is busy, and its cached
+probe has expired.
+
+## `GET /v1/agents/claude/rate-limits`
+
+Runs the local Claude CLI's `/usage` command and returns the normalized
+rate-limit windows together with the raw text. If the output cannot be
+parsed, `available` is false. The `/usage` command consumes no tokens or
+subscription allowance. The route spawns a Claude child process, so it
+receives the same admission, disk-space preflight and per-turn `TMPDIR`
+handling as a query — unlike the Codex route below, which starts no
+workspace turn.
 
 ## `GET /v1/agents/muse/rate-limits`
 
@@ -296,7 +309,7 @@ The old SSE stream endpoint is deliberately removed.
 | 422    | Invalid body (empty prompt, unknown/stateful fields, bad ranges)       |
 | 429    | Concurrency or pending-job capacity reached (jobs include Retry-After) |
 | 502    | SDK/CLI failure, or the run ended without a result message             |
-| 503    | `AGSRV_API_KEY` not configured and unauthenticated access not allowed; sandbox prerequisites unavailable; Claude, Codex or Muse disabled/unavailable; or the disk-space preflight failed (free space on `/tmp`, the workspace root or the working directory below its threshold, or no staging directory configured for the working directory's mount) |
+| 503    | `AGSRV_API_KEY` not configured and unauthenticated access not allowed; sandbox prerequisites unavailable; Claude, Codex or Muse disabled/unavailable; or the turn could not be prepared — the disk-space preflight found free space on `/tmp`, the workspace root or the working directory below its threshold, or no staging directory is configured for the working directory's mount |
 | 504    | Run exceeded its timeout                                               |
 
 Errors use FastAPI's `{"detail": "..."}` body.

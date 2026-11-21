@@ -13,8 +13,8 @@ Python SDKs.
   rate-limits route per agent (`/v1/agents/claude/rate-limits`,
   `/v1/agents/codex/rate-limits`, `/v1/agents/muse/rate-limits`).
   `GET /health` needs no authentication.
-- Bearer-token authentication, workspace confinement, and per-agent
-  concurrency and timeout limits.
+- Bearer-token authentication, workspace confinement, per-agent concurrency
+  limits, and a global timeout cap.
 - No sessions, resume, or server-side conversation state, and no streaming
   endpoint: every request is one ephemeral run.
 
@@ -24,6 +24,9 @@ Python SDKs.
 uv sync
 uv run uvicorn agsrv.main:app --host 127.0.0.1 --port 8000
 ```
+
+Since 0.4.0 the last command needs `AGSRV_TMP_STAGING_DIRS` set first — see
+[Deployment](api/deployment.md) (Local development).
 
 - [API reference](api/index.md)
 - [Deployment](api/deployment.md)
