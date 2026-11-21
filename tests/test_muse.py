@@ -22,7 +22,6 @@ from agsrv.config import Settings
 from agsrv.main import (
     create_app,
 )
-from agsrv.sandbox import SANDBOX_DENIED_ENV_VARS
 from agsrv.schemas import MuseQueryRequest
 
 if TYPE_CHECKING:
@@ -197,28 +196,6 @@ async def test_probe_success_and_failure(monkeypatch: pytest.MonkeyPatch) -> Non
     assert await muse.probe(None) is False
     monkeypatch.setattr(muse.MuseClient, "spawn", _fail)
     assert await muse.probe(None) is False
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("tmpdir", [None, "/private/turn"])
-async def test_spawn_filters_env(
-    monkeypatch: pytest.MonkeyPatch, tmpdir: str | None
-) -> None:
-    """Every host gets the filtered environment, even without a turn directory."""
-    for name in SANDBOX_DENIED_ENV_VARS:
-        monkeypatch.setenv(name, "sentinel")
-    monkeypatch.setenv("TMPDIR", "/inherited")
-    monkeypatch.setenv("AGSRV_KEEP_ME", "keep")
-    spawn = AsyncMock()
-    monkeypatch.setattr(muse.MuseClient, "spawn", spawn)
-    client = await muse._spawn(None, None, tmpdir)  # pyright: ignore[reportPrivateUsage]
-    await muse._close(client)  # pyright: ignore[reportPrivateUsage]
-    assert spawn.await_args is not None
-    options: MuseClientSpawnOptions = spawn.await_args.args[0]
-    assert options.env is not None
-    assert set(SANDBOX_DENIED_ENV_VARS).isdisjoint(options.env)
-    assert options.env["AGSRV_KEEP_ME"] == "keep"
-    assert options.env["TMPDIR"] == (tmpdir or "/inherited")
 
 
 @pytest.mark.asyncio

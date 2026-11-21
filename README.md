@@ -68,13 +68,14 @@ workspace root's mount (see the deployment property below).
 `AGSRV_API_KEY` decides whether the server serves: without it the server
 starts, but execution endpoints return 503 unless
 `AGSRV_ALLOW_UNAUTHENTICATED=true`. `AGSRV_WORKSPACE_ROOT` confines every
-request `cwd`. Other settings can also abort startup when their values are
+request `cwd` and must not contain the service user's home directory. Other settings can also abort startup when their values are
 invalid (for example `AGSRV_SANDBOX_ALLOWED_DOMAINS`).
 
 | Variable                          | Default                          | Description                                              |
 | --------------------------------- | -------------------------------- | -------------------------------------------------------- |
 | `AGSRV_API_KEY`                  | unset                            | Bearer token clients must send                           |
 | `AGSRV_ALLOW_UNAUTHENTICATED`    | `false`                          | Allow requests with no key configured (local dev only)   |
+| `AGSRV_ALLOW_UNSANDBOXED`        | `true`                           | Allow Claude and Muse requests to set `sandbox: false`   |
 | `AGSRV_WORKSPACE_ROOT`           | current directory                | All request `cwd` values must resolve inside this path   |
 | `AGSRV_TMP_STAGING_DIRS`         | **required** (unset: server refuses to start) | `mount_root=staging_dir` pairs, comma-separated; see below |
 | `AGSRV_CODEX_BIN`                | unset (SDK bundled binary)       | Optional Codex executable path                           |
@@ -300,18 +301,24 @@ the precise health definitions.
   it accordingly; the default Claude Bash sandbox is only one part of defence in depth.
 - **API key required by default.** Without `AGSRV_API_KEY` (or with an empty
   one), execution endpoints return 503 unless
-  `AGSRV_ALLOW_UNAUTHENTICATED=true` is set explicitly. Keys are compared in
+  `AGSRV_ALLOW_UNAUTHENTICATED=true` is set explicitly. With that setting the
+  server logs a startup warning and accepts only `localhost`, `127.0.0.1`, or
+  `[::1]` as the request host. Bind to loopback as well. Keys are compared in
   constant time.
 - **`allowed_tools` is an auto-approve list, not a restriction.** It names the
   tools a run may use without a permission decision; it does not remove other
   tools, and under the default `acceptEdits` mode file edits are approved
   regardless. The server-side `AGSRV_ALLOWED_TOOLS` is only a default — any
   key holder can send a different list per request.
-- **The agent can read the server's secrets.** A run inherits the service
+- **The agent can read the server's secrets.** A Claude run inherits the service
   environment, including `ANTHROPIC_API_KEY`, the Claude login credentials,
   and `AGSRV_API_KEY` itself. Prompt-injected workspace content can therefore
   exfiltrate them; do not point the service at untrusted workspaces. The
-  default-on sandbox only narrows the Bash path (see below).
+  default-on sandbox only narrows the Bash path (see below). Muse hosts inherit
+  the service environment except for `AGSRV_API_KEY`, `ANTHROPIC_API_KEY`,
+  `CLAUDE_CODE_OAUTH_TOKEN`, and `CLAUDE_CODE_MESSAGING_TOKEN`.
+- **Sandbox opt-outs are optional.** Set `AGSRV_ALLOW_UNSANDBOXED=false` to
+  reject Claude and Muse requests with `sandbox: false` (403), including jobs.
 - **Default-on Bash sandbox.** Claude requests default to `sandbox: true` and
   run Bash and its child processes inside the CLI sandbox. Set `sandbox: false`
   only for a deliberate control operation that needs access to the host:

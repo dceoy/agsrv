@@ -189,7 +189,7 @@ def client_for(
         Client and runner.
     """
     runner = runner or FakeRunner()
-    return TestClient(create_app(settings, runner)), runner
+    return TestClient(create_app(settings, runner), base_url="http://localhost"), runner
 
 
 AUTH = {"Authorization": "Bearer secret"}
@@ -202,6 +202,22 @@ def test_health(tmp_path: Path) -> None:
         response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_unauthenticated_hosts(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Local development accepts loopback hosts only and warns at startup."""
+    settings = make_settings(tmp_path, api_key=None, allow_unauthenticated=True)
+    with TestClient(create_app(settings)) as client:
+        assert "AGSRV_ALLOW_UNAUTHENTICATED is enabled" in caplog.text
+        for host in ("localhost", "127.0.0.1:8000", "[::1]:8000"):
+            assert client.get("/health", headers={"Host": host}).status_code == 200
+        for host in ("example.org", "testserver"):
+            assert client.get("/health", headers={"Host": host}).status_code == 400
+
+    with TestClient(create_app(make_settings(tmp_path))) as client:
+        assert client.get("/health", headers={"Host": "example.org"}).status_code == 200
 
 
 def test_query_success(tmp_path: Path) -> None:

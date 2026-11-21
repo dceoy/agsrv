@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Annotated, Any, TypeVar, cast
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import Response
 from pydantic import Field
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from agsrv import claude, codex, muse
 from agsrv.claude import (
@@ -998,6 +999,8 @@ def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure, 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Open the durable queue and stop all owned jobs on shutdown."""
+    if app.state.settings.allow_unauthenticated:
+        logger.warning("AGSRV_ALLOW_UNAUTHENTICATED is enabled; bind only to loopback")
     app.state.anchors.open()
     app.state.jobs.start()
     try:
@@ -1070,6 +1073,10 @@ def create_app(
         version=VERSION,
         lifespan=_lifespan,
     )
+    if settings.allow_unauthenticated:
+        app.add_middleware(
+            TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]"]
+        )
     app.state.settings = settings
     app.state.runner = runner or SdkAgentRunner()
     app.state.semaphore = asyncio.Semaphore(settings.max_concurrency)
