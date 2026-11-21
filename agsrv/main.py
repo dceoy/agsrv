@@ -12,7 +12,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import Response
 from pydantic import Field
 
-from agsrv import claude, codex
+from agsrv import claude, codex, muse
 from agsrv.claude import (
     AgentExecutionError,
     AgentRunner,
@@ -27,6 +27,8 @@ from agsrv.schemas import (
     CodexQueryRequest,
     CodexQueryResponse,
     InfoResponse,
+    MuseQueryRequest,
+    MuseQueryResponse,
     QueryRequest,
     QueryResponse,
 )
@@ -49,6 +51,7 @@ logger = logging.getLogger(__name__)
 VERSION = "0.4.0"
 DISCONNECT_POLL_INTERVAL = 0.1
 PROBE_TIMEOUT = 10.0
+MUSE_PROBE_TIMEOUT = 10.0
 
 # Keep detached Codex cleanup alive if the request task is cancelled.
 _pump_tasks: set[asyncio.Task[Any]] = set()
@@ -368,6 +371,206 @@ async def _codex_query_with_disconnect(
             await watcher
 
 
+@asynccontextmanager
+async def _muse_slot(app: FastAPI) -> AsyncGenerator[_SlotLease, None]:
+    """Acquire Muse capacity.
+
+    Yields:
+        After acquiring the slot.
+
+    Raises:
+        HTTPException: If capacity is exhausted.
+    """
+    semaphore: asyncio.Semaphore = app.state.muse_semaphore
+    if semaphore.locked():
+        if not app.state.settings.muse_enabled or (
+            time.monotonic() < app.state.muse_probe_expires
+            and not app.state.muse_healthy
+        ):
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "Muse is disabled or unavailable"
+            )
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS, "agent concurrency limit reached"
+        )
+    await semaphore.acquire()
+    lease = _SlotLease(semaphore)
+    try:
+        yield lease
+    finally:
+        if not lease.claimed:
+            lease.release()
+
+
+async def _muse_available(app: FastAPI, *, lease: _SlotLease | None = None) -> bool:
+    settings: Settings = app.state.settings
+    if not settings.muse_enabled:
+        return False
+    if time.monotonic() < app.state.muse_probe_expires:
+        return cast("bool", app.state.muse_healthy)
+    async with app.state.muse_probe_lock:
+        now = time.monotonic()
+        if now >= app.state.muse_probe_expires:
+            if lease is None:
+                async with _muse_slot(app) as acquired:
+                    app.state.muse_healthy = await _timed_muse_probe(app, acquired)
+            else:
+                app.state.muse_healthy = await _timed_muse_probe(app, lease)
+            app.state.muse_probe_expires = time.monotonic() + 30
+    return cast("bool", app.state.muse_healthy)
+
+
+async def _timed_muse_probe(app: FastAPI, lease: _SlotLease) -> bool:
+    """Release the caller at the deadline while cleanup retains capacity.
+
+    Returns:
+        The probe result, or false on timeout.
+
+    Raises:
+        asyncio.CancelledError: If the caller is cancelled.
+    """
+    task = asyncio.create_task(muse.probe(app.state.settings.muse_bin))
+    try:
+        done, _ = await asyncio.wait({task}, timeout=MUSE_PROBE_TIMEOUT)
+    except asyncio.CancelledError:
+        _detach_muse(task, lease)
+        app.state.muse_healthy = False
+        expires = time.monotonic() + 30
+        app.state.muse_probe_expires = expires
+
+        def invalidate(_operation: asyncio.Task[bool]) -> None:  # pragma: no cover
+            if app.state.muse_probe_expires == expires:
+                app.state.muse_probe_expires = 0
+
+        task.add_done_callback(invalidate)
+        raise
+    if done:
+        return task.result()
+    _detach_muse(task, lease)
+    return False
+
+
+def _detach_muse(task: asyncio.Task[Any], lease: _SlotLease) -> None:
+    """Transfer capacity to a cancelled operation until its cleanup finishes."""
+    lease.claimed = True
+    _pump_tasks.add(task)
+
+    def finished(operation: asyncio.Task[Any]) -> None:
+        _pump_tasks.discard(operation)
+        lease.release()
+        with suppress(asyncio.CancelledError):
+            operation.exception()
+
+    task.add_done_callback(finished)
+    task.cancel()
+
+
+async def _await_muse(operation: Coroutine[Any, Any, T], lease: _SlotLease) -> T:
+    """Run an operation while allowing its cleanup to outlive the caller.
+
+    Returns:
+        The operation result.
+
+    Raises:
+        asyncio.CancelledError: If the caller is cancelled.
+    """
+    task = asyncio.create_task(operation)
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        _detach_muse(task, lease)
+        raise
+
+
+async def _muse_query(body: MuseQueryRequest, request: Request) -> dict[str, Any]:
+    settings: Settings = request.app.state.settings
+    cwd = resolve_cwd(settings, body.cwd)
+    timeout = body.timeout_seconds or settings.max_timeout_seconds
+    if timeout > settings.max_timeout_seconds:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"timeout_seconds exceeds server maximum {settings.max_timeout_seconds}",
+        )
+    if not settings.muse_enabled or (
+        time.monotonic() < request.app.state.muse_probe_expires
+        and not request.app.state.muse_healthy
+    ):
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "Muse is disabled or unavailable"
+        )
+
+    async def execute() -> dict[str, Any]:
+        async with (
+            request.app.state.jobs.workspace(cwd),
+            _muse_slot(request.app) as lease,
+        ):
+            if not await _muse_available(request.app, lease=lease):
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Muse is disabled or unavailable",
+                )
+            return await muse.run_muse(
+                prompt=body.prompt,
+                cwd=str(cwd),
+                model=body.model or settings.muse_model,
+                effort=body.effort,
+                binary=settings.muse_bin,
+            )
+
+    task = asyncio.create_task(execute())
+    try:
+        async with asyncio.timeout(timeout):
+            return await asyncio.shield(task)
+    except (TimeoutError, asyncio.CancelledError) as exc:
+        task.cancel()
+        _pump_tasks.add(task)
+
+        def finished(operation: asyncio.Task[Any]) -> None:
+            _pump_tasks.discard(operation)
+            with suppress(asyncio.CancelledError, Exception):
+                operation.result()
+
+        task.add_done_callback(finished)
+        if isinstance(exc, TimeoutError):
+            raise HTTPException(
+                status.HTTP_504_GATEWAY_TIMEOUT, "agent run timed out"
+            ) from exc
+        raise
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Muse execution failed")
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, "agent execution failed"
+        ) from exc
+
+
+async def _muse_query_with_disconnect(
+    body: MuseQueryRequest, request: Request
+) -> dict[str, Any] | Response:
+    task = cast("asyncio.Task[object]", asyncio.current_task())
+    client_gone = False
+
+    async def watch_disconnect() -> None:
+        nonlocal client_gone
+        while not await request.is_disconnected():  # ruff: ignore[async-busy-wait]
+            await asyncio.sleep(DISCONNECT_POLL_INTERVAL)
+        client_gone = True
+        task.cancel()
+
+    watcher = asyncio.create_task(watch_disconnect())
+    try:
+        return await _muse_query(body, request)
+    except asyncio.CancelledError:  # pragma: no cover
+        if client_gone and task.uncancel() == 0:  # pragma: no cover
+            return Response(status_code=499)  # pragma: no cover
+        raise
+    finally:
+        watcher.cancel()
+        with suppress(asyncio.CancelledError):
+            await watcher
+
+
 def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[complex-structure,too-many-statements]
     """Register the health and info routes."""
 
@@ -417,6 +620,17 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
                 "enabled": settings.codex_enabled,
                 "healthy": await _codex_available(app),
                 "default_model": None,
+                "supports": {
+                    "sandbox": True,
+                    "network_access": True,
+                    "rate_limits": True,
+                    "streaming": False,
+                },
+            },
+            "muse": {
+                "enabled": settings.muse_enabled,
+                "healthy": await _muse_available(app),
+                "default_model": settings.muse_model,
                 "supports": {
                     "sandbox": True,
                     "network_access": True,
@@ -520,7 +734,46 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
                 status.HTTP_502_BAD_GATEWAY, "Codex rate limits failed"
             ) from exc
 
-    _ = (health, info, agents, claude_rate_limits, rate_limits)
+    @app.get(
+        "/v1/agents/muse/rate-limits",
+        dependencies=[Auth],
+        response_model=dict[str, Any],
+    )
+    async def muse_rate_limits(request: Request) -> dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not settings.muse_enabled or (
+            time.monotonic() < app.state.muse_probe_expires
+            and not app.state.muse_healthy
+        ):
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "Muse is disabled or unavailable"
+            )
+        try:
+            async with asyncio.timeout(settings.max_timeout_seconds):
+                async with _muse_slot(app) as lease:
+                    if not await _muse_available(app, lease=lease):
+                        raise HTTPException(  # ruff: ignore[raise-within-try]
+                            status.HTTP_503_SERVICE_UNAVAILABLE,
+                            "Muse is disabled or unavailable",
+                        )
+                    raw = await _await_muse(muse.read_usage(settings.muse_bin), lease)
+                    return {**muse.parse_usage(raw), "backend": raw}
+        except TimeoutError as exc:
+            raise HTTPException(
+                status.HTTP_504_GATEWAY_TIMEOUT, "Muse rate limits timed out"
+            ) from exc
+        except HTTPException:
+            raise
+        except muse.MuseUnavailableError as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "Muse is disabled or unavailable"
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY, "Muse rate limits failed"
+            ) from exc
+
+    _ = (health, info, agents, claude_rate_limits, rate_limits, muse_rate_limits)
 
 
 def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure]
@@ -530,11 +783,15 @@ def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure]
         "/v1/query",
         dependencies=[Auth],
         response_model=Annotated[
-            QueryResponse | CodexQueryResponse, Field(discriminator="agent")
+            QueryResponse | CodexQueryResponse | MuseQueryResponse,
+            Field(discriminator="agent"),
         ],
     )
     async def run_query(  # pyright: ignore[reportUnusedFunction]  # ruff: ignore[complex-structure]
-        body: Annotated[QueryRequest | CodexQueryRequest, Field(discriminator="agent")],
+        body: Annotated[
+            QueryRequest | CodexQueryRequest | MuseQueryRequest,
+            Field(discriminator="agent"),
+        ],
         request: Request,
     ) -> QueryResponse | Response | dict[str, Any]:
         """Run one ephemeral agent query and return its result.
@@ -552,6 +809,8 @@ def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure]
         """
         if isinstance(body, CodexQueryRequest):
             return await _codex_query_with_disconnect(body, request)
+        if isinstance(body, MuseQueryRequest):
+            return await _muse_query_with_disconnect(body, request)
         options, timeout, semaphore = await _prepare(
             request, body, check_claude_cache=True
         )
@@ -622,6 +881,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None]:
     try:
         yield
     finally:
+        await muse.shutdown()
         await app.state.jobs.stop()
 
 
@@ -630,7 +890,10 @@ def _add_job_routes(app: FastAPI) -> None:
 
     @app.post("/v1/jobs", dependencies=[Auth], status_code=status.HTTP_202_ACCEPTED)
     async def submit_job(  # pyright: ignore[reportUnusedFunction]
-        body: Annotated[QueryRequest | CodexQueryRequest, Field(discriminator="agent")],
+        body: Annotated[
+            QueryRequest | CodexQueryRequest | MuseQueryRequest,
+            Field(discriminator="agent"),
+        ],
         request: Request,
         idempotency_key: Annotated[str | None, Header()] = None,
         authorization: Annotated[str | None, Header()] = None,
@@ -690,6 +953,10 @@ def create_app(
     app.state.codex_probe_lock = asyncio.Lock()
     app.state.codex_probe_expires = 0.0
     app.state.codex_healthy = False
+    app.state.muse_semaphore = asyncio.Semaphore(settings.muse_max_concurrency)
+    app.state.muse_probe_lock = asyncio.Lock()
+    app.state.muse_probe_expires = 0.0
+    app.state.muse_healthy = False
     app.state.jobs = JobManager(app)
     _add_meta_routes(app, settings)
     _add_query_routes(app)
