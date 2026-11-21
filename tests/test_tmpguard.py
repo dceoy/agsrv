@@ -159,13 +159,13 @@ def wrap(monkeypatch: pytest.MonkeyPatch, module: Any, name: str, hook: Any) -> 
     monkeypatch.setattr(module, name, replacement)
 
 
-def staged_chmod_hook(action: Callable[[], None]) -> Callable[..., None]:
-    """Build an ``os.chmod`` wrapper running ``action`` before the private chmod."""
+def staged_open_hook(action: Callable[[], None]) -> Callable[..., Any]:
+    """Build an ``os.open`` wrapper running ``action`` before the staged open."""
 
-    def hook(real: Any, path: Any, *args: Any, **kwargs: Any) -> None:  # ruff: ignore[any-type]
+    def hook(real: Any, path: Any, *args: Any, **kwargs: Any) -> Any:  # ruff: ignore[any-type]
         if kwargs.get("dir_fd") is not None and str(path).startswith(stg(0)[:-32]):
             action()
-        real(path, *args, **kwargs)
+        return real(path, *args, **kwargs)
 
     return hook
 
@@ -217,9 +217,9 @@ async def test_error_in_turn_still_cleans(env: Env) -> None:
 
 
 @pytest.mark.asyncio
-async def test_restrictive_umask(env: Env) -> None:
-    """Mode 000 from the umask is repaired while the directory is private."""
-    old = os.umask(0o777)
+async def test_umask_does_not_weaken_the_mode(env: Env) -> None:
+    """A permissive umask still ends with mode 0700, applied on the descriptor."""
+    old = os.umask(0o000)
     try:
         modes: list[int] = []
         await run_turn(
@@ -229,6 +229,16 @@ async def test_restrictive_umask(env: Env) -> None:
         os.umask(old)
     assert modes == [0o700]
     assert env.listing(env.stage) == []
+
+
+@pytest.mark.asyncio
+async def test_umask_clearing_owner_bits_fails_closed(env: Env) -> None:
+    """Mode 000 cannot be repaired without a name-based chmod: the turn fails."""
+    old = os.umask(0o777)
+    try:
+        await expect_setup_failure(env, retained=1)
+    finally:
+        os.umask(old)
 
 
 @pytest.mark.asyncio
@@ -250,7 +260,7 @@ async def test_child_removing_its_own_directory(
 async def test_setup_substitution_is_not_replaced(
     env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
 ) -> None:
-    """A writer taking the public name between mkdir and chmod is never replaced."""
+    """A writer taking the public name between mkdir and open is never replaced."""
     outside = tmp_path / "outside"
     outside.mkdir(mode=0o750)
     outside.chmod(0o750)
@@ -266,7 +276,7 @@ async def test_setup_substitution_is_not_replaced(
             public.symlink_to(outside)
         info.append(public.lstat())
 
-    wrap(monkeypatch, os, "chmod", staged_chmod_hook(place))
+    wrap(monkeypatch, os, "open", staged_open_hook(place))
     base = fds()
     with pytest.raises(HTTPException) as error:
         await run_turn(env, env.root)
@@ -277,28 +287,6 @@ async def test_setup_substitution_is_not_replaced(
     assert (outside / "marker").read_text() == "m"
     assert stat.S_IMODE(outside.stat().st_mode) == 0o750
     assert fds() == base
-
-
-@pytest.mark.asyncio
-@pytest.mark.usefixtures("names")
-async def test_umask_with_foreign_name_still_fails_closed(
-    env: Env, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Restrictive umask plus a squatter on the public name: no overwrite."""
-    public = env.root / pub(2)
-
-    def place() -> None:
-        public.mkdir()
-
-    wrap(monkeypatch, os, "chmod", staged_chmod_hook(place))
-    old = os.umask(0o777)
-    try:
-        with pytest.raises(HTTPException):
-            await run_turn(env, env.root)
-    finally:
-        os.umask(old)
-    assert public.is_dir()
-    assert env.listing(env.stage) == []
 
 
 # --- substitution while the turn runs --------------------------------------------
@@ -610,7 +598,9 @@ def test_rename_noreplace_errors(env: Env) -> None:
 # --- failure injection ---------------------------------------------------------
 
 
-async def expect_setup_failure(env: Env, *, cwd: Path | None = None) -> None:
+async def expect_setup_failure(
+    env: Env, *, cwd: Path | None = None, retained: int = 0
+) -> None:
     """Run a turn that must fail setup and verify nothing was left anywhere."""
     base = fds()
     launched: list[bool] = []
@@ -618,14 +608,23 @@ async def expect_setup_failure(env: Env, *, cwd: Path | None = None) -> None:
         await run_turn(env, cwd or env.root, lambda _d: launched.append(True))
     assert error.value.status_code == 503
     assert not launched
-    assert env.listing(env.stage) == []
+    assert len(env.listing(env.stage)) == retained
     assert [n for n in env.listing(cwd or env.root) if n.startswith(".agsrv")] == []
     assert fds() == base
     assert env.anchors._live == 0  # pyright: ignore[reportPrivateUsage]
 
 
+def raise_for_fchmod(error: BaseException) -> Callable[..., Any]:
+    """Build an ``os.fchmod`` hook that always fails."""
+
+    def hook(_real: Callable[..., Any], *_a: Any, **_k: Any) -> Any:  # ruff: ignore[any-type]
+        raise error
+
+    return hook
+
+
 def raise_for_staged(error: BaseException) -> Callable[..., Any]:
-    """Build an ``os.chmod``/``os.open`` hook failing only on staged names."""
+    """Build an ``os.open``/``os.rmdir`` hook failing only on staged names."""
 
     def hook(real: Callable[..., Any], path: Any, *args: Any, **kwargs: Any) -> Any:  # ruff: ignore[any-type]
         if kwargs.get("dir_fd") is not None and str(path).startswith(".agsrv-stg-"):
@@ -636,13 +635,22 @@ def raise_for_staged(error: BaseException) -> Callable[..., Any]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("target", ["chmod", "open"])
-async def test_failure_after_private_mkdir_rolls_back(
-    env: Env, monkeypatch: pytest.MonkeyPatch, target: str
+async def test_fchmod_failure_rolls_back_verified_directory(
+    env: Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """chmod/open failure removes the private directory by its staged name."""
-    wrap(monkeypatch, os, target, raise_for_staged(OSError(errno.EMFILE, "boom")))
+    """A failure after the open removes the entry: identity matches the held fd."""
+    wrap(monkeypatch, os, "fchmod", raise_for_fchmod(OSError(errno.EPERM, "boom")))
     await expect_setup_failure(env)
+
+
+@pytest.mark.asyncio
+async def test_open_failure_leaves_unverifiable_entry(
+    env: Env, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Without a descriptor ownership is unproven: nothing is deleted, only logged."""
+    wrap(monkeypatch, os, "open", raise_for_staged(OSError(errno.EMFILE, "boom")))
+    await expect_setup_failure(env, retained=1)
+    assert "could not be verified" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -650,7 +658,7 @@ async def test_non_oserror_during_setup_propagates_after_rollback(
     env: Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Any other exception still triggers rollback and keeps its type."""
-    wrap(monkeypatch, os, "chmod", raise_for_staged(RuntimeError("bug")))
+    wrap(monkeypatch, os, "fchmod", raise_for_fchmod(RuntimeError("bug")))
     with pytest.raises(RuntimeError, match="bug"):
         await run_turn(env, env.root)
     assert env.listing(env.stage) == []
@@ -663,10 +671,10 @@ async def test_wrong_mode_after_chmod_rolls_back(
 ) -> None:
     """The exact-mode verification fails closed."""
 
-    def hook(real: Callable[..., None], path: Any, mode: int, **kwargs: Any) -> None:  # ruff: ignore[any-type]
-        real(path, 0o755 if kwargs.get("dir_fd") is not None else mode, **kwargs)
+    def hook(real: Callable[..., None], fd: int, _mode: int) -> None:
+        real(fd, 0o755)
 
-    wrap(monkeypatch, os, "chmod", hook)
+    wrap(monkeypatch, os, "fchmod", hook)
     await expect_setup_failure(env)
 
 
@@ -675,13 +683,95 @@ async def test_rollback_failure_is_logged(
     env: Env, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """If even the rollback rmdir fails the staged name is reported."""
-    wrap(monkeypatch, os, "chmod", raise_for_staged(OSError(errno.EIO, "io")))
+    wrap(monkeypatch, os, "fchmod", raise_for_fchmod(OSError(errno.EIO, "io")))
     wrap(monkeypatch, os, "rmdir", raise_for_staged(OSError(errno.EBUSY, "busy")))
     with pytest.raises(HTTPException):
         await run_turn(env, env.root)
     monkeypatch.undo()
     assert "Failed to roll back private staged directory" in caplog.text
     assert env.listing(env.stage)  # retained, not deleted blindly
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("names")
+@pytest.mark.parametrize("kind", ["populated", "symlink"])
+async def test_swap_between_mkdir_and_open_is_neither_published_nor_touched(
+    env: Env,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    kind: str,
+) -> None:
+    """A writer replacing the staged entry before the open gains nothing."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    outside.chmod(0o750)
+    (outside / "marker").write_text("m")
+    foreign = env.stage / stg(1)
+    chmods: list[str] = []
+
+    def swap() -> None:
+        foreign.rmdir()
+        if kind == "populated":
+            foreign.mkdir(mode=0o755)
+            foreign.chmod(0o755)
+            (foreign / "foreign.txt").write_text("f")
+        else:
+            foreign.symlink_to(outside)
+        chmods.clear()  # only count what the service does after the swap
+
+    def no_chmod(path: object, *_a: object, **_k: object) -> None:
+        chmods.append(str(path))
+
+    monkeypatch.setattr(os, "chmod", no_chmod)
+    wrap(monkeypatch, os, "open", staged_open_hook(swap))
+    real_fchmod = os.fchmod
+    fchmods: list[int] = []
+
+    def spy(fd: int, mode: int) -> None:
+        fchmods.append(fd)
+        real_fchmod(fd, mode)
+
+    monkeypatch.setattr(os, "fchmod", spy)
+    base = fds()
+    with pytest.raises(HTTPException) as error:
+        await run_turn(env, env.root)
+    assert error.value.status_code == 503
+    assert not chmods  # no name-based chmod, so none can hit an external target
+    assert not fchmods  # never applied to the foreign object either
+    assert [n for n in env.listing(env.root) if n.startswith(".agsrv")] == []
+    assert env.listing(env.stage) == [stg(1)]  # left, not deleted
+    if kind == "populated":
+        assert (foreign / "foreign.txt").read_text() == "f"
+        assert stat.S_IMODE(foreign.stat().st_mode) == 0o755
+    else:
+        assert foreign.is_symlink()
+    assert stat.S_IMODE(outside.stat().st_mode) == 0o750
+    assert (outside / "marker").read_text() == "m"
+    assert fds() == base
+    assert env.anchors._live == 0  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("names")
+async def test_swap_after_open_is_not_rolled_back(
+    env: Env, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """If publication fails after the entry was replaced, rollback keeps it."""
+    foreign = env.stage / stg(1)
+
+    def fail(*_a: object) -> None:
+        foreign.rename(env.stage / "aside")
+        foreign.mkdir()
+        (foreign / "foreign.txt").write_text("f")
+        raise OSError(errno.EIO, "io")
+
+    monkeypatch.setattr(tmpguard, "_rename_noreplace", fail)
+    with pytest.raises(HTTPException) as error:
+        await run_turn(env, env.root)
+    assert error.value.status_code == 503
+    assert (foreign / "foreign.txt").read_text() == "f"
+    assert env.listing(env.stage / "aside") == []
+    assert "was replaced" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -785,7 +875,7 @@ async def test_staging_on_another_filesystem_is_refused(
         return os.stat_result(values)
 
     monkeypatch.setattr(os, "fstat", fake)
-    with pytest.raises(HTTPException, match="different filesystem"):
+    with pytest.raises(HTTPException, match="different device"):
         async with turn_tmpdir(env.settings, env.anchors, adm):
             pytest.fail("must not launch")  # pragma: no cover
     monkeypatch.undo()

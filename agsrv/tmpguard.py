@@ -472,19 +472,39 @@ class _Turn:
     stage_fd: int
     cwd_fd: int
     child_fd: int
+    ident: tuple[int, int]
     public: str
     path: Path
     where: str
 
 
+def _still_held(stage_fd: int, name: str, child_fd: int) -> bool:
+    """Return whether ``name`` in staging is the directory held as ``child_fd``."""
+    current = os.stat(name, dir_fd=stage_fd, follow_symlinks=False)
+    return stat.S_ISDIR(current.st_mode) and os.path.samestat(
+        current, os.fstat(child_fd)
+    )
+
+
 def _private_rollback(stage_fd: int, name: str, child_fd: int) -> None:
-    """Remove a still-private directory by its staged name."""
-    if child_fd >= 0:
-        os.close(child_fd)
+    """Remove a staged directory only if it is still the one we hold.
+
+    ``child_fd`` is the verified descriptor (or ``-1`` if none was obtained, in
+    which case ownership of the name is unproven). It is closed here. A foreign
+    or unverifiable entry is never deleted; it is left in staging and logged.
+    """
+    if child_fd < 0:
+        logger.error("Staged entry %s could not be verified; leaving it", name)
+        return
     try:
-        os.rmdir(name, dir_fd=stage_fd)
+        if _still_held(stage_fd, name, child_fd):
+            os.rmdir(name, dir_fd=stage_fd)
+        else:
+            logger.error("Staged entry %s was replaced; leaving it untouched", name)
     except OSError:
         logger.exception("Failed to roll back private staged directory %s", name)
+    finally:
+        os.close(child_fd)
 
 
 def _mkdir_private(stage_fd: int) -> str:
@@ -510,24 +530,52 @@ def _mkdir_private(stage_fd: int) -> str:
     raise TmpdirError(msg)
 
 
+def _is_empty(dir_fd: int) -> bool:
+    """Return whether the held directory has no entries."""
+    with os.scandir(dir_fd) as entries:
+        return next(entries, None) is None
+
+
 def _open_private(stage_fd: int, name: str) -> int:
-    """Fix the mode, open and verify a staged directory.
+    """Open a staged entry without following symlinks; it must be an empty dir.
 
     Returns:
-        The verified directory descriptor.
+        The descriptor. From here on the directory is identified by it, not by
+        its name.
 
     Raises:
-        TmpdirError: If the opened object is not a ``0700`` directory.
+        TmpdirError: If the entry is not an empty directory (it is left alone).
     """
-    # A restrictive umask can leave mode 000; fix it while still private.
-    os.chmod(name, _PRIVATE_MODE, dir_fd=stage_fd)
-    child_fd = os.open(name, _DIR_FLAGS, dir_fd=stage_fd)
+    try:
+        child_fd = os.open(name, _DIR_FLAGS, dir_fd=stage_fd)  # symlink: ELOOP
+    except PermissionError as exc:
+        # An umask clearing the owner bits makes the new directory unopenable,
+        # and there is deliberately no name-based chmod to repair it.
+        msg = f"staged entry {name} is not accessible (umask too restrictive?)"
+        raise TmpdirError(msg) from exc
+    if stat.S_ISDIR(os.fstat(child_fd).st_mode) and _is_empty(child_fd):
+        return child_fd
+    os.close(child_fd)
+    msg = f"staged entry {name} is not an empty directory"
+    raise TmpdirError(msg)
+
+
+def _seal_private(child_fd: int, name: str) -> tuple[int, int]:
+    """Make the held directory ``0700`` through its descriptor.
+
+    Returns:
+        The ``(st_dev, st_ino)`` identity of the held directory.
+
+    Raises:
+        TmpdirError: If the mode is not ``0700`` afterwards.
+    """
+    # Apply the exact mode on the descriptor (the umask may have narrowed it).
+    os.fchmod(child_fd, _PRIVATE_MODE)
     info = os.fstat(child_fd)
-    if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != _PRIVATE_MODE:
-        os.close(child_fd)
-        msg = f"staged directory {name} has unexpected type or mode"
+    if stat.S_IMODE(info.st_mode) != _PRIVATE_MODE:
+        msg = f"staged directory {name} has unexpected mode"
         raise TmpdirError(msg)
-    return child_fd
+    return info.st_dev, info.st_ino
 
 
 def _setup(adm: Admitted) -> _Turn:
@@ -541,10 +589,11 @@ def _setup(adm: Admitted) -> _Turn:
     """
     stage_fd = adm.stage_fd
     if os.fstat(adm.fd).st_dev != os.fstat(stage_fd).st_dev:
-        msg = f"staging is on a different filesystem than {adm.path}"
+        msg = f"staging is on a different device than {adm.path}"
         raise TmpdirError(msg)
     name = _mkdir_private(stage_fd)
     child_fd = -1
+    ident = (-1, -1)
     owned: list[int] = []
     public = f"{_PUBLIC}{secrets.token_hex(16)}"
     try:
@@ -552,6 +601,7 @@ def _setup(adm: Admitted) -> _Turn:
         owned.append(os.dup(stage_fd))  # ruff: ignore[repeated-append]
         owned.append(os.dup(adm.fd))
         child_fd = _open_private(stage_fd, name)
+        ident = _seal_private(child_fd, name)
         _rename_noreplace(stage_fd, name, adm.fd, public)
     except BaseException as exc:
         _private_rollback(stage_fd, name, child_fd)
@@ -562,7 +612,7 @@ def _setup(adm: Admitted) -> _Turn:
             raise TmpdirError(msg) from exc
         raise
     path = adm.path / public
-    return _Turn(owned[0], owned[1], child_fd, public, path, str(path))
+    return _Turn(owned[0], owned[1], child_fd, ident, public, path, str(path))
 
 
 def _capture(turn: _Turn) -> str | None:
@@ -618,9 +668,10 @@ def _reclaim_verified(turn: _Turn) -> None:
     turn.where = f"staging entry {recovery}"
     try:
         captured = os.stat(recovery, dir_fd=turn.stage_fd, follow_symlinks=False)
-        ours = stat.S_ISDIR(captured.st_mode) and os.path.samestat(
-            captured, os.fstat(turn.child_fd)
-        )
+        ours = stat.S_ISDIR(captured.st_mode) and (
+            captured.st_dev,
+            captured.st_ino,
+        ) == (turn.ident)
     except OSError:
         logger.exception(
             "Could not inspect %s; retaining the unverified entry as %s",
