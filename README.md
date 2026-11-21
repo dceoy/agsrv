@@ -151,13 +151,15 @@ unsupported flags or a missing `renameat2` fail closed. Example:
 `AGSRV_WORKSPACE_ROOT=/srv/ws`
 `AGSRV_TMP_STAGING_DIRS=/srv/ws=/var/lib/agsrv/stage`.
 
-The `mount_root` key must be the workspace root itself or one of its
-ancestors, and a directory the service can write to on the same mount as the
-staging directory; it need not be the mount point itself. Keying on the
-filesystem root `/` fails when the service cannot create its probe entries
-there (for example `Permission denied` on `.agsrv-probe-…`). The example pair
-above is the working shape: the workspace root as key, the staging directory
-as value.
+The workspace root must be contained in at least one `mount_root` key; keys
+below the workspace root are also valid and cover the working directories
+under them (the most specific containing key wins). Each key must be a
+directory the service can write to on the same mount as its staging
+directory; it need not be the mount point itself. Keying on the filesystem
+root `/` fails when the service cannot create its probe entries there (for
+example `Permission denied` on `.agsrv-probe-…`). The example pair above is
+the working shape: the workspace root as key, the staging directory as
+value.
 
 Other writers may share the working directory and can list it, rename or remove
 entries, substitute real directories or symlinks, and change ancestors. Random
@@ -243,8 +245,7 @@ The default sandbox domains are `github.com`, `api.github.com`,
 `objects.githubusercontent.com`, `release-assets.githubusercontent.com`,
 `pypi.org`, `files.pythonhosted.org`, and `registry.npmjs.org`.
 
-(including an empty string, `OFF`, `Opt-In`, padded values, or `required`)
-aborts startup. Domain entries are trimmed and lowercased, and empty
+Domain entries are trimmed and lowercased, and empty
 comma-separated entries are dropped (`a.com,,b.com` is two entries; a set but
 empty or blank list means no egress). Each entry must be an ASCII hostname with
 at least two DNS labels, each 1-63 characters (letters, digits, inner hyphens),
@@ -278,8 +279,9 @@ the selected agent is disabled or unavailable. The Claude probe runs the local
 probe checks that a `muse serve` host starts with ephemeral durability and
 sandboxing available. The endpoint never returns 429 because of the Claude
 probe — while the Claude slot is busy it serves the last cached value; the
-Codex entry can still produce 429 (Codex enabled, its slot busy), and so can
-the Muse entry (Muse enabled, its slot busy, its cached probe expired).
+Codex entry can still produce 429 (Codex enabled, its slot busy, its cached
+probe expired), and so can the Muse entry (Muse enabled, its slot busy, its
+cached probe expired).
 
 Each agent also has a rate-limits route (see the endpoints table): Claude's
 returns the local `/usage` result, Codex's the typed

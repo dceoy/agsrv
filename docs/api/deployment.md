@@ -15,9 +15,9 @@ AGSRV_TMP_STAGING_DIRS="$PWD=$HOME/.agsrv-stage" \
   uv run uvicorn agsrv.main:app --host 127.0.0.1 --port 8000
 ```
 
-The key (here `$PWD`) is the workspace root or one of its ancestors; if you
-set `AGSRV_WORKSPACE_ROOT` to something else, use that value as the key
-instead.
+The key (here `$PWD`) must contain the workspace root; if you set
+`AGSRV_WORKSPACE_ROOT` to something else, use that value (or an ancestor of
+it) as the key instead.
 
 ## Remote server
 

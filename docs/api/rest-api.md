@@ -202,7 +202,7 @@ request/response.
 
 Returns `claude`, `codex` and `muse` objects with `enabled`, `healthy`, `default_model`,
 and `supports` flags for `sandbox`, `network_access`, `rate_limits`, and
-`streaming`. Claude and Codex health probes are cached for approximately 30 seconds. Muse initialization follows the same cached (~30s) durability probe pattern. Claude uses the local `/usage` command, without consuming tokens or allowance.
+`streaming`. Claude and Codex health probes are cached for approximately 30 seconds. Muse initialization follows the same cached (~30s) probe pattern, checking ephemeral durability and sandbox availability. Claude uses the local `/usage` command, without consuming tokens or allowance.
 
 Claude is `healthy` when the CLI is spawnable, the ephemeral `/usage` run does not
 return an error result, and the bundled CLI's `auth status` reports
@@ -212,9 +212,9 @@ still valid server-side (an expired or revoked token can pass until a real turn
 runs). While the Claude concurrency slot is busy, this endpoint returns the last
 cached health value (even if expired) and never responds 429 because of the
 Claude probe. The Codex entry is unaffected: with Codex enabled and its
-concurrency slot busy, this endpoint can still respond 429. The same applies
-to the Muse entry when Muse is enabled, its slot is busy, and its cached
-probe has expired.
+concurrency slot busy and its cached probe has expired, this endpoint can
+still respond 429. The same applies to the Muse entry when Muse is enabled,
+its slot is busy, and its cached probe has expired.
 
 ## `GET /v1/agents/claude/rate-limits`
 
@@ -309,7 +309,7 @@ The old SSE stream endpoint is deliberately removed.
 | 422    | Invalid body (empty prompt, unknown/stateful fields, bad ranges)       |
 | 429    | Concurrency or pending-job capacity reached (jobs include Retry-After) |
 | 502    | SDK/CLI failure, or the run ended without a result message             |
-| 503    | `AGSRV_API_KEY` not configured and unauthenticated access not allowed; sandbox prerequisites unavailable; Claude, Codex or Muse disabled/unavailable; or the turn could not be prepared — the disk-space preflight found free space on `/tmp`, the workspace root or the working directory below its threshold, or no staging directory is configured for the working directory's mount |
+| 503    | `AGSRV_API_KEY` not configured and unauthenticated access not allowed; sandbox prerequisites unavailable; Claude, Codex or Muse disabled/unavailable; or the turn could not be prepared — the disk-space preflight found free space on `/tmp`, the workspace root or the working directory below its threshold; no staging directory is configured for the working directory's mount; the working directory failed acceptance revalidation (a missing component, a symlink, or a substituted directory); or the per-turn directory could not be created (for example an owner-clearing `umask`, or `EXDEV`) |
 | 504    | Run exceeded its timeout                                               |
 
 Errors use FastAPI's `{"detail": "..."}` body.
