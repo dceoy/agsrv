@@ -12,7 +12,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
-from agsrv.agent import build_options
+from agsrv.claude import build_options
 from agsrv.config import Settings
 from agsrv.main import create_app
 from agsrv.schemas import QueryRequest
@@ -48,9 +48,9 @@ def test_options_tmpdir(
 ) -> None:
     """Both Claude configurations carry the turn directory."""
     monkeypatch.setattr(
-        "agsrv.agent.prepare_sandbox_cache", MagicMock(return_value=tmp_path)
+        "agsrv.claude.prepare_sandbox_cache", MagicMock(return_value=tmp_path)
     )
-    monkeypatch.setattr("agsrv.agent.bundled_cli_path", lambda: tmp_path)
+    monkeypatch.setattr("agsrv.claude.bundled_cli_path", lambda: tmp_path)
     request = QueryRequest(agent="claude", prompt="test", sandbox=sandbox)
     options = build_options(
         request,
@@ -389,7 +389,7 @@ async def test_codex_detached_cleanup(
         return {}
 
     monkeypatch.setattr(main, "_codex_available", AsyncMock(return_value=True))
-    monkeypatch.setattr(main.codex_agent, "run_codex", run)
+    monkeypatch.setattr(main.codex, "run_codex", run)
     monkeypatch.setattr(main, "DISCONNECT_POLL_INTERVAL", 0.01)
     request = Request({"type": "http", "app": app}, receive)
     body = CodexQueryRequest(

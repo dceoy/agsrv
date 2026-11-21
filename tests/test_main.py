@@ -29,7 +29,7 @@ from fastapi import HTTPException, Request
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 
-from agsrv.agent import (
+from agsrv.claude import (
     AgentExecutionError,
     AgentRunner,
     SdkAgentRunner,
@@ -861,7 +861,7 @@ def test_sdk_runner_delegates(monkeypatch: pytest.MonkeyPatch) -> None:
         calls.append((prompt, options))
         return "stream"
 
-    monkeypatch.setattr("agsrv.agent.query", fake_query)
+    monkeypatch.setattr("agsrv.claude.query", fake_query)
     options = ClaudeAgentOptions()
     assert SdkAgentRunner().stream("p", options) == "stream"  # pyright: ignore[reportUnnecessaryComparison]
     assert calls == [("p", options)]

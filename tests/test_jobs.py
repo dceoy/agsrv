@@ -262,7 +262,7 @@ def test_codex_jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         await asyncio.sleep(0)
         return {"agent": "codex", "result": "done", "is_error": False}
 
-    monkeypatch.setattr("agsrv.jobs.codex_agent.run_codex", fake_codex)
+    monkeypatch.setattr("agsrv.jobs.codex.run_codex", fake_codex)
     with TestClient(create_app(_settings(tmp_path))) as client:
         response = client.post(
             "/v1/jobs", headers=AUTH, json={"agent": "codex", "prompt": "x"}
@@ -494,7 +494,7 @@ def test_sync_codex_query_shares_job_workspace_lock(
 
     runner = CheckedRunner()
     monkeypatch.setattr("agsrv.main._codex_available", fake_available)
-    monkeypatch.setattr("agsrv.main.codex_agent.run_codex", fake_codex)
+    monkeypatch.setattr("agsrv.main.codex.run_codex", fake_codex)
     with TestClient(create_app(_settings(tmp_path), runner)) as client:
         job_id = client.post("/v1/jobs", headers=AUTH, json=BODY).json()["job_id"]
         response = client.post(

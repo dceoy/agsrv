@@ -24,7 +24,7 @@ from openai_codex.generated.v2_all import (
 from openai_codex.models import InitializeResponse, Notification
 from starlette.requests import Request
 
-from agsrv import codex_agent, main
+from agsrv import codex, main
 from agsrv.config import Settings
 from agsrv.main import create_app
 from agsrv.schemas import CodexQueryRequest
@@ -58,7 +58,7 @@ class FakeClient:
 
 def test_client_declines() -> None:
     """The real SDK client installs the fail-closed handler."""
-    client = codex_agent.make_client(None)
+    client = codex.make_client(None)
     handler = client._client._sync._approval_handler  # pyright: ignore[reportPrivateUsage]
     assert handler("anything", None) == {"decision": "decline"}
 
@@ -67,8 +67,8 @@ def test_client_declines() -> None:
 async def test_probe_and_limits(monkeypatch: pytest.MonkeyPatch) -> None:
     """Initialize and normalize rate limits, preserving raw data."""
     client = FakeClient()
-    monkeypatch.setattr(codex_agent, "make_client", MagicMock(return_value=client))
-    assert await codex_agent.probe(None)
+    monkeypatch.setattr(codex, "make_client", MagicMock(return_value=client))
+    assert await codex.probe(None)
     client.request.return_value = SimpleNamespace(
         model_dump=MagicMock(
             return_value={
@@ -82,7 +82,7 @@ async def test_probe_and_limits(monkeypatch: pytest.MonkeyPatch) -> None:
             }
         )
     )
-    result = await codex_agent.read_rate_limits(None)
+    result = await codex.read_rate_limits(None)
     assert result["primary"] == {"used_percent": 12, "resets_at": 123}
     assert result["secondary"] is None
     assert result["plan"] == "plus"
@@ -93,8 +93,8 @@ async def test_probe_and_limits(monkeypatch: pytest.MonkeyPatch) -> None:
     def fail(_: object) -> NoReturn:
         raise RuntimeError
 
-    monkeypatch.setattr(codex_agent, "make_client", fail)
-    assert not await codex_agent.probe(None)
+    monkeypatch.setattr(codex, "make_client", fail)
+    assert not await codex.probe(None)
 
 
 @pytest.mark.asyncio
@@ -107,7 +107,7 @@ async def test_run(
 ) -> None:
     """Every turn is ephemeral and denies approvals with the requested sandbox."""
     client = FakeClient()
-    monkeypatch.setattr(codex_agent, "make_client", MagicMock(return_value=client))
+    monkeypatch.setattr(codex, "make_client", MagicMock(return_value=client))
     item = MagicMock()
     item.model_dump.return_value = {"type": "commandExecution", "command": "pwd"}
     result = SimpleNamespace(
@@ -120,17 +120,17 @@ async def test_run(
         status=TurnStatus.completed,
     )
     run = AsyncMock(return_value=result)
-    monkeypatch.setattr(codex_agent, "collect_turn", run)
+    monkeypatch.setattr(codex, "collect_turn", run)
     monkeypatch.setattr(
-        codex_agent, "AsyncTurnHandle", MagicMock(return_value=SimpleNamespace())
+        codex, "AsyncTurnHandle", MagicMock(return_value=SimpleNamespace())
     )
     thread_turn = AsyncMock()
     monkeypatch.setattr(
-        codex_agent,
+        codex,
         "AsyncThread",
         MagicMock(return_value=SimpleNamespace(turn=thread_turn)),
     )
-    response = await codex_agent.run_codex(
+    response = await codex.run_codex(
         prompt="hi",
         cwd="/workspace",
         model="requested",
@@ -169,8 +169,8 @@ def test_terminal_results_endpoint(
 ) -> None:
     """Typed SDK events preserve terminal results through the HTTP endpoint."""
     client = FakeClient()
-    monkeypatch.setattr(codex_agent, "make_client", MagicMock(return_value=client))
-    monkeypatch.setattr(codex_agent, "probe", AsyncMock(return_value=True))
+    monkeypatch.setattr(codex, "make_client", MagicMock(return_value=client))
+    monkeypatch.setattr(codex, "probe", AsyncMock(return_value=True))
     item = ItemCompletedNotification.model_validate({
         "threadId": "t",
         "turnId": "turn",
@@ -204,9 +204,9 @@ def test_terminal_results_endpoint(
             yield Notification("turn/completed", terminal)
 
     handle = SimpleNamespace(id="turn", stream=stream)
-    monkeypatch.setattr(codex_agent, "AsyncTurnHandle", MagicMock(return_value=handle))
+    monkeypatch.setattr(codex, "AsyncTurnHandle", MagicMock(return_value=handle))
     monkeypatch.setattr(
-        codex_agent,
+        codex,
         "AsyncThread",
         MagicMock(return_value=SimpleNamespace(turn=AsyncMock(return_value=handle))),
     )
@@ -246,9 +246,9 @@ def test_endpoints(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         }
     )
     limits = AsyncMock(return_value={"plan": "plus"})
-    monkeypatch.setattr(codex_agent, "probe", probe)
-    monkeypatch.setattr(codex_agent, "run_codex", run)
-    monkeypatch.setattr(codex_agent, "read_rate_limits", limits)
+    monkeypatch.setattr(codex, "probe", probe)
+    monkeypatch.setattr(codex, "run_codex", run)
+    monkeypatch.setattr(codex, "read_rate_limits", limits)
     app = create_app(
         Settings(api_key="key", workspace_root=tmp_path, max_timeout_seconds=2)
     )
@@ -336,7 +336,7 @@ async def test_probe_coalesces_and_times_out(
         return True
 
     mock = AsyncMock(side_effect=probe)
-    monkeypatch.setattr(codex_agent, "probe", mock)
+    monkeypatch.setattr(codex, "probe", mock)
     first = asyncio.create_task(main._codex_available(app))  # pyright: ignore[reportPrivateUsage]
     await started.wait()
     second = asyncio.create_task(main._codex_available(app))  # pyright: ignore[reportPrivateUsage]
@@ -354,7 +354,7 @@ async def assert_probe_cache_after_cleanup(
 ) -> None:
     """Only a caller-interrupted probe is retried after cleanup."""
     healthy_probe = AsyncMock(return_value=True)
-    monkeypatch.setattr(codex_agent, "probe", healthy_probe)
+    monkeypatch.setattr(codex, "probe", healthy_probe)
     health = await http.get("/v1/agents")
     assert health.json()["codex"]["healthy"] is query_deadline
     assert healthy_probe.await_count == int(query_deadline)
@@ -369,7 +369,7 @@ async def test_probe_timeout_releases_waiters_but_keeps_slot(
     app = create_app(
         Settings(workspace_root=tmp_path, codex_max_concurrency=1, api_key="key")
     )
-    client = codex_agent.make_client(None)
+    client = codex.make_client(None)
     started = threading.Event()
     release = threading.Event()
     closed = threading.Event()
@@ -391,7 +391,7 @@ async def test_probe_timeout_releases_waiters_but_keeps_slot(
 
     monkeypatch.setattr(client._client._sync, "start", start)  # pyright: ignore[reportPrivateUsage]
     monkeypatch.setattr(client._client._sync, "close", close)  # pyright: ignore[reportPrivateUsage]
-    monkeypatch.setattr(codex_agent, "make_client", MagicMock(return_value=client))
+    monkeypatch.setattr(codex, "make_client", MagicMock(return_value=client))
     monkeypatch.setattr(main, "CODEX_PROBE_TIMEOUT", 0.05)
     async with AsyncClient(
         transport=ASGITransport(app=app),
@@ -452,7 +452,7 @@ async def test_warm_cache_start_timeout_keeps_slot(
     )
     app.state.codex_healthy = True
     app.state.codex_probe_expires = time.monotonic() + 30
-    client = codex_agent.make_client(None)
+    client = codex.make_client(None)
     started = threading.Event()
     release = threading.Event()
     closed = threading.Event()
@@ -474,7 +474,7 @@ async def test_warm_cache_start_timeout_keeps_slot(
 
     monkeypatch.setattr(sync, "start", start)
     monkeypatch.setattr(sync, "close", close)
-    monkeypatch.setattr(codex_agent, "make_client", MagicMock(return_value=client))
+    monkeypatch.setattr(codex, "make_client", MagicMock(return_value=client))
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://test",
@@ -511,7 +511,7 @@ async def test_cancelled_probe_consumes_late_start_failure(
 ) -> None:
     """A late startup failure is consumed without an orphaned future exception."""
     app = create_app(Settings(workspace_root=tmp_path))
-    client = codex_agent.make_client(None)
+    client = codex.make_client(None)
     started = threading.Event()
     release = threading.Event()
     errors: list[dict[str, object]] = []
@@ -524,7 +524,7 @@ async def test_cancelled_probe_consumes_late_start_failure(
         raise FileNotFoundError
 
     monkeypatch.setattr(client._client._sync, "start", start)  # pyright: ignore[reportPrivateUsage]
-    monkeypatch.setattr(codex_agent, "make_client", MagicMock(return_value=client))
+    monkeypatch.setattr(codex, "make_client", MagicMock(return_value=client))
     loop.set_exception_handler(lambda _loop, context: errors.append(context))
     task = asyncio.create_task(main._codex_available(app))  # pyright: ignore[reportPrivateUsage]
     try:
@@ -559,7 +559,7 @@ async def test_cached_agents_with_busy_executor_and_probe_lock(
         )
     )
     probe = AsyncMock(return_value=True)
-    monkeypatch.setattr(codex_agent, "probe", probe)
+    monkeypatch.setattr(codex, "probe", probe)
     monkeypatch.setattr(main, "CODEX_PROBE_TIMEOUT", 0.05)
     release = threading.Event()
     occupied = threading.Event()
@@ -614,7 +614,7 @@ async def test_codex_deadline_and_disconnect(
         return True
 
     request = Request({"type": "http", "app": app}, receive)
-    monkeypatch.setattr(codex_agent, "probe", slow)
+    monkeypatch.setattr(codex, "probe", slow)
     with pytest.raises(main.HTTPException) as error:
         await main._codex_query(  # pyright: ignore[reportPrivateUsage]
             CodexQueryRequest(agent="codex", prompt="x", timeout_seconds=0.01), request
@@ -657,7 +657,7 @@ async def test_codex_deadline_and_disconnect(
 @pytest.mark.asyncio
 async def test_cancel_during_transport_start(monkeypatch: pytest.MonkeyPatch) -> None:
     """Cancellation waits for the SDK start worker before closing its transport."""
-    client = codex_agent.make_client(None)
+    client = codex.make_client(None)
     started = threading.Event()
     release = threading.Event()
     closed = threading.Event()
@@ -678,13 +678,13 @@ async def test_cancel_during_transport_start(monkeypatch: pytest.MonkeyPatch) ->
         "initialize",
         AsyncMock(side_effect=RuntimeError()),
     )
-    monkeypatch.setattr(codex_agent, "make_client", MagicMock(return_value=client))
+    monkeypatch.setattr(codex, "make_client", MagicMock(return_value=client))
     app = create_app(Settings())
     app.state.codex_semaphore = asyncio.Semaphore(1)
 
     async def operation() -> None:
         async with main._codex_slot(app):  # pyright: ignore[reportPrivateUsage]
-            await codex_agent.probe(None)
+            await codex.probe(None)
 
     task = asyncio.create_task(operation())
     await asyncio.to_thread(started.wait)
@@ -711,7 +711,7 @@ async def test_stalled_initialize_closed_on_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Closing the transport unblocks an initialize worker after a deadline."""
-    client = codex_agent.make_client(None)
+    client = codex.make_client(None)
     started = threading.Event()
     closed = threading.Event()
     finished = threading.Event()
@@ -725,10 +725,10 @@ async def test_stalled_initialize_closed_on_deadline(
     monkeypatch.setattr(client._client._sync, "start", lambda: None)  # pyright: ignore[reportPrivateUsage]
     monkeypatch.setattr(client._client._sync, "initialize", initialize)  # pyright: ignore[reportPrivateUsage]
     monkeypatch.setattr(client._client._sync, "close", closed.set)  # pyright: ignore[reportPrivateUsage]
-    monkeypatch.setattr(codex_agent, "make_client", MagicMock(return_value=client))
+    monkeypatch.setattr(codex, "make_client", MagicMock(return_value=client))
     with pytest.raises(TimeoutError):
         async with asyncio.timeout(0.1):
-            await codex_agent.probe(None)
+            await codex.probe(None)
     assert started.is_set()
     assert closed.is_set()
     assert await asyncio.to_thread(finished.wait, 1)
@@ -748,7 +748,7 @@ def test_saturated_executor_closes_real_transport(
         "time.sleep(30)\n"
     )
     binary.chmod(0o755)
-    client = codex_agent.make_client(str(binary))
+    client = codex.make_client(str(binary))
     sync = client._client._sync  # pyright: ignore[reportPrivateUsage]
     close = sync.close
     processes: list[subprocess.Popen[str] | None] = []
@@ -758,7 +758,7 @@ def test_saturated_executor_closes_real_transport(
         close()
 
     monkeypatch.setattr(sync, "close", record_close)
-    monkeypatch.setattr(codex_agent, "make_client", MagicMock(return_value=client))
+    monkeypatch.setattr(codex, "make_client", MagicMock(return_value=client))
 
     async def exercise() -> None:
         loop = asyncio.get_running_loop()
@@ -767,7 +767,7 @@ def test_saturated_executor_closes_real_transport(
             started = time.monotonic()
             with pytest.raises(TimeoutError):
                 async with asyncio.timeout(0.2):
-                    await codex_agent.probe(str(binary))
+                    await codex.probe(str(binary))
             assert time.monotonic() - started < 3
             assert handshake.exists()
             assert len(processes) == 1
@@ -791,8 +791,8 @@ def test_metadata_capacity_timeout_and_schema(
         return {}
 
     limits = AsyncMock(side_effect=slow_limits)
-    monkeypatch.setattr(codex_agent, "probe", probe)
-    monkeypatch.setattr(codex_agent, "read_rate_limits", limits)
+    monkeypatch.setattr(codex, "probe", probe)
+    monkeypatch.setattr(codex, "read_rate_limits", limits)
     client = TestClient(app, headers={"Authorization": "Bearer key"})
     app.state.codex_semaphore = asyncio.Semaphore(0)
     assert client.get("/v1/agents").status_code == 429
@@ -839,7 +839,7 @@ def test_start_with_busy_default_executor(tmp_path: Path) -> None:
                 started = time.monotonic()
                 with pytest.raises(TimeoutError):
                     async with asyncio.timeout(0.2):
-                        await codex_agent.probe(str(binary))
+                        await codex.probe(str(binary))
                 assert time.monotonic() - started < 1
                 assert marker.exists()
             finally:
@@ -865,7 +865,7 @@ def test_blocked_writer_child_is_killed(
         "time.sleep(30)\n"
     )
     binary.chmod(0o755)
-    client = codex_agent.make_client(str(binary))
+    client = codex.make_client(str(binary))
     sync = client._client._sync  # pyright: ignore[reportPrivateUsage]
     close = sync.close
     processes: list[subprocess.Popen[str] | None] = []
@@ -875,13 +875,13 @@ def test_blocked_writer_child_is_killed(
         close()
 
     monkeypatch.setattr(sync, "close", record_close)
-    monkeypatch.setattr(codex_agent, "make_client", MagicMock(return_value=client))
+    monkeypatch.setattr(codex, "make_client", MagicMock(return_value=client))
 
     async def exercise() -> None:
         started = time.monotonic()
         with pytest.raises(TimeoutError):
             async with asyncio.timeout(0.2):
-                await codex_agent.run_codex(
+                await codex.run_codex(
                     prompt="x",
                     cwd=str(tmp_path),
                     model="x" * 1_000_000,
