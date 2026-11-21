@@ -1084,8 +1084,11 @@ async def test_query_external_cancel_propagates(
 
 
 @pytest.mark.asyncio
-async def test_query_disconnect_coalesced_external_cancel(tmp_path: Path) -> None:
+async def test_query_disconnect_coalesced_external_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """An external cancel coalesced with the disconnect cancel still propagates."""
+    monkeypatch.setattr("agsrv.main.DISCONNECT_POLL_INTERVAL", 0)
     runner = CleanupRunner()
     test_app = create_app(make_settings(tmp_path, max_concurrency=1), runner)
     gate = asyncio.Event()

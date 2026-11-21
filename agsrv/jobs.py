@@ -457,21 +457,30 @@ class JobManager:
         anchors = self.app.state.anchors
         cwd = admitted.path
         if isinstance(body, QueryRequest):
-            async with (
-                self.app.state.semaphore,
-                turn_tmpdir(settings, anchors, admitted) as tmpdir,
-            ):
-                home = service_home() if body.sandbox else None
-                options = build_options(body, settings, cwd, home, tmpdir)
-                runner = self.app.state.runner
-                stream = runner.stream(body.prompt, options)
-                async with aclosing(
-                    cast("AsyncGenerator[Message]", stream)
-                ) as messages:
-                    result = await collect_result(
-                        messages, include_messages=body.include_messages
-                    )
+            from agsrv.main import _claude_available, _SlotLease  # pyright: ignore[reportPrivateUsage]  # ruff: ignore[import-outside-top-level]
+
+            semaphore: asyncio.Semaphore = self.app.state.semaphore
+            await semaphore.acquire()
+            lease = _SlotLease(semaphore)
+            try:
+                if not await _claude_available(self.app, lease=lease):
+                    msg = "Claude unavailable"
+                    raise RuntimeError(msg)
+                async with turn_tmpdir(settings, anchors, admitted) as tmpdir:
+                    home = service_home() if body.sandbox else None
+                    options = build_options(body, settings, cwd, home, tmpdir)
+                    runner = self.app.state.runner
+                    stream = runner.stream(body.prompt, options)
+                    async with aclosing(
+                        cast("AsyncGenerator[Message]", stream)
+                    ) as messages:
+                        result = await collect_result(
+                            messages, include_messages=body.include_messages
+                        )
                 return result.model_dump(mode="json")
+            finally:
+                if not lease.claimed:
+                    lease.release()
         if not settings.codex_enabled:
             msg = "Codex unavailable"
             raise RuntimeError(msg)

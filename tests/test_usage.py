@@ -116,6 +116,7 @@ def test_endpoint(tmp_path: Path) -> None:
     runner.delay = 0.1
     app.state.settings = replace(app.state.settings, max_timeout_seconds=0.01)
     assert client.get(path, headers=headers).status_code == 504
+    assert client.get("/v1/agents", headers=headers).status_code == 200
     app.state.semaphore = asyncio.Semaphore(0)
     assert client.get(path, headers=headers).status_code == 429
     assert (
