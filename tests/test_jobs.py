@@ -362,11 +362,13 @@ async def test_orphaned_run_and_unstarted_manager_stop(tmp_path: Path) -> None:
     app = create_app(_settings(tmp_path))
     manager = app.state.jobs
     manager.start()
+    admitted = app.state.anchors.admit(tmp_path)
     await manager._run(  # pyright: ignore[reportPrivateUsage]
         "does-not-exist",
         QueryRequest(agent="claude", prompt="x", sandbox=False),
-        tmp_path,
+        admitted,
     )
+    admitted.close()
     await manager.stop()
     unstarted = create_app(_settings(tmp_path)).state.jobs
     await unstarted.stop()
@@ -554,19 +556,22 @@ def test_oversized_results_preserve_success(
 @pytest.mark.asyncio
 async def test_cancel_workspace_waiter_before_acquisition(tmp_path: Path) -> None:
     """Cancelled waiters never release another execution's workspace lease."""
-    manager = create_app(_settings(tmp_path)).state.jobs
+    app = create_app(_settings(tmp_path))
+    manager = app.state.jobs
     manager.start()
+    admitted = app.state.anchors.admit(tmp_path)
     async with manager.workspace(tmp_path):
         task = asyncio.create_task(
             manager._run(  # pyright: ignore[reportPrivateUsage]
                 "not-yet-running",
                 QueryRequest(agent="claude", prompt="x", sandbox=False),
-                tmp_path,
+                admitted,
             )
         )
         await asyncio.sleep(0)
         task.cancel()
         await task
+    admitted.close()
     await manager.stop()
 
 

@@ -30,7 +30,7 @@ from agsrv.security import (
     check_sandbox_request,
     resolve_cwd,
 )
-from agsrv.tmpguard import check_space, turn_tmpdir
+from agsrv.tmpguard import Admitted, check_space, turn_tmpdir
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -220,7 +220,29 @@ class JobManager:
             or not idempotency_key.isprintable()
         ):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid Idempotency-Key")
-        cwd = self._validate(body)
+        admitted = self.app.state.anchors.admit(self._validate(body))
+        try:
+            return self._enqueue(body, authorization, idempotency_key, admitted)
+        except BaseException:
+            admitted.close()
+            raise
+
+    def _enqueue(
+        self,
+        body: QueryRequest | CodexQueryRequest,
+        authorization: str | None,
+        idempotency_key: str | None,
+        admitted: Admitted,
+    ) -> dict[str, Any]:
+        """Deduplicate and enqueue a job; owns ``admitted`` once it is scheduled.
+
+        Returns:
+            Accepted job identifier and polling URL.
+
+        Raises:
+            HTTPException: If validation or queue capacity checks fail.
+        """
+        cwd = admitted.path
         payload = _canonical(body)
         settings: Settings = self.app.state.settings
         if len(payload.encode()) > settings.jobs_max_payload_bytes:
@@ -248,8 +270,9 @@ class JobManager:
                     raise HTTPException(
                         status.HTTP_409_CONFLICT, "Idempotency-Key payload mismatch"
                     )
+                admitted.close()  # a replay owns no turn
                 return self._accepted(existing["job_id"], existing["status"])
-            check_space(settings, cwd)
+            check_space(settings, self.app.state.anchors, admitted)
             pending = db.execute(
                 "SELECT COUNT(*) FROM jobs WHERE status IN ('queued','running')"
             ).fetchone()[0]
@@ -276,7 +299,8 @@ class JobManager:
                 ),
             )
             db.commit()
-        task = asyncio.create_task(self._run(job_id, body, cwd))
+        task = asyncio.create_task(self._run(job_id, body, admitted))
+        task.add_done_callback(lambda _: admitted.close())  # even if never started
         self.tasks[job_id] = task
         task.add_done_callback(lambda _: self.tasks.pop(job_id, None))
         return self._accepted(job_id, "queued")
@@ -427,44 +451,49 @@ class JobManager:
             await self._release_workspace(cwd)
 
     async def _execute(
-        self, body: QueryRequest | CodexQueryRequest, cwd: Path
+        self, body: QueryRequest | CodexQueryRequest, admitted: Admitted
     ) -> dict[str, Any]:
         settings: Settings = self.app.state.settings
+        anchors = self.app.state.anchors
+        cwd = admitted.path
         if isinstance(body, QueryRequest):
-            async with self.app.state.semaphore:
-                check_space(settings, cwd)
-                async with turn_tmpdir(settings.workspace_root, cwd) as tmpdir:
-                    home = service_home() if body.sandbox else None
-                    options = build_options(body, settings, cwd, home, tmpdir)
-                    runner = self.app.state.runner
-                    stream = runner.stream(body.prompt, options)
-                    async with aclosing(
-                        cast("AsyncGenerator[Message]", stream)
-                    ) as messages:
-                        result = await collect_result(
-                            messages, include_messages=body.include_messages
-                        )
-                    return result.model_dump(mode="json")
+            async with (
+                self.app.state.semaphore,
+                turn_tmpdir(settings, anchors, admitted) as tmpdir,
+            ):
+                home = service_home() if body.sandbox else None
+                options = build_options(body, settings, cwd, home, tmpdir)
+                runner = self.app.state.runner
+                stream = runner.stream(body.prompt, options)
+                async with aclosing(
+                    cast("AsyncGenerator[Message]", stream)
+                ) as messages:
+                    result = await collect_result(
+                        messages, include_messages=body.include_messages
+                    )
+                return result.model_dump(mode="json")
         if not settings.codex_enabled:
             msg = "Codex unavailable"
             raise RuntimeError(msg)
-        async with self.app.state.codex_semaphore:
-            check_space(settings, cwd)
-            async with turn_tmpdir(settings.workspace_root, cwd) as tmpdir:
-                return await codex.run_codex(
-                    prompt=body.prompt,
-                    cwd=str(cwd),
-                    model=body.model,
-                    effort=body.effort,
-                    sandbox=body.options.sandbox,
-                    network_access=body.options.network_access,
-                    binary=settings.codex_bin,
-                    tmpdir=str(tmpdir),
-                )
+        async with (
+            self.app.state.codex_semaphore,
+            turn_tmpdir(settings, anchors, admitted) as tmpdir,
+        ):
+            return await codex.run_codex(
+                prompt=body.prompt,
+                cwd=str(cwd),
+                model=body.model,
+                effort=body.effort,
+                sandbox=body.options.sandbox,
+                network_access=body.options.network_access,
+                binary=settings.codex_bin,
+                tmpdir=str(tmpdir),
+            )
 
     async def _run(
-        self, job_id: str, body: QueryRequest | CodexQueryRequest, cwd: Path
+        self, job_id: str, body: QueryRequest | CodexQueryRequest, admitted: Admitted
     ) -> None:
+        cwd = admitted.path
         acquired = False
         try:  # ruff: ignore[too-many-statements-in-try-clause]
             timeout = (
@@ -476,7 +505,7 @@ class JobManager:
                 async with self.running_slots:
                     if not self._mark_running(job_id):
                         return
-                    result = await self._execute(body, cwd)
+                    result = await self._execute(body, admitted)
             if result.get("is_error"):
                 self._finish(job_id, "failed", result, "agent_failed")
             else:

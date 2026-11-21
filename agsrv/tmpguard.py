@@ -3,313 +3,627 @@
 Design and threat model
 -----------------------
 Each turn gets a private directory ``.agsrv-tmp-<random>`` inside its working
-directory. Other writers may share that parent directory and can rename or
-replace entries in it, so no pathname is trusted after it has been used once:
+directory (the *cwd*). Writers that share the cwd can list it, rename or remove
+entries, substitute real directories or symlinks, and change ancestors. Neither
+random names nor the workspace lease establish ownership of a directory entry,
+so ownership is decided by an open descriptor, never by a name:
 
-* The parent descriptor is obtained by walking from the workspace-root
-  descriptor one component at a time (``O_DIRECTORY | O_NOFOLLOW``). A symlink
-  swapped into any ancestor makes the walk fail before anything is created, and
-  the walk can never leave the workspace root.
-* The directory is created with a ``dir_fd``-relative ``mkdir`` under a random
-  128-bit name (atomic; an existing entry is never reused), then opened at once
-  and its ``(st_dev, st_ino)`` recorded.
-* Removal renames the entry through the parent descriptor to a fresh tombstone
-  name, verifies the tombstone still has the recorded identity, and only then
-  deletes the tree with ``dir_fd``-relative operations anchored on the held
-  descriptor. A mismatch deletes nothing.
+* **Admission.** The workspace root is opened once at startup. An accepted cwd
+  is converted to relative components and opened by descending from the root
+  descriptor (``O_DIRECTORY | O_NOFOLLOW`` per component). The resulting cwd
+  descriptor is held by the request/job (``Admitted``). After the last wait the
+  same walk is repeated and compared with ``os.path.samestat``; all later
+  server mutations use the held descriptor, so a later symlink swap cannot
+  redirect them.
+* **Creation in staging.** A service-controlled staging directory (one per
+  workspace mount, opened and validated at startup: directory, owned by the
+  service, mode ``0700``) is outside the writers' reach. The turn directory is
+  created there with ``mkdir`` and a random name, made ``0700``, opened, and
+  verified through the descriptor while still private. It is then *published*
+  into the cwd with ``renameat2(RENAME_NOREPLACE)``, which never overwrites even
+  an empty directory.
+* **Reclaim.** Cleanup renames the public entry back into staging (no-replace),
+  checks it against the held descriptor with ``os.path.samestat``, and only on a
+  match calls the descriptor-safe ``shutil.rmtree(name, dir_fd=staging)``.
+  Everything destructive happens under the protected staging parent. A
+  mismatching entry is never traversed or deleted; it is renamed back to the
+  public name if that is free, otherwise it is kept in staging and its exact
+  location is logged. Cleanup runs in one worker thread and is shielded from
+  cancellation.
 
-Residual risks: children receive the directory as a path string (unavoidable),
-so a hostile writer can redirect *children*; it cannot redirect server-side
-creation or deletion. A writer that enumerates the parent and swaps the entry
-in the instant between ``mkdir`` and the following ``open`` is not detectable by
-identity alone; the opened directory must therefore also be empty and owned by
-the server user, otherwise nothing is deleted. The workspace root path itself
-(and everything above it) is administrator-controlled and trusted.
+Residual risks (see also the README): children receive a ``TMPDIR`` path string
+and resolve it themselves, so a writer can redirect *children* by replacing the
+leaf or an ancestor; server-side operations stay attached to the held
+descriptors. A descriptor identifies the object even if an ancestor is moved.
+Mounting filesystems, service compromise and a same-UID child that can reach the
+staging directory (e.g. via ``/proc``) are outside the model. A service crash
+can leave a public or staged entry; there is deliberately no name-based
+scavenger. The staging directory, workspace root and their ancestors are trusted.
 """
 
 import asyncio
+import ctypes
+import errno
+import functools
 import logging
 import os
 import secrets
 import shutil
 import stat
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fastapi import HTTPException, status
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Callable
 
     from agsrv.config import Settings
 
 logger = logging.getLogger(__name__)
 
 _DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-_PREFIX = ".agsrv-tmp-"
-_TOMBSTONE = ".agsrv-del-"
-
-
-def check_space(settings: "Settings", cwd: Path | None = None) -> None:
-    """Reject a turn if either enabled free-space threshold is unmet.
-
-    Raises:
-        HTTPException: If free space cannot be established or is insufficient.
-    """
-    paths = [
-        (Path("/tmp"), settings.tmp_min_free_bytes),  # ruff: ignore[hardcoded-temp-file]
-        (settings.workspace_root, settings.workspace_min_free_bytes),
-    ]
-    if cwd is not None and cwd != settings.workspace_root:
-        paths.append((cwd, settings.workspace_min_free_bytes))
-    for path, required in paths:
-        if required:
-            try:
-                free = shutil.disk_usage(path).free
-            except OSError as exc:
-                raise HTTPException(
-                    status.HTTP_503_SERVICE_UNAVAILABLE,
-                    f"Cannot check free space on {path}: {exc}",
-                ) from exc
-            if free < required:
-                raise HTTPException(
-                    status.HTTP_503_SERVICE_UNAVAILABLE,
-                    f"Insufficient free space on {path}: {free} bytes free, "
-                    f"{required} bytes required",
-                )
+_PUBLIC = ".agsrv-tmp-"
+_STAGED = ".agsrv-stg-"
+_RECOVERY = ".agsrv-rec-"
+_RENAME_NOREPLACE = 1
+_PRIVATE_MODE = 0o700
+_NAME_ATTEMPTS = 8
+_DRAIN_TIMEOUT = 60.0
 
 
 class TmpdirError(Exception):
     """Per-turn directory setup failed."""
 
 
-@dataclass
-class _Turn:
-    parent_fd: int
-    child_fd: int
-    name: str
-    identity: tuple[int, int]
-    path: Path
-
-
-def _walk(root: Path, cwd: Path) -> tuple[int, Path]:
-    """Open ``cwd`` by descending from the workspace root without pathnames.
+@functools.cache
+def _renameat2_fn() -> "Callable[..., int]":
+    """Load libc's ``renameat2`` with a declared signature.
 
     Returns:
-        The open directory descriptor and the canonical path of the directory.
+        The foreign function.
 
     Raises:
-        TmpdirError: If ``cwd`` is not inside the root or any component fails.
+        OSError: ``ENOSYS`` if libc has no ``renameat2``.
     """
-    root = Path(os.path.realpath(root))
-    cwd = Path(os.path.realpath(cwd))
+    libc = ctypes.CDLL(None, use_errno=True)
     try:
-        parts = cwd.relative_to(root).parts
-    except ValueError as exc:
-        msg = f"working directory {cwd} is outside the workspace root"
-        raise TmpdirError(msg) from exc
-    fd = -1
+        fn = libc.renameat2
+    except AttributeError as exc:
+        raise OSError(errno.ENOSYS, "renameat2 is unavailable in libc") from exc
+    fn.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    fn.restype = ctypes.c_int
+    return fn
+
+
+def _rename_noreplace(src_fd: int, src: str, dst_fd: int, dst: str) -> None:
+    """Move an entry between directories without ever replacing the target.
+
+    Raises:
+        OSError: On any failure (``EEXIST`` if the destination exists, ``EXDEV``
+            across mounts, ``ENOSYS``/``EINVAL`` if unsupported).
+    """
+    fn = _renameat2_fn()
+    if fn(src_fd, os.fsencode(src), dst_fd, os.fsencode(dst), _RENAME_NOREPLACE) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), dst)
+
+
+def _walk(root_fd: int, parts: tuple[str, ...]) -> int:
+    """Open a descendant by descending one no-follow component at a time.
+
+    Returns:
+        A new descriptor owned by the caller (``dup`` of the root for no parts).
+
+    Raises:
+        TmpdirError: If a component is unsafe or cannot be opened.
+    """
+    if any(p in {"", ".", ".."} or "/" in p for p in parts):
+        msg = f"unsafe path components {parts!r}"
+        raise TmpdirError(msg)
+    fd = os.dup(root_fd)
+    part = ""
     try:
-        fd = os.open(root, _DIR_FLAGS)
         for part in parts:
             next_fd = os.open(part, _DIR_FLAGS, dir_fd=fd)
             os.close(fd)
             fd = next_fd
     except OSError as exc:
-        if fd >= 0:
-            os.close(fd)
-        msg = f"cannot open working directory {cwd} safely: {exc}"
+        os.close(fd)
+        msg = f"cannot open working directory component {part!r} safely: {exc}"
         raise TmpdirError(msg) from exc
-    return fd, root.joinpath(*parts)
+    return fd
 
 
-def _purge(root_fd: int) -> None:
-    """Delete everything below ``root_fd`` using only descriptor-relative calls.
+@dataclass
+class Admitted:
+    """A request's working directory bound to an open descriptor.
 
-    Every directory is opened with ``O_NOFOLLOW`` relative to its parent's
-    descriptor, so symlinks are unlinked, never followed.
+    Attributes:
+        path: Canonical absolute path (for policy, leases and child strings).
+        parts: Components below the workspace root.
+        fd: Held cwd descriptor, valid until :meth:`close`.
+        stage_fd: Borrowed staging descriptor for this cwd's mount.
     """
-    top = os.listdir(root_fd)
-    stack: list[tuple[int, str | None, list[str]]] = [(root_fd, None, top)]
-    try:
-        while stack:
-            fd, name, pending = stack[-1]
-            if pending:
-                entry = pending.pop()
-                if stat.S_ISDIR(
-                    os.stat(entry, dir_fd=fd, follow_symlinks=False).st_mode
-                ):
-                    child = os.open(entry, _DIR_FLAGS, dir_fd=fd)
-                    with suppress(PermissionError):
-                        os.fchmod(child, 0o700)  # read-only trees must stay removable
-                    listing: list[str] = []
-                    stack.append((child, entry, listing))  # closed by `finally`
-                    listing.extend(os.listdir(child))  # ruff: ignore[os-listdir]
-                else:
-                    os.unlink(entry, dir_fd=fd)
-            else:
-                stack.pop()
-                if name is not None:
-                    os.close(fd)
-                    os.rmdir(name, dir_fd=stack[-1][0])
-    finally:
-        for fd, name, _ in stack:
-            if name is not None:
-                os.close(fd)
+
+    anchors: "Anchors"
+    path: Path
+    parts: tuple[str, ...]
+    fd: int
+    stage_fd: int
+    _closed: bool = field(default=False, repr=False)
+
+    def revalidate(self) -> None:
+        """Re-walk from the root and require the same directory object.
+
+        Raises:
+            TmpdirError: If the path no longer leads to the admitted directory.
+        """
+        fd = _walk(self.anchors.root_fd, self.parts)
+        try:
+            same = os.path.samestat(os.fstat(fd), os.fstat(self.fd))
+        finally:
+            os.close(fd)
+        if not same:
+            msg = f"working directory {self.path} changed after admission"
+            raise TmpdirError(msg)
+
+    def close(self) -> None:
+        """Release the descriptor (idempotent)."""
+        if not self._closed:
+            self._closed = True
+            os.close(self.fd)
+            self.anchors.release()
 
 
-def _same(turn: _Turn, tomb: str) -> bool:
-    found = os.stat(tomb, dir_fd=turn.parent_fd, follow_symlinks=False)
-    return stat.S_ISDIR(found.st_mode) and (found.st_dev, found.st_ino) == turn.identity
-
-
-def _retire(turn: _Turn, tomb: str) -> bool:
-    """Move the entry to ``tomb`` and confirm it is the directory we created.
+def _open_trusted(
+    settings: "Settings", root_path: Path
+) -> tuple[int, list[tuple[Path, int]]]:
+    """Open the workspace root and every staging directory (all or nothing).
 
     Returns:
-        Whether the tombstone is verified to be ours and may be deleted.
-    """
-    try:
-        os.rename(turn.name, tomb, src_dir_fd=turn.parent_fd, dst_dir_fd=turn.parent_fd)
-    except FileNotFoundError:
-        if os.fstat(turn.child_fd).st_nlink:
-            logger.warning(
-                "Turn temporary directory was moved away; skipping cleanup: %s",
-                turn.path,
-            )
-        return False
-    if _same(turn, tomb):
-        return True
-    _restore_foreign(turn.parent_fd, tomb, turn.name, turn.path)
-    return False
-
-
-def _delete_verified(turn: _Turn) -> None:
-    tomb = f"{_TOMBSTONE}{secrets.token_hex(16)}"
-    if _retire(turn, tomb):
-        _purge(turn.child_fd)
-        if _same(turn, tomb):  # rmdir only ever removes an empty directory
-            os.rmdir(tomb, dir_fd=turn.parent_fd)
-
-
-def _remove(turn: _Turn) -> None:
-    """Remove a turn directory if, and only if, it is still the one created.
-
-    Closes both descriptors. Never raises; problems are logged.
-    """
-    try:
-        _delete_verified(turn)
-    except Exception:  # cleanup must never mask the turn result
-        logger.exception("Failed to remove turn temporary directory %s", turn.path)
-    finally:
-        os.close(turn.child_fd)
-        os.close(turn.parent_fd)
-
-
-def _restore_foreign(parent_fd: int, tomb: str, name: str, path: Path) -> None:
-    """Leave a foreign entry untouched; put it back if its name is free."""
-    logger.error(
-        "Turn temporary directory was replaced; deleting nothing and leaving the "
-        "foreign entry in place: %s",
-        path,
-    )
-    try:
-        os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        os.rename(tomb, name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-    else:
-        logger.error("Foreign entry remains under tombstone name %s", tomb)
-
-
-def _open_fresh(parent_fd: int, name: str, path: Path) -> _Turn:
-    """Open the just-created directory and record its identity.
-
-    Returns:
-        A handle owning ``parent_fd`` and the new child descriptor.
+        The root descriptor and ``(mount root, staging descriptor)`` pairs.
 
     Raises:
-        TmpdirError: If the entry is not an empty directory we own, which means
-            it was swapped after ``mkdir``. Nothing is deleted in that case.
+        TmpdirError: If a trusted location is unusable.
+        OSError: Never; ``OSError`` is converted to ``TmpdirError``.
     """
-    # A restrictive umask can leave the new directory unopenable (mode 000).
-    os.chmod(name, 0o700, dir_fd=parent_fd, follow_symlinks=False)
-    child_fd = os.open(name, _DIR_FLAGS, dir_fd=parent_fd)
-    try:
-        info = os.fstat(child_fd)
-        empty = not os.listdir(child_fd)  # ruff: ignore[os-listdir]
-        fresh = info.st_uid == os.geteuid() and empty
-    except BaseException:
-        os.close(child_fd)
-        raise
-    if not fresh:
-        os.close(child_fd)
-        logger.error("Unexpected entry at new turn directory %s; leaving it", path)
-        msg = f"{path} was replaced during creation"
+    opened: list[int] = []
+    stages: list[tuple[Path, int]] = []
+    try:  # ruff: ignore[too-many-statements-in-try-clause]
+        root_fd = os.open(root_path, _DIR_FLAGS)
+        opened.append(root_fd)
+        for mount, stage in settings.tmp_staging_dirs:
+            fd = _open_stage(mount.resolve(), stage, root_path)
+            opened.append(fd)
+            stages.append((mount.resolve(), fd))
+        if stages:
+            _renameat2_fn()
+    except (OSError, TmpdirError) as exc:
+        for fd in opened:
+            os.close(fd)
+        if isinstance(exc, TmpdirError):
+            raise
+        msg = f"cannot open trusted location: {exc}"
+        raise TmpdirError(msg) from exc
+    return root_fd, stages
+
+
+class Anchors:
+    """Trusted descriptors held for the life of the server."""
+
+    def __init__(self, settings: "Settings") -> None:
+        """Remember configuration; descriptors are opened by :meth:`open`."""
+        self.settings = settings
+        self.root_fd = -1
+        self.root_path = settings.workspace_root.resolve()
+        self.stages: list[tuple[Path, int]] = []
+        self.is_open = False
+        self._live = 0
+        self._idle = asyncio.Event()
+        self._idle.set()
+        self.cleanups: set[asyncio.Task[None]] = set()
+
+    def open(self) -> None:
+        """Open and validate the workspace root and every staging directory.
+
+        Idempotent. Called at startup and lazily by :meth:`admit`.
+
+        Raises:
+            TmpdirError: If a trusted location is unusable.
+        """
+        if self.is_open:
+            return
+        if not shutil.rmtree.avoids_symlink_attacks:
+            msg = "this platform's shutil.rmtree is not symlink-attack resistant"
+            raise TmpdirError(msg)
+        self.root_fd, stages = _open_trusted(self.settings, self.root_path)
+        self.stages = sorted(stages, key=lambda s: len(s[0].parts), reverse=True)
+        self.is_open = True
+        if not stages:
+            logger.warning(
+                "No AGSRV_TMP_STAGING_DIRS configured: agent turns are unavailable"
+            )
+
+    def _stage_for(self, cwd: Path) -> int:
+        for mount, fd in self.stages:
+            if cwd.is_relative_to(mount):
+                return fd
+        msg = f"no staging directory is configured for {cwd}"
         raise TmpdirError(msg)
-    return _Turn(parent_fd, child_fd, name, (info.st_dev, info.st_ino), path)
+
+    def admit(self, cwd: Path) -> Admitted:
+        """Bind an accepted canonical ``cwd`` to a held descriptor.
+
+        Args:
+            cwd: Canonical path already accepted by ``security.resolve_cwd``.
+
+        Returns:
+            The admitted directory; the caller must close it.
+
+        Raises:
+            HTTPException: 503 if the directory cannot be opened safely.
+        """
+        try:
+            self.open()
+            parts = cwd.relative_to(self.root_path).parts
+            stage_fd = self._stage_for(cwd)
+            fd = _walk(self.root_fd, parts)
+        except (TmpdirError, ValueError) as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                f"Cannot prepare turn temporary directory: {exc}",
+            ) from exc
+        self._live += 1
+        self._idle.clear()
+        return Admitted(self, cwd, parts, fd, stage_fd)
+
+    def release(self) -> None:
+        """Record that one admitted descriptor was closed."""
+        self._live -= 1
+        if self._live == 0:
+            self._idle.set()
+
+    async def aclose(self) -> None:
+        """Wait for every turn owner, then close the shared descriptors."""
+        try:
+            async with asyncio.timeout(_DRAIN_TIMEOUT):
+                await self._idle.wait()
+        except TimeoutError:
+            logger.exception("Turn owners did not finish; keeping anchors open")
+            return
+        if self.is_open:
+            for fd in (self.root_fd, *(fd for _, fd in self.stages)):
+                os.close(fd)
+            self.root_fd = -1
+            self.stages = []
+            self.is_open = False
 
 
-def _create(root: Path, cwd: Path) -> _Turn:
-    """Create the directory and return its descriptor-anchored handle.
+def _check_stage(stage: Path, mount: Path, info: os.stat_result) -> None:
+    """Validate an opened staging directory's ownership, mode and filesystem.
+
+    Raises:
+        TmpdirError: If it is not service-owned ``0700`` on the mount's filesystem.
+    """
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != _PRIVATE_MODE:
+        msg = f"staging directory {stage} must be owned by the service, mode 0700"
+        raise TmpdirError(msg)
+    if mount.stat().st_dev != info.st_dev:
+        msg = f"staging directory {stage} is not on the filesystem of {mount}"
+        raise TmpdirError(msg)
+
+
+def _open_stage(mount: Path, stage: Path, root: Path) -> int:
+    """Open and validate a staging directory.
 
     Returns:
-        The handle owning both descriptors.
+        The held descriptor.
+
+    Raises:
+        TmpdirError: If it is unsafe: inside the workspace, not a ``0700``
+            directory owned by the service, or on another filesystem.
+    """
+    stage = stage.resolve()
+    if stage.is_relative_to(root):
+        msg = f"staging directory {stage} must be outside the workspace root"
+        raise TmpdirError(msg)
+    try:
+        fd = os.open(stage, _DIR_FLAGS)
+    except OSError as exc:
+        msg = f"cannot open staging directory {stage}: {exc}"
+        raise TmpdirError(msg) from exc
+    try:
+        _check_stage(stage, mount, os.fstat(fd))
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _free(fd: int) -> int:
+    info = os.fstatvfs(fd)
+    return info.f_bavail * info.f_frsize
+
+
+def check_space(settings: "Settings", anchors: Anchors, cwd: Admitted) -> None:
+    """Reject a turn if either enabled free-space threshold is unmet.
+
+    The filesystems actually used are measured: ``/tmp``, the held workspace
+    root and the held cwd (skipped when it is the root).
+
+    Raises:
+        HTTPException: If free space cannot be established or is insufficient.
+    """
+    targets: list[tuple[str, int | None, int]] = [
+        ("/tmp", None, settings.tmp_min_free_bytes),  # ruff: ignore[hardcoded-temp-file]
+        (str(anchors.root_path), anchors.root_fd, settings.workspace_min_free_bytes),
+    ]
+    if cwd.path != anchors.root_path:
+        targets.append((str(cwd.path), cwd.fd, settings.workspace_min_free_bytes))
+    for label, fd, required in targets:
+        if not required:
+            continue
+        try:
+            if fd is None:
+                info = os.statvfs(label)
+                free = info.f_bavail * info.f_frsize
+            else:
+                free = _free(fd)
+        except OSError as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                f"Cannot check free space on {label}: {exc}",
+            ) from exc
+        if free < required:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                f"Insufficient free space on {label}: {free} bytes free, "
+                f"{required} bytes required",
+            )
+
+
+@dataclass
+class _Turn:
+    """Ownership record for one published turn directory."""
+
+    stage_fd: int
+    cwd_fd: int
+    child_fd: int
+    public: str
+    path: Path
+    where: str
+
+
+def _private_rollback(stage_fd: int, name: str, child_fd: int) -> None:
+    """Remove a still-private directory by its staged name."""
+    if child_fd >= 0:
+        os.close(child_fd)
+    try:
+        os.rmdir(name, dir_fd=stage_fd)
+    except OSError:
+        logger.exception("Failed to roll back private staged directory %s", name)
+
+
+def _mkdir_private(stage_fd: int) -> str:
+    """Create an empty ``0700`` directory under an unused random staging name.
+
+    Returns:
+        The staged name (ownership is proven by the private parent).
+
+    Raises:
+        TmpdirError: If no directory could be created.
+    """
+    for _ in range(_NAME_ATTEMPTS):
+        name = f"{_STAGED}{secrets.token_hex(16)}"
+        try:
+            os.mkdir(name, _PRIVATE_MODE, dir_fd=stage_fd)
+        except FileExistsError:
+            continue  # never touch an existing entry
+        except OSError as exc:
+            msg = f"cannot create staged directory: {exc}"
+            raise TmpdirError(msg) from exc
+        return name
+    msg = "could not pick an unused staging name"
+    raise TmpdirError(msg)
+
+
+def _open_private(stage_fd: int, name: str) -> int:
+    """Fix the mode, open and verify a staged directory.
+
+    Returns:
+        The verified directory descriptor.
+
+    Raises:
+        TmpdirError: If the opened object is not a ``0700`` directory.
+    """
+    # A restrictive umask can leave mode 000; fix it while still private.
+    os.chmod(name, _PRIVATE_MODE, dir_fd=stage_fd)
+    child_fd = os.open(name, _DIR_FLAGS, dir_fd=stage_fd)
+    info = os.fstat(child_fd)
+    if not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != _PRIVATE_MODE:
+        os.close(child_fd)
+        msg = f"staged directory {name} has unexpected type or mode"
+        raise TmpdirError(msg)
+    return child_fd
+
+
+def _setup(adm: Admitted) -> _Turn:
+    """Create the directory privately in staging and publish it atomically.
+
+    Returns:
+        The ownership record; the caller must reclaim it.
 
     Raises:
         TmpdirError: If any step fails; partial state is rolled back first.
     """
-    parent_fd, parent = _walk(root, cwd)
-    name = f"{_PREFIX}{secrets.token_hex(16)}"
-    path = parent / name
+    stage_fd = adm.stage_fd
+    if os.fstat(adm.fd).st_dev != os.fstat(stage_fd).st_dev:
+        msg = f"staging is on a different filesystem than {adm.path}"
+        raise TmpdirError(msg)
+    name = _mkdir_private(stage_fd)
+    child_fd = -1
+    public = f"{_PUBLIC}{secrets.token_hex(16)}"
     try:
-        os.mkdir(name, 0o700, dir_fd=parent_fd)
-    except OSError as exc:
-        os.close(parent_fd)
-        msg = f"cannot create {path}: {exc}"
-        raise TmpdirError(msg) from exc
-    try:
-        turn = _open_fresh(parent_fd, name, path)
+        child_fd = _open_private(stage_fd, name)
+        _rename_noreplace(stage_fd, name, adm.fd, public)
     except BaseException as exc:
-        if not isinstance(exc, TmpdirError):
-            try:  # no identity yet: rmdir can only ever remove an empty directory
-                os.rmdir(name, dir_fd=parent_fd)
-            except OSError:
-                logger.exception("Failed to roll back %s", path)
-        os.close(parent_fd)
-        if isinstance(exc, OSError | NotImplementedError):
-            msg = f"cannot open {path}: {exc}"
-            raise TmpdirError(msg) from exc
-        raise
-    try:
-        os.fchmod(turn.child_fd, 0o700)
-    except BaseException as exc:
-        _remove(turn)  # identity is known: the full anchored removal applies
+        _private_rollback(stage_fd, name, child_fd)
         if isinstance(exc, OSError):
-            msg = f"cannot set mode of {path}: {exc}"
+            msg = f"cannot publish into {adm.path}: {exc}"
             raise TmpdirError(msg) from exc
         raise
-    return turn
+    path = adm.path / public
+    return _Turn(stage_fd, adm.fd, child_fd, public, path, str(path))
+
+
+def _capture(turn: _Turn) -> str | None:
+    """Move the public entry into staging under a fresh recovery name.
+
+    Returns:
+        The recovery name, or ``None`` if nothing was captured.
+    """
+    for _ in range(_NAME_ATTEMPTS):
+        recovery = f"{_RECOVERY}{secrets.token_hex(16)}"
+        try:
+            _rename_noreplace(turn.cwd_fd, turn.public, turn.stage_fd, recovery)
+        except FileExistsError:
+            continue
+        except FileNotFoundError:
+            logger.warning(
+                "Turn temporary directory was moved away; skipping cleanup: %s",
+                turn.path,
+            )
+            return None
+        except OSError:
+            logger.exception("Could not reclaim turn directory %s", turn.path)
+            return None
+        return recovery
+    logger.error("Could not pick a recovery name; %s is retained", turn.path)
+    return None
+
+
+def _make_removable(turn: _Turn, recovery: str) -> None:
+    """Let read-only subdirectories be emptied (descriptor-based chmod only)."""
+    for _top, _dirs, _files, dirfd in os.fwalk(recovery, dir_fd=turn.stage_fd):
+        with suppress(OSError):
+            os.fchmod(dirfd, _PRIVATE_MODE)
+
+
+def _reclaim_verified(turn: _Turn) -> None:
+    recovery = _capture(turn)
+    if recovery is None:
+        return
+    turn.where = f"staging entry {recovery}"
+    try:
+        captured = os.stat(recovery, dir_fd=turn.stage_fd, follow_symlinks=False)
+        ours = stat.S_ISDIR(captured.st_mode) and os.path.samestat(
+            captured, os.fstat(turn.child_fd)
+        )
+    except OSError:
+        logger.exception(
+            "Could not inspect %s; retaining the unverified entry as %s",
+            turn.path,
+            turn.where,
+        )
+        return
+    if not ours:
+        try:
+            _rename_noreplace(turn.stage_fd, recovery, turn.cwd_fd, turn.public)
+        except OSError:
+            logger.exception(
+                "Turn directory %s was replaced by a foreign entry; deleting "
+                "nothing. It could not be restored and is retained as %s",
+                turn.path,
+                turn.where,
+            )
+        else:
+            logger.error(
+                "Turn directory %s was replaced by a foreign entry; deleting "
+                "nothing and restored it",
+                turn.path,
+            )
+        return
+    _make_removable(turn, recovery)
+    shutil.rmtree(recovery, dir_fd=turn.stage_fd)
+
+
+def _reclaim(turn: _Turn) -> None:
+    """Reclaim a turn directory; closes the child descriptor. Never raises."""
+    try:
+        _reclaim_verified(turn)
+    except Exception:  # cleanup must never mask the turn result
+        logger.exception(
+            "Failed to remove turn temporary directory %s; last known location: %s",
+            turn.path,
+            turn.where,
+        )
+    finally:
+        os.close(turn.child_fd)
+
+
+async def _finish(anchors: Anchors, turn: _Turn) -> None:
+    """Run cleanup in a worker; survive repeated cancellation of the owner.
+
+    Raises:
+        asyncio.CancelledError: After cleanup finished, if the owner was cancelled.
+    """
+    task = asyncio.ensure_future(asyncio.to_thread(_reclaim, turn))
+    anchors.cleanups.add(task)
+    task.add_done_callback(anchors.cleanups.discard)
+    cancelled = False
+    while True:
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+            if task.done():  # the cleanup itself was cancelled (loop shutdown)
+                break
+        else:
+            break
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 @asynccontextmanager
-async def turn_tmpdir(root: Path, cwd: Path) -> "AsyncGenerator[Path, None]":
-    """Create a private directory for a turn and remove it afterward.
+async def turn_tmpdir(
+    settings: "Settings", anchors: Anchors, adm: Admitted
+) -> "AsyncGenerator[Path, None]":
+    """Create a private per-turn directory in the cwd and reclaim it afterward.
+
+    Call after the last workspace/capacity wait. Revalidates the admitted cwd,
+    checks free space on the filesystems used, then creates and publishes.
 
     Args:
-        root: Workspace root that contains ``cwd``.
-        cwd: Canonical working directory of the turn.
+        settings: Server settings.
+        anchors: Trusted descriptors.
+        adm: Admitted working directory (held by the caller).
 
     Yields:
-        The directory inside the working directory (a canonical path string
-        source for children; server-side removal never uses it).
+        The canonical absolute path to hand to the child as ``TMPDIR``.
 
     Raises:
-        HTTPException: 503 if the directory cannot be created safely.
+        HTTPException: 503 if the directory cannot be created safely or free
+            space is insufficient.
     """
     try:
-        turn = _create(root, cwd)
+        adm.revalidate()
+    except TmpdirError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"Cannot prepare turn temporary directory: {exc}",
+        ) from exc
+    check_space(settings, anchors, adm)
+    try:
+        turn = _setup(adm)  # publication and ownership: no await in between
     except TmpdirError as exc:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -318,6 +632,4 @@ async def turn_tmpdir(root: Path, cwd: Path) -> "AsyncGenerator[Path, None]":
     try:
         yield turn.path
     finally:
-        # The worker closes the descriptors itself, so they are released even
-        # if this await is cancelled again.
-        await asyncio.to_thread(_remove, turn)
+        await _finish(anchors, turn)
