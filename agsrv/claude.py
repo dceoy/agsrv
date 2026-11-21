@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
+import json
+import os
 import re
+from contextlib import aclosing, suppress
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from claude_agent_sdk import (
@@ -292,3 +296,88 @@ async def collect_result(
         stop_reason=final.stop_reason,
         messages=messages,
     )
+
+
+AUTH_STATUS_TIMEOUT = 5.0
+
+
+async def _logged_in(env: dict[str, str], cwd: str | None) -> bool:
+    """Ask the bundled CLI whether it is logged in.
+
+    Runs ``<bundled cli> auth status`` with the query path's environment (minus
+    ``CLAUDECODE``, which the SDK strips for turns) in the workspace directory.
+    Any spawn, timeout, exit-code, or parse failure counts as not logged in.
+    Non-JSON noise before the first ``{`` on stdout is ignored.
+
+    Args:
+        env: Environment overrides applied by the query path.
+        cwd: Working directory for the subprocess (the workspace).
+
+    Returns:
+        True only if the JSON output has ``loggedIn`` exactly ``true``.
+    """
+    process: asyncio.subprocess.Process | None = None
+    try:
+        process = await asyncio.create_subprocess_exec(
+            str(bundled_cli_path()),
+            "auth",
+            "status",
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            env={k: v for k, v in {**os.environ, **env}.items() if k != "CLAUDECODE"},
+            cwd=cwd,
+        )
+        stdout, _ = await asyncio.wait_for(
+            process.communicate(), timeout=AUTH_STATUS_TIMEOUT
+        )
+        if process.returncode != 0:
+            return False
+        text = stdout.decode()
+        payload: Any = json.loads(text[text.index("{") :])
+    except Exception:  # ruff: ignore[blind-except]
+        return False
+    finally:
+        if process is not None and process.returncode is None:
+            with suppress(ProcessLookupError):
+                process.kill()
+            await asyncio.shield(process.wait())
+    return (
+        isinstance(payload, dict)
+        and cast("dict[str, Any]", payload).get("loggedIn") is True
+    )
+
+
+async def probe(runner: AgentRunner, settings: Settings) -> bool:
+    """Check that Claude is usable without spending tokens.
+
+    Healthy means the CLI is spawnable, an ephemeral ``/usage`` run succeeds
+    without ``is_error``, and ``auth status`` reports ``loggedIn: true``. This
+    does not prove the credential is still valid server-side.
+
+    The probe never uses the sandbox, so sandbox prerequisites cannot fail it
+    or create cache directories; sandbox eligibility stays per request.
+
+    Returns:
+        Whether Claude is considered healthy.
+    """
+    from agsrv.schemas import QueryRequest  # ruff: ignore[import-outside-top-level]
+
+    try:  # ruff: ignore[too-many-statements-in-try-clause]
+        body = QueryRequest(
+            agent="claude",
+            prompt="/usage",
+            allowed_tools=[],
+            max_turns=1,
+            sandbox=False,
+        )
+        options = build_options(body, settings, settings.workspace_root)
+        options.tools = []
+        stream = runner.stream(body.prompt, options)
+        async with aclosing(cast("Any", stream)) as messages:
+            result = await collect_result(messages, include_messages=False)
+        if result.is_error:
+            return False
+        return await _logged_in(dict(options.env), str(options.cwd))
+    except Exception:  # ruff: ignore[blind-except]
+        return False

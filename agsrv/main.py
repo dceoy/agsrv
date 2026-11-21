@@ -12,7 +12,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import Response
 from pydantic import Field
 
-from agsrv import codex
+from agsrv import claude, codex
 from agsrv.claude import (
     AgentExecutionError,
     AgentRunner,
@@ -40,7 +40,7 @@ from agsrv.security import (
 from agsrv.usage import parse_usage
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Coroutine
+    from collections.abc import AsyncGenerator, Callable, Coroutine
 
     from claude_agent_sdk import ClaudeAgentOptions, Message
 
@@ -48,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 VERSION = "0.4.0"
 DISCONNECT_POLL_INTERVAL = 0.1
-CODEX_PROBE_TIMEOUT = 10.0
+PROBE_TIMEOUT = 10.0
 
 # Keep detached Codex cleanup alive if the request task is cancelled.
 _pump_tasks: set[asyncio.Task[Any]] = set()
@@ -59,7 +59,7 @@ Auth = Depends(auth_dependency)
 
 
 async def _prepare(
-    request: Request, body: QueryRequest
+    request: Request, body: QueryRequest, *, check_claude_cache: bool = False
 ) -> tuple[ClaudeAgentOptions, float, asyncio.Semaphore]:
     """Validate a request and acquire a concurrency slot.
 
@@ -91,6 +91,14 @@ async def _prepare(
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             f"timeout_seconds exceeds server maximum {settings.max_timeout_seconds}",
+        )
+    if (
+        check_claude_cache
+        and time.monotonic() < request.app.state.claude_probe_expires
+        and not request.app.state.claude_healthy
+    ):
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "Claude is disabled or unavailable"
         )
     semaphore: asyncio.Semaphore = request.app.state.semaphore
     if semaphore.locked():
@@ -151,6 +159,37 @@ async def _codex_slot(app: FastAPI) -> AsyncGenerator[_SlotLease, None]:
             lease.release()
 
 
+async def _claude_available(app: FastAPI, *, lease: _SlotLease | None = None) -> bool:
+    if time.monotonic() < app.state.claude_probe_expires:
+        return cast("bool", app.state.claude_healthy)
+    async with app.state.claude_probe_lock:
+        if time.monotonic() >= app.state.claude_probe_expires:
+
+            def operation() -> Coroutine[Any, Any, bool]:
+                return claude.probe(app.state.runner, app.state.settings)
+
+            semaphore: asyncio.Semaphore = app.state.semaphore
+            if lease is None and semaphore.locked():
+                # The agents listing must never fail because the slot is busy:
+                # serve the last known value, even if expired, and probe later.
+                return cast("bool", app.state.claude_healthy)
+            if lease is None:
+                await semaphore.acquire()  # immediate: not locked
+                lease = _SlotLease(semaphore)
+                owned = True
+            else:
+                owned = False
+            try:
+                app.state.claude_healthy = await _timed_probe(
+                    app, lease, operation, "claude"
+                )
+            finally:
+                if owned and not lease.claimed:
+                    lease.release()
+            app.state.claude_probe_expires = time.monotonic() + 30
+    return cast("bool", app.state.claude_healthy)
+
+
 async def _codex_available(app: FastAPI, *, lease: _SlotLease | None = None) -> bool:
     settings: Settings = app.state.settings
     if not settings.codex_enabled:
@@ -160,17 +199,36 @@ async def _codex_available(app: FastAPI, *, lease: _SlotLease | None = None) -> 
     async with app.state.codex_probe_lock:
         now = time.monotonic()
         if now >= app.state.codex_probe_expires:
+
+            def operation() -> Coroutine[Any, Any, bool]:
+                return codex.probe(settings.codex_bin)
+
             if lease is None:
                 async with _codex_slot(app) as acquired:
-                    app.state.codex_healthy = await _timed_probe(app, acquired)
+                    app.state.codex_healthy = await _timed_probe(
+                        app, acquired, operation, "codex"
+                    )
             else:
-                app.state.codex_healthy = await _timed_probe(app, lease)
+                app.state.codex_healthy = await _timed_probe(
+                    app, lease, operation, "codex"
+                )
             app.state.codex_probe_expires = time.monotonic() + 30
     return cast("bool", app.state.codex_healthy)
 
 
-async def _timed_probe(app: FastAPI, lease: _SlotLease) -> bool:
+async def _timed_probe(
+    app: FastAPI,
+    lease: _SlotLease,
+    operation: Callable[[], Coroutine[Any, Any, bool]],
+    agent: str,
+) -> bool:
     """Release the caller at the deadline while cleanup retains capacity.
+
+    Args:
+        app: Application owning the ``<agent>_healthy``/``_probe_expires`` state.
+        lease: Slot held for the probe.
+        operation: Factory for the probe coroutine, called once the slot is held.
+        agent: State prefix, ``"claude"`` or ``"codex"``.
 
     Returns:
         The probe result, or false on timeout.
@@ -178,28 +236,28 @@ async def _timed_probe(app: FastAPI, lease: _SlotLease) -> bool:
     Raises:
         asyncio.CancelledError: If the caller is cancelled.
     """
-    task = asyncio.create_task(codex.probe(app.state.settings.codex_bin))
+    task = asyncio.create_task(operation())
     try:
-        done, _ = await asyncio.wait({task}, timeout=CODEX_PROBE_TIMEOUT)
+        done, _ = await asyncio.wait({task}, timeout=PROBE_TIMEOUT)
     except asyncio.CancelledError:
-        _detach_codex(task, lease)
-        app.state.codex_healthy = False
+        _detach_probe(task, lease)
+        setattr(app.state, f"{agent}_healthy", False)
         expires = time.monotonic() + 30
-        app.state.codex_probe_expires = expires
+        setattr(app.state, f"{agent}_probe_expires", expires)
 
         def invalidate(_operation: asyncio.Task[bool]) -> None:
-            if app.state.codex_probe_expires == expires:
-                app.state.codex_probe_expires = 0
+            if getattr(app.state, f"{agent}_probe_expires") == expires:
+                setattr(app.state, f"{agent}_probe_expires", 0)
 
         task.add_done_callback(invalidate)
         raise
     if done:
         return task.result()
-    _detach_codex(task, lease)
+    _detach_probe(task, lease)
     return False
 
 
-def _detach_codex(task: asyncio.Task[Any], lease: _SlotLease) -> None:
+def _detach_probe(task: asyncio.Task[Any], lease: _SlotLease) -> None:
     """Transfer capacity to a cancelled operation until its cleanup finishes."""
     lease.claimed = True
     _pump_tasks.add(task)
@@ -227,7 +285,7 @@ async def _await_codex(operation: Coroutine[Any, Any, T], lease: _SlotLease) -> 
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
-        _detach_codex(task, lease)
+        _detach_probe(task, lease)
         raise
 
 
@@ -346,7 +404,7 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
         return {
             "claude": {
                 "enabled": True,
-                "healthy": True,
+                "healthy": await _claude_available(app),
                 "default_model": settings.default_model,
                 "supports": {
                     "sandbox": True,
@@ -465,7 +523,7 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
     _ = (health, info, agents, claude_rate_limits, rate_limits)
 
 
-def _add_query_routes(app: FastAPI) -> None:
+def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure]
     """Register the agent execution routes."""
 
     @app.post(
@@ -475,7 +533,7 @@ def _add_query_routes(app: FastAPI) -> None:
             QueryResponse | CodexQueryResponse, Field(discriminator="agent")
         ],
     )
-    async def run_query(  # pyright: ignore[reportUnusedFunction]
+    async def run_query(  # pyright: ignore[reportUnusedFunction]  # ruff: ignore[complex-structure]
         body: Annotated[QueryRequest | CodexQueryRequest, Field(discriminator="agent")],
         request: Request,
     ) -> QueryResponse | Response | dict[str, Any]:
@@ -494,7 +552,10 @@ def _add_query_routes(app: FastAPI) -> None:
         """
         if isinstance(body, CodexQueryRequest):
             return await _codex_query_with_disconnect(body, request)
-        options, timeout, semaphore = await _prepare(request, body)
+        options, timeout, semaphore = await _prepare(
+            request, body, check_claude_cache=True
+        )
+        lease = _SlotLease(semaphore)
         agent_runner: AgentRunner = request.app.state.runner
         task = cast("asyncio.Task[object]", asyncio.current_task())
 
@@ -509,8 +570,13 @@ def _add_query_routes(app: FastAPI) -> None:
             task.cancel()
 
         watcher = asyncio.create_task(watch_disconnect())
-        try:
+        try:  # ruff: ignore[too-many-statements-in-try-clause]
             async with asyncio.timeout(timeout):
+                if not await _claude_available(request.app, lease=lease):
+                    raise HTTPException(  # ruff: ignore[raise-within-try]
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "Claude is disabled or unavailable",
+                    )
                 cwd = resolve_cwd(request.app.state.settings, body.cwd)
                 async with request.app.state.jobs.workspace(cwd):
                     stream = agent_runner.stream(body.prompt, options)
@@ -528,6 +594,8 @@ def _add_query_routes(app: FastAPI) -> None:
             raise HTTPException(
                 status.HTTP_504_GATEWAY_TIMEOUT, "agent run timed out"
             ) from exc
+        except HTTPException:
+            raise
         except AgentExecutionError as exc:
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
         except Exception as exc:
@@ -541,7 +609,8 @@ def _add_query_routes(app: FastAPI) -> None:
                 with suppress(asyncio.CancelledError):
                     await watcher
             finally:
-                semaphore.release()
+                if not lease.claimed:
+                    lease.release()
 
     _ = run_query
 
@@ -615,6 +684,9 @@ def create_app(
     app.state.runner = runner or SdkAgentRunner()
     app.state.semaphore = asyncio.Semaphore(settings.max_concurrency)
     app.state.codex_semaphore = asyncio.Semaphore(settings.codex_max_concurrency)
+    app.state.claude_probe_lock = asyncio.Lock()
+    app.state.claude_probe_expires = 0.0
+    app.state.claude_healthy = False
     app.state.codex_probe_lock = asyncio.Lock()
     app.state.codex_probe_expires = 0.0
     app.state.codex_healthy = False
