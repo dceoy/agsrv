@@ -615,6 +615,9 @@ def create_app(
     app.state.runner = runner or SdkAgentRunner()
     app.state.semaphore = asyncio.Semaphore(settings.max_concurrency)
     app.state.codex_semaphore = asyncio.Semaphore(settings.codex_max_concurrency)
+    app.state.claude_probe_lock = asyncio.Lock()
+    app.state.claude_probe_expires = 0.0
+    app.state.claude_healthy = False
     app.state.codex_probe_lock = asyncio.Lock()
     app.state.codex_probe_expires = 0.0
     app.state.codex_healthy = False
