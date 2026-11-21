@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from muse_code.facade.approval import ApprovalRouter
 from muse_code.facade.turn_handle import _Completed, _TerminalUnknown, _Unqueued  # pyright: ignore[reportPrivateUsage]
@@ -982,11 +983,104 @@ def test_invalid_usage() -> None:
     """Malformed and out-of-range observations fail soft."""
     samples: list[dict[str, Any]] = [
         {"usage": {"window": None, "weekly": {}}},
-        {"usage": {"window": {"usedPercent": 101, "resetsAtMs": 1}}},
         {"usage": {"window": {"usedPercent": 1, "resetsAtMs": 10**30}}},
     ]
     for raw in samples:
         assert not muse.parse_usage(raw)["available"]
+
+
+def test_usage_integer_fields() -> None:
+    """Preserve over-quota values and skip malformed integer fields."""
+    window = {"usedPercent": 101, "resetsAtMs": 1}
+    result = muse.parse_usage({"usage": {"window": window, "weekly": window}})
+    assert result["available"] is True
+    assert result["five_hour"]["used_percent"] == 101
+    assert result["seven_day"]["used_percent"] == 101
+    for field in ("usedPercent", "resetsAtMs"):
+        for value in (True, False, 1.5):
+            malformed = {**window, field: value}
+            result = muse.parse_usage({
+                "usage": {"window": malformed, "weekly": malformed}
+            })
+            assert result["available"] is False
+            assert result["five_hour"] is None
+            assert result["seven_day"] is None
+    assert not muse.parse_usage({
+        "usage": {"window": {**window, "resetsAtMs": 10**400}}
+    })["available"]
+
+
+def test_usage_reader_availability_route(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reader handshake unavailability is distinct from a usage operation failure."""
+    monkeypatch.setattr(muse, "probe", AsyncMock(return_value=True))
+    host = MagicMock()
+    host.durability = SimpleNamespace(kind="ephemeral")
+    host.initialize_result = {"sandboxAvailability": "unavailable"}
+    host.close = AsyncMock()
+    host.read_usage = AsyncMock(side_effect=RuntimeError("read failed"))
+    monkeypatch.setattr(muse.MuseClient, "spawn", AsyncMock(return_value=host))
+    app = create_app(
+        Settings(api_key="key", workspace_root=tmp_path, muse_enabled=True)
+    )
+    client = TestClient(app)
+    url = "/v1/agents/muse/rate-limits"
+    headers = {"Authorization": "Bearer key"}
+    response = client.get(url, headers=headers)
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Muse is disabled or unavailable"
+    host.read_usage.assert_not_awaited()
+    host.initialize_result = {"sandboxAvailability": "available"}
+    assert client.get(url, headers=headers).status_code == 502
+    host.read_usage.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_queued_query_observes_negative_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A query waiting for a workspace observes a probe's negative cache."""
+    app = create_app(
+        Settings(workspace_root=tmp_path, muse_enabled=True, muse_max_concurrency=1)
+    )
+    started, cleanup, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def probe(_binary: object) -> bool:
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cleanup.set()
+            await release.wait()
+        return True
+
+    monkeypatch.setattr(muse, "probe", probe)
+    monkeypatch.setattr(main, "MUSE_PROBE_TIMEOUT", 0.01)
+    request = MagicMock()
+    request.app = app
+    async with app.state.jobs.workspace(tmp_path):
+        query = asyncio.create_task(
+            main._muse_query(MuseQueryRequest(agent="muse", prompt="x"), request)  # pyright: ignore[reportPrivateUsage]
+        )
+        await asyncio.sleep(0)
+        assert not query.done()
+        assert not await main._muse_available(app)  # pyright: ignore[reportPrivateUsage]
+        await started.wait()
+        await cleanup.wait()
+        assert app.state.muse_semaphore.locked()
+        assert app.state.muse_healthy is False
+    try:
+        with pytest.raises(HTTPException) as exc:
+            await query
+        assert exc.value.status_code == 503
+    finally:
+        release.set()
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if not app.state.muse_semaphore.locked():
+                break
+    assert not app.state.muse_semaphore.locked()
 
 
 def test_muse_unavailable_and_rate_timeout(

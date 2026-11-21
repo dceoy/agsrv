@@ -325,6 +325,13 @@ async def _muse_slot(app: FastAPI) -> AsyncGenerator[_SlotLease, None]:
     """
     semaphore: asyncio.Semaphore = app.state.muse_semaphore
     if semaphore.locked():
+        if not app.state.settings.muse_enabled or (
+            time.monotonic() < app.state.muse_probe_expires
+            and not app.state.muse_healthy
+        ):
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "Muse is disabled or unavailable"
+            )
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS, "agent concurrency limit reached"
         )
@@ -699,6 +706,10 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
             ) from exc
         except HTTPException:
             raise
+        except muse.MuseUnavailableError as exc:
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "Muse is disabled or unavailable"
+            ) from exc
         except Exception as exc:
             raise HTTPException(
                 status.HTTP_502_BAD_GATEWAY, "Muse rate limits failed"

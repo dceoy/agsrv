@@ -27,6 +27,10 @@ SERVE_ARGS: tuple[str, ...] = ("serve", "--no-session-log", "--contributor-mode"
 _active_hosts: set[MuseClient[Any]] = set()
 
 
+class MuseUnavailableError(RuntimeError):
+    """The Muse host cannot provide the required availability guarantees."""
+
+
 def serve_args() -> list[str]:
     """Return fixed serve arguments for the Muse host.
 
@@ -274,11 +278,7 @@ def parse_usage(raw: dict[str, Any]) -> dict[str, Any]:
             if isinstance(item, dict):
                 item = cast("dict[str, Any]", item)
                 percent, reset = item.get("usedPercent"), item.get("resetsAtMs")
-                if (
-                    isinstance(percent, (int, float))
-                    and 0 <= percent <= 100  # ruff: ignore[magic-value-comparison]
-                    and isinstance(reset, (int, float))
-                ):
+                if type(percent) is int and percent >= 0 and type(reset) is int:
                     try:
                         stamp = datetime.fromtimestamp(reset / 1000, UTC).isoformat()
                     except (ValueError, OverflowError, OSError):
@@ -299,13 +299,13 @@ async def read_usage(binary: str | None) -> dict[str, Any]:
         The last-observed usage payload.
 
     Raises:
-        RuntimeError: If the host is unavailable.
+        MuseUnavailableError: If the host is unavailable.
     """
     client = await _spawn(binary, None)
     try:
         if not _is_ephemeral(client) or not _sandbox_available(client):
             msg = "Muse unavailable"
-            raise RuntimeError(msg)
+            raise MuseUnavailableError(msg)
         return dict(await client.read_usage())
     finally:
         await _close(client)
