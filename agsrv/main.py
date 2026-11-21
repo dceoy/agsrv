@@ -812,7 +812,7 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
         dependencies=[Auth],
         response_model=dict[str, Any],
     )
-    async def muse_rate_limits(request: Request) -> dict[str, Any]:
+    async def muse_rate_limits(request: Request) -> dict[str, Any]:  # ruff: ignore[complex-structure]
         settings: Settings = request.app.state.settings
         if not settings.muse_enabled or (
             time.monotonic() < app.state.muse_probe_expires
@@ -821,16 +821,46 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE, "Muse is disabled or unavailable"
             )
-        try:
+        try:  # ruff: ignore[too-many-nested-blocks, too-many-statements-in-try-clause]
             async with asyncio.timeout(settings.max_timeout_seconds):
-                async with _muse_slot(app) as lease:
-                    if not await _muse_available(app, lease=lease):
-                        raise HTTPException(  # ruff: ignore[raise-within-try]
-                            status.HTTP_503_SERVICE_UNAVAILABLE,
-                            "Muse is disabled or unavailable",
-                        )
-                    raw = await _await_muse(muse.read_usage(settings.muse_bin), lease)
-                    return {**muse.parse_usage(raw), "backend": raw}
+                async with app.state.muse_usage_lock:
+                    if time.monotonic() < app.state.muse_usage_expires:
+                        return cast("dict[str, Any]", app.state.muse_usage)
+                    async with _muse_slot(app) as lease:
+                        if not await _muse_available(app, lease=lease):
+                            raise HTTPException(  # ruff: ignore[raise-within-try]
+                                status.HTTP_503_SERVICE_UNAVAILABLE,
+                                "Muse is disabled or unavailable",
+                            )
+
+                        async def refresh() -> None:
+                            was_dispatched = False
+
+                            def dispatched() -> None:
+                                nonlocal was_dispatched
+                                was_dispatched = True
+                                app.state.muse_usage_expires = time.monotonic() + 60
+
+                            try:
+                                raw = await muse.read_usage(
+                                    settings.muse_bin, dispatched
+                                )
+                                app.state.muse_usage = {
+                                    **muse.parse_usage(raw),
+                                    "backend": raw,
+                                }
+                            finally:
+                                if not was_dispatched:
+                                    app.state.muse_usage_expires = 0
+
+                        empty: dict[str, Any] = {}
+                        app.state.muse_usage = {
+                            **muse.parse_usage(empty),
+                            "backend": empty,
+                        }
+                        app.state.muse_usage_expires = float("inf")
+                        await _await_muse(refresh(), lease)
+                        return cast("dict[str, Any]", app.state.muse_usage)
         except TimeoutError as exc:
             raise HTTPException(
                 status.HTTP_504_GATEWAY_TIMEOUT, "Muse rate limits timed out"
@@ -1047,6 +1077,9 @@ def create_app(
     app.state.codex_healthy = False
     app.state.anchors = Anchors(settings)
     app.state.muse_semaphore = asyncio.Semaphore(settings.muse_max_concurrency)
+    app.state.muse_usage_lock = asyncio.Lock()
+    app.state.muse_usage_expires = 0.0
+    app.state.muse_usage = {}
     app.state.muse_probe_lock = asyncio.Lock()
     app.state.muse_probe_expires = 0.0
     app.state.muse_healthy = False
