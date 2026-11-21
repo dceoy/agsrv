@@ -51,7 +51,7 @@ from agsrv.sandbox import (
     service_home,
 )
 from agsrv.schemas import QueryRequest
-from agsrv.security import check_sandbox_request
+from agsrv.security import check_sandbox_cwd, check_sandbox_request
 
 if TYPE_CHECKING:
     from collections.abc import (
@@ -1331,6 +1331,20 @@ def test_sandbox_rejects_shared_cache(sbx: SandboxEnv) -> None:
     ok = {**SANDBOX_BODY, "cwd": "agsrv-sandbox/work"}
     assert client.post("/v1/query", json=ok, headers=AUTH).status_code == 200
     assert runner.stream_calls == 1
+
+
+def test_sandbox_rejects_symlinked_shared_cache(tmp_path: Path) -> None:
+    """Resolve a relocated cache before checking the sandbox cwd."""
+    home = tmp_path / "home"
+    home.mkdir()
+    cache = tmp_path / "workspace" / "cache"
+    (cache / "pip").mkdir(parents=True)
+    (cache / "agsrv-sandbox" / "work").mkdir(parents=True)
+    (home / ".cache").symlink_to(cache)
+    with pytest.raises(HTTPException) as exc_info:
+        check_sandbox_cwd(cache / "pip", home)
+    assert exc_info.value.status_code == 403
+    check_sandbox_cwd(cache / "agsrv-sandbox" / "work", home)
 
 
 def test_sandbox_allows_unrelated_cwd_under_home(sbx: SandboxEnv) -> None:

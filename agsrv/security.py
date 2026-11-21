@@ -149,7 +149,7 @@ def check_sandbox_cwd(cwd: Path, home: Path | None = None) -> None:
             the service home directory is unavailable.
     """
     try:
-        cache = (home or service_home()).resolve() / ".cache"
+        cache = ((home or service_home()) / ".cache").resolve()
     except SandboxSetupError as exc:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE, "sandbox unavailable"
