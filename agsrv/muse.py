@@ -186,8 +186,7 @@ async def run_muse(
     """
     started = time.monotonic()
     client: MuseClient[Any] | None = None
-    run_task: asyncio.Task[Any] | None = None
-    try:  # ruff: ignore[too-many-statements-in-try-clause]
+    try:
         client = await _spawn(binary, cwd)
         if not _is_ephemeral(client):
             msg = "Muse backend requires ephemeral sessions"
@@ -232,10 +231,6 @@ async def run_muse(
                 "outcome": outcome,
             },
         }
-    except asyncio.CancelledError:  # pragma: no cover
-        if run_task is not None and not run_task.done():  # pragma: no cover
-            run_task.cancel()  # pragma: no cover
-        raise
     finally:
         if client is not None:
             with contextlib.suppress(Exception):

@@ -36,10 +36,7 @@ def _request(choices: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
 def test_serve_args_fixed() -> None:
     """Serve args are fixed and safe."""
     args = muse.serve_args()
-    assert args[0] == "serve"
-    assert "--no-session-log" in args
-    assert "--contributor-mode" in args
-    assert "off" in args
+    assert args == ["serve", "--no-session-log", "--contributor-mode", "off"]
     assert "--disable-sandbox" not in args
     assert "--trust-workspace" not in args
     assert muse.APPROVAL_MODE in {"onRequest", "promptUnmatched", "denyUnmatched"}
@@ -616,9 +613,10 @@ async def test_muse_probe_timeout_and_cancel(monkeypatch: pytest.MonkeyPatch) ->
         )
     )
     app.state.muse_probe_expires = 0
-    app.state.muse_probe_expires = 0
+    started.clear()
 
     async def _never(_binary: object) -> bool:
+        started.set()
         await asyncio.sleep(0.2)
         return True
 
@@ -752,5 +750,85 @@ def test_muse_job_success_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
         assert status["status"] == "succeeded"
         assert status["result"]["result"] == "ok"
 
+        await app.state.jobs.stop()
+
     asyncio.run(_run())
-    app.state.jobs.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("newer_cache", [False, True])
+async def test_muse_probe_coalesces_and_cancel_invalidation(
+    monkeypatch: pytest.MonkeyPatch,
+    newer_cache: bool,
+) -> None:
+    """Waiters share a probe and cancelled probes invalidate their cache."""
+    app = create_app(Settings(muse_enabled=True))
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def probe(_binary: object) -> bool:
+        started.set()
+        await release.wait()
+        return True
+
+    monkeypatch.setattr(muse, "probe", probe)
+    first = asyncio.create_task(main._muse_available(app))  # pyright: ignore[reportPrivateUsage]
+    await started.wait()
+    second = asyncio.create_task(main._muse_available(app))  # pyright: ignore[reportPrivateUsage]
+    await asyncio.sleep(0)
+    release.set()
+    assert await first
+    assert await second
+
+    started.clear()
+    release.clear()
+    app.state.muse_probe_expires = 0
+    task = asyncio.create_task(main._muse_available(app))  # pyright: ignore[reportPrivateUsage]
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    if newer_cache:
+        app.state.muse_probe_expires += 30
+    expected = app.state.muse_probe_expires if newer_cache else 0
+    release.set()
+    for _ in range(10):
+        await asyncio.sleep(0)
+    assert app.state.muse_probe_expires == expected
+
+
+@pytest.mark.asyncio
+async def test_muse_disconnect_and_external_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A disconnect returns 499 while external cancellation propagates."""
+    started = asyncio.Event()
+
+    async def query(_body: object, _request: object) -> dict[str, object]:
+        started.set()
+        await asyncio.Event().wait()
+        return {}
+
+    monkeypatch.setattr(main, "_muse_query", query)
+    request = MagicMock()
+    request.is_disconnected = AsyncMock(return_value=True)
+    body = MuseQueryRequest(agent="muse", prompt="hi")
+    response = await main._muse_query_with_disconnect(body, request)  # pyright: ignore[reportPrivateUsage,reportUnknownVariableType]
+    assert response.status_code == 499  # pyright: ignore[reportAttributeAccessIssue,reportUnknownMemberType]
+    request.is_disconnected = AsyncMock(return_value=False)
+    started.clear()
+    task = asyncio.create_task(main._muse_query_with_disconnect(body, request))  # pyright: ignore[reportPrivateUsage]
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
+async def test_disabled_muse_job(tmp_path: Path) -> None:
+    """A disabled Muse backend cannot execute a queued job."""
+    app = create_app(Settings(workspace_root=tmp_path, muse_enabled=False))
+    with pytest.raises(RuntimeError, match="Muse unavailable"):
+        await app.state.jobs._execute(
+            MuseQueryRequest(agent="muse", prompt="hi"), tmp_path
+        )
