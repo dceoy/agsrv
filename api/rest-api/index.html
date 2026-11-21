@@ -117,6 +117,10 @@
               <ul class="nav flex-column">
               </ul>
             </li>
+            <li class="nav-item" data-bs-level="2"><a href="#get-v1agentsclauderate-limits" class="nav-link">GET /v1/agents/claude/rate-limits</a>
+              <ul class="nav flex-column">
+              </ul>
+            </li>
             <li class="nav-item" data-bs-level="2"><a href="#get-v1agentsmuserate-limits" class="nav-link">GET /v1/agents/muse/rate-limits</a>
               <ul class="nav flex-column">
               </ul>
@@ -144,7 +148,7 @@
 <p>All <code>/v1/*</code> endpoints require <code>Authorization: Bearer &lt;AGSRV_API_KEY&gt;</code>.
 FastAPI also serves <code>/docs</code> and <code>/openapi.json</code>.</p>
 <h2 id="statelessness-contract">Statelessness contract<a class="headerlink" href="#statelessness-contract" title="Permanent link">&para;</a></h2>
-<p>Every request is one ephemeral Claude or Codex run. The server keeps no sessions
+<p>Every request is one ephemeral Claude, Codex or Muse run. The server keeps no sessions
 and offers no resume, continue, or fork. The <code>session_id</code> in responses is
 informational only and cannot be sent back: request bodies with unknown fields
 (such as <code>resume</code> or <code>session_id</code>) are rejected with <code>422</code>. To continue work,
@@ -308,11 +312,12 @@ and <code>GET /v1/agents</code> reports unhealthy. <code>include_messages</code>
 parity but no transcript is returned in v1. The backend is disabled by default
 (<code>AGSRV_MUSE_ENABLED=false</code>) and requires a logged-in <code>muse</code> host matching the
 SDK version (<code>muse-code-sdk==1.4.24</code> with <code>muse 1.4.24</code>); upgrade them
-together. <code>POST /v1/query/stream</code> with <code>agent=muse</code> returns 404 like Codex.</p>
+together. There is no streaming variant for any agent; all queries are
+request/response.</p>
 <h2 id="get-v1agents"><code>GET /v1/agents</code><a class="headerlink" href="#get-v1agents" title="Permanent link">&para;</a></h2>
 <p>Returns <code>claude</code>, <code>codex</code> and <code>muse</code> objects with <code>enabled</code>, <code>healthy</code>, <code>default_model</code>,
 and <code>supports</code> flags for <code>sandbox</code>, <code>network_access</code>, <code>rate_limits</code>, and
-<code>streaming</code>. Claude and Codex health probes are cached for approximately 30 seconds. Muse initialization follows the same cached (~30s) durability probe pattern. Claude uses the local <code>/usage</code> command, without consuming tokens or allowance.</p>
+<code>streaming</code>. Claude and Codex health probes are cached for approximately 30 seconds. Muse initialization follows the same cached (~30s) probe pattern, checking ephemeral durability and sandbox availability. Claude uses the local <code>/usage</code> command, without consuming tokens or allowance.</p>
 <p>Claude is <code>healthy</code> when the CLI is spawnable, the ephemeral <code>/usage</code> run does not
 return an error result, and the bundled CLI's <code>auth status</code> reports
 <code>loggedIn: true</code>. The probe never uses the sandbox. This proves a configured,
@@ -321,7 +326,17 @@ still valid server-side (an expired or revoked token can pass until a real turn
 runs). While the Claude concurrency slot is busy, this endpoint returns the last
 cached health value (even if expired) and never responds 429 because of the
 Claude probe. The Codex entry is unaffected: with Codex enabled and its
-concurrency slot busy, this endpoint can still respond 429.</p>
+concurrency slot busy and its cached probe has expired, this endpoint can
+still respond 429. The same applies to the Muse entry when Muse is enabled,
+its slot is busy, and its cached probe has expired.</p>
+<h2 id="get-v1agentsclauderate-limits"><code>GET /v1/agents/claude/rate-limits</code><a class="headerlink" href="#get-v1agentsclauderate-limits" title="Permanent link">&para;</a></h2>
+<p>Runs the local Claude CLI's <code>/usage</code> command and returns the normalized
+rate-limit windows together with the raw text. If the output cannot be
+parsed, <code>available</code> is false. The <code>/usage</code> command consumes no tokens or
+subscription allowance. The route spawns a Claude child process, so it
+receives the same admission, disk-space preflight and per-turn <code>TMPDIR</code>
+handling as a query — unlike the Codex route below, which starts no
+workspace turn.</p>
 <h2 id="get-v1agentsmuserate-limits"><code>GET /v1/agents/muse/rate-limits</code><a class="headerlink" href="#get-v1agentsmuserate-limits" title="Permanent link">&para;</a></h2>
 <p>Returns the host's last-observed subscription usage without a model call or a
 session. <code>five_hour</code> and <code>seven_day</code> contain <code>used_percent</code> and an ISO 8601
@@ -427,7 +442,7 @@ The old SSE stream endpoint is deliberately removed.</p>
 </tr>
 <tr>
 <td>503</td>
-<td><code>AGSRV_API_KEY</code> not configured and unauthenticated access not allowed; sandbox prerequisites unavailable or Claude, Codex or Muse disabled/unavailable</td>
+<td><code>AGSRV_API_KEY</code> not configured and unauthenticated access not allowed; sandbox prerequisites unavailable; Claude, Codex or Muse disabled/unavailable; or the turn could not be prepared — the disk-space preflight found free space on <code>/tmp</code>, the workspace root or the working directory below its threshold; no staging directory is configured for the working directory's mount; the working directory failed acceptance revalidation (a missing component, a symlink, or a substituted directory); or the per-turn directory could not be created (for example an owner-clearing <code>umask</code>, or <code>EXDEV</code>)</td>
 </tr>
 <tr>
 <td>504</td>

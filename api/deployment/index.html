@@ -114,9 +114,19 @@
 
 <h1 id="deployment">Deployment<a class="headerlink" href="#deployment" title="Permanent link">&para;</a></h1>
 <h2 id="local-development">Local development<a class="headerlink" href="#local-development" title="Permanent link">&para;</a></h2>
+<p>Since 0.4.0 the server refuses to start without a staging directory for the
+workspace root's mount (see <code>AGSRV_TMP_STAGING_DIRS</code> in the README), even for
+local development. Provision one outside the workspace root and point the
+setting at it:</p>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>uv<span class="w"> </span>sync
-<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="nv">AGSRV_ALLOW_UNAUTHENTICATED</span><span class="o">=</span><span class="nb">true</span><span class="w"> </span>uv<span class="w"> </span>run<span class="w"> </span>uvicorn<span class="w"> </span>agsrv.main:app<span class="w"> </span>--host<span class="w"> </span><span class="m">127</span>.0.0.1<span class="w"> </span>--port<span class="w"> </span><span class="m">8000</span>
+<a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>mkdir<span class="w"> </span>-p<span class="w"> </span>~/.agsrv-stage<span class="w"> </span><span class="o">&amp;&amp;</span><span class="w"> </span>chmod<span class="w"> </span><span class="m">700</span><span class="w"> </span>~/.agsrv-stage
+<a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="nv">AGSRV_ALLOW_UNAUTHENTICATED</span><span class="o">=</span><span class="nb">true</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="nv">AGSRV_TMP_STAGING_DIRS</span><span class="o">=</span><span class="s2">"</span><span class="nv">$PWD</span><span class="s2">=</span><span class="nv">$HOME</span><span class="s2">/.agsrv-stage"</span><span class="w"> </span><span class="se">\</span>
+<a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="w">  </span>uv<span class="w"> </span>run<span class="w"> </span>uvicorn<span class="w"> </span>agsrv.main:app<span class="w"> </span>--host<span class="w"> </span><span class="m">127</span>.0.0.1<span class="w"> </span>--port<span class="w"> </span><span class="m">8000</span>
 </code></pre></div>
+<p>The key (here <code>$PWD</code>) must contain the workspace root; if you set
+<code>AGSRV_WORKSPACE_ROOT</code> to something else, use that value (or an ancestor of
+it) as the key instead.</p>
 <h2 id="remote-server">Remote server<a class="headerlink" href="#remote-server" title="Permanent link">&para;</a></h2>
 <ol>
 <li>Install dependencies on the server:</li>
@@ -131,12 +141,19 @@
    with <code>claude</code> as the user that runs the service.</p>
 </li>
 <li>
+<p>Provision a staging directory (mandatory since 0.4.0): service-owned,
+   mode <code>0700</code>, outside the workspace root, on the same mount as it — for
+   example <code>install -d -m 700 -o agsrv /var/lib/agsrv/stage</code>. Without it the
+   server fails to start.</p>
+</li>
+<li>
 <p>Create <code>/etc/agsrv.env</code> (mode <code>0600</code>):</p>
 </li>
 </ol>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="nv">AGSRV_API_KEY</span><span class="o">=</span>&lt;long<span class="w"> </span>random<span class="w"> </span>secret,<span class="w"> </span>e.g.<span class="w"> </span>openssl<span class="w"> </span>rand<span class="w"> </span>-hex<span class="w"> </span><span class="m">32</span>&gt;
 <a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="nv">AGSRV_WORKSPACE_ROOT</span><span class="o">=</span>/srv/workspaces
-<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="nv">ANTHROPIC_API_KEY</span><span class="o">=</span>sk-ant-...
+<a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="nv">AGSRV_TMP_STAGING_DIRS</span><span class="o">=</span>/srv/workspaces<span class="o">=</span>/var/lib/agsrv/stage
+<a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="nv">ANTHROPIC_API_KEY</span><span class="o">=</span>sk-ant-...
 </code></pre></div>
 <ol>
 <li>
@@ -145,7 +162,8 @@
    tunnel (<code>ssh -L 8000:127.0.0.1:8000 server</code>).</p>
 </li>
 <li>
-<p>Run it as an unprivileged user that owns only the workspace directory.
+<p>Run it as an unprivileged user that owns only the workspace directory (and
+   the staging directory above).
    Workspace confinement limits the starting <code>cwd</code>, not what <code>Bash</code> can reach.
    The agent inherits this environment file, so a run can read
    <code>AGSRV_API_KEY</code> and <code>ANTHROPIC_API_KEY</code> from its own environment — the
