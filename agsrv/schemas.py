@@ -80,6 +80,34 @@ class CodexQueryResponse(BaseModel):
     backend: dict[str, Any]
 
 
+class MuseQueryRequest(BaseModel):
+    """One ephemeral Muse run."""
+
+    model_config = ConfigDict(extra="forbid")
+    agent: Literal["muse"]
+    prompt: str = Field(min_length=1)
+    model: str | None = None
+    effort: (
+        Literal["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+        | None
+    ) = None
+    cwd: str | None = None
+    timeout_seconds: float | None = Field(default=None, gt=0)
+    include_messages: bool = True
+
+
+class MuseQueryResponse(BaseModel):
+    """Final Muse result and backend metadata."""
+
+    agent: Literal["muse"]
+    result: str | None
+    model: str | None
+    is_error: bool
+    duration_ms: int
+    usage: dict[str, Any] | None
+    backend: dict[str, Any]
+
+
 class InfoResponse(BaseModel):
     """Server capabilities and defaults."""
 

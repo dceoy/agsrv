@@ -114,6 +114,10 @@ class Settings:
         codex_bin: Optional path to the Codex executable.
         codex_enabled: Whether Codex execution is enabled.
         codex_max_concurrency: Maximum number of simultaneous Codex runs.
+        muse_bin: Optional path to the Muse executable.
+        muse_enabled: Whether Muse execution is enabled.
+        muse_max_concurrency: Maximum number of simultaneous Muse runs.
+        muse_model: Default model for Muse runs.
         jobs_db_path: Durable SQLite WAL database (single worker).
         jobs_max_pending: Maximum queued and running jobs.
         jobs_retention_seconds: Retention for completed jobs and deduplication keys.
@@ -137,6 +141,10 @@ class Settings:
     codex_bin: str | None = None
     codex_enabled: bool = True
     codex_max_concurrency: int = 2
+    muse_bin: str | None = None
+    muse_enabled: bool = False
+    muse_max_concurrency: int = 2
+    muse_model: str | None = None
     jobs_db_path: Path = field(
         default_factory=lambda: Path.home() / ".local/state/agsrv/jobs.sqlite3"
     )
@@ -198,6 +206,10 @@ class Settings:
             codex_max_concurrency=int(
                 os.environ.get("AGSRV_CODEX_MAX_CONCURRENCY", "2")
             ),
+            muse_bin=os.environ.get("AGSRV_MUSE_BIN"),
+            muse_enabled=_env_bool("AGSRV_MUSE_ENABLED", default=False),
+            muse_max_concurrency=int(os.environ.get("AGSRV_MUSE_MAX_CONCURRENCY", "2")),
+            muse_model=os.environ.get("AGSRV_MUSE_MODEL"),
             jobs_db_path=Path(
                 os.environ.get(
                     "AGSRV_JOBS_DB_PATH",

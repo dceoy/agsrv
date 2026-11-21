@@ -808,7 +808,7 @@ def test_metadata_capacity_timeout_and_schema(
         "responses"
     ]["200"]["content"]["application/json"]["schema"]
     assert schema["discriminator"]["propertyName"] == "agent"
-    assert len(schema["oneOf"]) == 2
+    assert len(schema["oneOf"]) == 3
 
 
 def test_start_with_busy_default_executor(tmp_path: Path) -> None:

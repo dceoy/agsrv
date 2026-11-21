@@ -15,7 +15,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.requests import Request
 
-from agsrv import main
+from agsrv import main, muse
 from agsrv.claude import build_options
 from agsrv.config import Settings
 from agsrv.main import create_app
@@ -568,3 +568,76 @@ def test_cheap_validation_precedes_admission(
     good = client.post("/v1/query", headers=AUTH, json=CLAUDE)
     assert good.status_code == 503  # a valid request still reaches admission
     admit.assert_called_once()
+
+
+MUSE = {"agent": "muse", "prompt": "test"}
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/query", "/v1/jobs"])
+def test_muse_payload_tmpdir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, endpoint: str
+) -> None:
+    """Muse runs receive the canonical turn directory, removed afterwards."""
+    received: list[str] = []
+
+    async def run(**kwargs: Any) -> dict[str, Any]:  # ruff: ignore[any-type, unused-async]
+        received.append(kwargs["tmpdir"])
+        assert Path(kwargs["tmpdir"]).is_dir()  # ruff: ignore[blocking-path-method-in-async-function]
+        return {
+            "agent": "muse",
+            "result": "ok",
+            "model": None,
+            "is_error": False,
+            "duration_ms": 1,
+            "usage": None,
+            "backend": {},
+        }
+
+    monkeypatch.setattr(muse, "probe", AsyncMock(return_value=True))
+    monkeypatch.setattr(muse, "run_muse", run)
+    app = create_app(_settings(tmp_path, muse_enabled=True))
+    with TestClient(app) as client:
+        response = client.post(endpoint, headers=AUTH, json=MUSE)
+        if endpoint == "/v1/jobs":
+            assert _wait(client, response.json()["job_id"])["status"] == "succeeded"
+        else:
+            assert response.status_code == 200
+        assert Path(received[0]).parent == tmp_path
+        _clean(app, tmp_path)
+
+
+@pytest.mark.parametrize("endpoint", ["/v1/query", "/v1/jobs"])
+def test_muse_rejects_low_space(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, endpoint: str
+) -> None:
+    """Muse is preflighted like the other agents and starts nothing."""
+    monkeypatch.setattr(os, "statvfs", statvfs_stub(lambda: 1))
+    monkeypatch.setattr(os, "fstatvfs", statvfs_stub(lambda: 1000))
+    run = AsyncMock()
+    monkeypatch.setattr(muse, "probe", AsyncMock(return_value=True))
+    monkeypatch.setattr(muse, "run_muse", run)
+    app = create_app(_settings(tmp_path, muse_enabled=True, tmp_min_free_bytes=100))
+    with TestClient(app) as client:
+        response = client.post(endpoint, headers=AUTH, json=MUSE)
+        assert response.status_code == 503
+        assert "1 bytes free" in response.json()["detail"]
+        run.assert_not_awaited()
+        _clean(app, tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_muse_spawn_exports_tmpdir(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The host child gets TMPDIR only when a turn directory is supplied."""
+    seen: list[Any] = []
+    client = MagicMock()
+    client.close = AsyncMock()
+
+    async def spawn(options: Any) -> MagicMock:  # ruff: ignore[any-type, unused-async]
+        seen.append(options.env)
+        return client
+
+    monkeypatch.setattr(muse.MuseClient, "spawn", spawn)
+    await muse._close(await muse._spawn(None, None, "/w/t"))  # pyright: ignore[reportPrivateUsage]
+    await muse._close(await muse._spawn(None, None))  # pyright: ignore[reportPrivateUsage]
+    assert seen[0]["TMPDIR"] == "/w/t"
+    assert seen[1] is None

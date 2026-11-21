@@ -178,11 +178,30 @@ Set `AGSRV_CODEX_ENABLED` (default `true`), `AGSRV_CODEX_BIN` (optional SDK
 binary override), and `AGSRV_CODEX_MAX_CONCURRENCY` (default `2`). A disabled
 or unavailable backend returns 503 without affecting Claude.
 
+### Muse requests
+
+```json
+{ "agent": "muse", "prompt": "Summarize this project", "cwd": ".",
+  "model": null, "effort": "high", "timeout_seconds": 300,
+  "include_messages": false }
+```
+
+`effort` is one of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`,
+`ultra`. Muse uses `muse serve --no-session-log --contributor-mode off` with a
+fixed sandbox posture (never `--disable-sandbox` or `--trust-workspace`), a
+deny-all `on_approval` handler and approval mode `onRequest`. Sessions are
+memory-only; if `client.durability` is not ephemeral the backend fails closed
+and `GET /v1/agents` reports unhealthy. `include_messages` is accepted for
+parity but no transcript is returned in v1. The backend is disabled by default
+(`AGSRV_MUSE_ENABLED=false`) and requires a logged-in `muse` host matching the
+SDK version (`muse-code-sdk==1.4.24` with `muse 1.4.24`); upgrade them
+together. `POST /v1/query/stream` with `agent=muse` returns 404 like Codex.
+
 ## `GET /v1/agents`
 
-Returns `claude` and `codex` objects with `enabled`, `healthy`, `default_model`,
+Returns `claude`, `codex` and `muse` objects with `enabled`, `healthy`, `default_model`,
 and `supports` flags for `sandbox`, `network_access`, `rate_limits`, and
-`streaming`. Claude and Codex health probes are cached for approximately 30 seconds. Claude uses the local `/usage` command, without consuming tokens or allowance.
+`streaming`. Claude and Codex health probes are cached for approximately 30 seconds. Muse initialization follows the same cached (~30s) durability probe pattern. Claude uses the local `/usage` command, without consuming tokens or allowance.
 
 Claude is `healthy` when the CLI is spawnable, the ephemeral `/usage` run does not
 return an error result, and the bundled CLI's `auth status` reports
@@ -194,6 +213,15 @@ cached health value (even if expired) and never responds 429 because of the
 Claude probe. The Codex entry is unaffected: with Codex enabled and its
 concurrency slot busy, this endpoint can still respond 429.
 
+## `GET /v1/agents/muse/rate-limits`
+
+Returns the host's last-observed subscription usage without a model call or a
+session. `five_hour` and `seven_day` contain `used_percent` and an ISO 8601
+`resets_at`, or null when unavailable. `raw` and `backend` preserve the SDK
+payload; `fetched_at` is the read time. A fresh host may have no cached usage,
+in which case `available` is false. Disabled or unavailable Muse returns 503;
+backend failures return 502 and timeouts return 504.
+
 ## `GET /v1/agents/codex/rate-limits`
 
 Returns `plan`, `primary` and `secondary` windows (`used_percent` and
@@ -202,7 +230,7 @@ Returns `plan`, `primary` and `secondary` windows (`used_percent` and
 
 ## Durable asynchronous jobs
 
-`POST /v1/jobs` accepts the same discriminated Claude/Codex JSON body as
+`POST /v1/jobs` accepts the same discriminated Claude/Codex/Muse JSON body as
 `/v1/query`. Unlike synchronous queries, the server owns execution after the
 202 response and continues across HTTP disconnects. Example:
 
@@ -224,7 +252,7 @@ record expires, key reuse can create a new job.
 `GET /v1/jobs/{job_id}` returns `job_id`, `agent`, `status`,
 `created_at`, `started_at`, `finished_at`, `result`, and `error`.
 Statuses are `queued`, `running`, `succeeded`, `failed`, `cancelled`,
-or `interrupted`. `result` contains the normalized Claude or Codex response
+or `interrupted`. `result` contains the normalized Claude, Codex or Muse response
 only on completion. Agent-level errors become `failed` with a retained result;
 transport failures and deadlines have sanitized `error.code` values.
 `POST /v1/jobs/{job_id}/cancel` is idempotent: queued jobs stop immediately,
@@ -268,7 +296,7 @@ The old SSE stream endpoint is deliberately removed.
 | 422    | Invalid body (empty prompt, unknown/stateful fields, bad ranges)       |
 | 429    | Concurrency or pending-job capacity reached (jobs include Retry-After) |
 | 502    | SDK/CLI failure, or the run ended without a result message             |
-| 503    | `AGSRV_API_KEY` not configured and unauthenticated access not allowed; sandbox prerequisites unavailable or Claude or Codex disabled/unavailable |
+| 503    | `AGSRV_API_KEY` not configured and unauthenticated access not allowed; sandbox prerequisites unavailable or Claude, Codex or Muse disabled/unavailable |
 | 504    | Run exceeded its timeout                                               |
 
 Errors use FastAPI's `{"detail": "..."}` body.
