@@ -20,7 +20,7 @@ from uuid import uuid4
 
 from fastapi import HTTPException, status
 
-from agsrv import codex_agent, muse_agent
+from agsrv import codex_agent, muse
 from agsrv.agent import AgentExecutionError, build_options, collect_result
 from agsrv.sandbox import SandboxSetupError, service_home
 from agsrv.schemas import CodexQueryRequest, MuseQueryRequest, QueryRequest
@@ -463,7 +463,7 @@ class JobManager:
             msg = "Muse unavailable"
             raise RuntimeError(msg)
         async with self.app.state.muse_semaphore:  # pragma: no cover
-            return await muse_agent.run_muse(  # pragma: no cover
+            return await muse.run_muse(  # pragma: no cover
                 prompt=body.prompt,
                 cwd=str(cwd),
                 model=body.model or settings.muse_model,

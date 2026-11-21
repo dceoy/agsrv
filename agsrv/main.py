@@ -12,7 +12,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import Response
 from pydantic import Field
 
-from agsrv import codex_agent, muse_agent
+from agsrv import codex_agent, muse
 from agsrv.agent import (
     AgentExecutionError,
     AgentRunner,
@@ -363,7 +363,7 @@ async def _timed_muse_probe(app: FastAPI, lease: _SlotLease) -> bool:
     Raises:
         asyncio.CancelledError: If the caller is cancelled.
     """
-    task = asyncio.create_task(muse_agent.probe(app.state.settings.muse_bin))
+    task = asyncio.create_task(muse.probe(app.state.settings.muse_bin))
     try:
         done, _ = await asyncio.wait({task}, timeout=MUSE_PROBE_TIMEOUT)
     except asyncio.CancelledError:
@@ -435,7 +435,7 @@ async def _muse_query(body: MuseQueryRequest, request: Request) -> dict[str, Any
 
     async def execute() -> dict[str, Any]:
         async with request.app.state.jobs.workspace(cwd):
-            return await muse_agent.run_muse(
+            return await muse.run_muse(
                 prompt=body.prompt,
                 cwd=str(cwd),
                 model=body.model or settings.muse_model,
@@ -686,7 +686,7 @@ async def _lifespan(app: FastAPI) -> AsyncGenerator[None]:
     try:
         yield
     finally:
-        await muse_agent.shutdown()
+        await muse.shutdown()
         await app.state.jobs.stop()
 
 
