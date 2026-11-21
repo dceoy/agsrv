@@ -167,7 +167,7 @@ workspace and ordinary CLI bookkeeping under <code>~/.claude</code>.</p>
 </code></pre></div>
 <h2 id="get-v1info"><code>GET /v1/info</code><a class="headerlink" href="#get-v1info" title="Permanent link">&para;</a></h2>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="p">{</span>
-<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="s2">"0.4.0"</span><span class="p">,</span>
+<a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span><span class="nt">"version"</span><span class="p">:</span><span class="w"> </span><span class="s2">"0.5.0"</span><span class="p">,</span>
 <a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">  </span><span class="nt">"stateless"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="p">,</span>
 <a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">  </span><span class="nt">"default_model"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span>
 <a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="w">  </span><span class="nt">"workspace_root"</span><span class="p">:</span><span class="w"> </span><span class="s2">"/srv/workspaces"</span><span class="p">,</span>
@@ -301,12 +301,24 @@ or unavailable backend returns 503 without affecting Claude.</p>
 <h3 id="muse-requests">Muse requests<a class="headerlink" href="#muse-requests" title="Permanent link">&para;</a></h3>
 <div class="highlight"><pre><span></span><code><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="p">{</span><span class="w"> </span><span class="nt">"agent"</span><span class="p">:</span><span class="w"> </span><span class="s2">"muse"</span><span class="p">,</span><span class="w"> </span><span class="nt">"prompt"</span><span class="p">:</span><span class="w"> </span><span class="s2">"Summarize this project"</span><span class="p">,</span><span class="w"> </span><span class="nt">"cwd"</span><span class="p">:</span><span class="w"> </span><span class="s2">"."</span><span class="p">,</span>
 <a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="w">  </span><span class="nt">"model"</span><span class="p">:</span><span class="w"> </span><span class="kc">null</span><span class="p">,</span><span class="w"> </span><span class="nt">"effort"</span><span class="p">:</span><span class="w"> </span><span class="s2">"high"</span><span class="p">,</span><span class="w"> </span><span class="nt">"timeout_seconds"</span><span class="p">:</span><span class="w"> </span><span class="mi">300</span><span class="p">,</span>
-<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">  </span><span class="nt">"include_messages"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="w"> </span><span class="p">}</span>
+<a id="__codelineno-5-3" name="__codelineno-5-3" href="#__codelineno-5-3"></a><span class="w">  </span><span class="nt">"include_messages"</span><span class="p">:</span><span class="w"> </span><span class="kc">false</span><span class="p">,</span><span class="w"> </span><span class="nt">"sandbox"</span><span class="p">:</span><span class="w"> </span><span class="kc">true</span><span class="w"> </span><span class="p">}</span>
 </code></pre></div>
 <p><code>effort</code> is one of <code>none</code>, <code>minimal</code>, <code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code>, <code>max</code>,
-<code>ultra</code>. Muse uses <code>muse serve --no-session-log --contributor-mode off</code> with a
-fixed sandbox posture (never <code>--disable-sandbox</code> or <code>--trust-workspace</code>), a
-deny-all <code>on_approval</code> handler and approval mode <code>onRequest</code>. Sessions are
+<code>ultra</code>. Muse uses <code>muse serve --no-session-log --contributor-mode off</code>, a
+deny-all <code>on_approval</code> handler and approval mode <code>onRequest</code> (never
+<code>--trust-workspace</code>).</p>
+<p><code>sandbox</code> (boolean, default <code>true</code>) applies to both <code>POST /v1/query</code> and
+<code>POST /v1/jobs</code>. An explicit opt-out is the only way to disable the sandbox:
+that turn's <code>muse serve</code> host is spawned with <code>--disable-sandbox</code> and the
+sandbox availability check is skipped for that turn. Omitting the field or
+sending <code>true</code> keeps the sandboxed posture and the fail-closed availability
+check. <code>false</code> (or any value Pydantic's boolean parsing accepts as false, such
+as <code>"false"</code>, <code>"0"</code>, <code>"no"</code>, <code>"off"</code> or <code>0</code>) opts out for that turn; other
+non-boolean values, including <code>null</code> and strings such as <code>"maybe"</code>, are
+rejected with 422. The opt-out is per request; there is no server-wide
+setting or separate control endpoint, and the health probe and
+<code>GET /v1/agents/muse/rate-limits</code> always use the sandboxed posture. The
+effective value is recorded as <code>backend.sandbox</code> in the response. Sessions are
 memory-only; if <code>client.durability</code> is not ephemeral the backend fails closed
 and <code>GET /v1/agents</code> reports unhealthy. <code>include_messages</code> is accepted for
 parity but no transcript is returned in v1. The backend is disabled by default
@@ -317,7 +329,9 @@ request/response.</p>
 <h2 id="get-v1agents"><code>GET /v1/agents</code><a class="headerlink" href="#get-v1agents" title="Permanent link">&para;</a></h2>
 <p>Returns <code>claude</code>, <code>codex</code> and <code>muse</code> objects with <code>enabled</code>, <code>healthy</code>, <code>default_model</code>,
 and <code>supports</code> flags for <code>sandbox</code>, <code>network_access</code>, <code>rate_limits</code>, and
-<code>streaming</code>. Claude and Codex health probes are cached for approximately 30 seconds. Muse initialization follows the same cached (~30s) probe pattern, checking ephemeral durability and sandbox availability. Claude uses the local <code>/usage</code> command, without consuming tokens or allowance.</p>
+<code>streaming</code>. For Muse, <code>supports.sandbox</code> means the backend honours the
+per-request <code>sandbox</code> field (sandboxed by default, opt-out with <code>false</code>); it
+does not mean every turn is sandboxed. Claude and Codex health probes are cached for approximately 30 seconds. Muse initialization follows the same cached (~30s) probe pattern, checking ephemeral durability and sandbox availability. Claude uses the local <code>/usage</code> command, without consuming tokens or allowance.</p>
 <p>Claude is <code>healthy</code> when the CLI is spawnable, the ephemeral <code>/usage</code> run does not
 return an error result, and the bundled CLI's <code>auth status</code> reports
 <code>loggedIn: true</code>. The probe never uses the sandbox. This proves a configured,
