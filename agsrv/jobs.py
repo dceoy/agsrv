@@ -433,7 +433,15 @@ class JobManager:
     ) -> dict[str, Any]:
         settings: Settings = self.app.state.settings
         if isinstance(body, QueryRequest):
-            async with self.app.state.semaphore:
+            from agsrv.main import _claude_available, _SlotLease  # pyright: ignore[reportPrivateUsage]  # ruff: ignore[import-outside-top-level]
+
+            semaphore: asyncio.Semaphore = self.app.state.semaphore
+            await semaphore.acquire()
+            lease = _SlotLease(semaphore)
+            try:
+                if not await _claude_available(self.app, lease=lease):
+                    msg = "Claude unavailable"
+                    raise RuntimeError(msg)
                 home = service_home() if body.sandbox else None
                 options = build_options(body, settings, cwd, home)
                 runner = self.app.state.runner
@@ -445,6 +453,9 @@ class JobManager:
                         messages, include_messages=body.include_messages
                     )
                 return result.model_dump(mode="json")
+            finally:
+                if not lease.claimed:
+                    lease.release()
         if isinstance(body, CodexQueryRequest):
             if not settings.codex_enabled:
                 msg = "Codex unavailable"

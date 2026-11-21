@@ -224,3 +224,15 @@ Dependency versions are tracked in the committed `uv.lock`.
 AGPL-3.0-only. See [LICENSE](LICENSE).
 
 Muse rate limits use the host’s `usage/read` cache without a model turn or subscription allowance. A fresh host may have no observation; in that case `available` is false.
+
+Agent health is measured using cached availability probes (approximately 30 seconds).
+Claude uses its local `/usage` command without consuming tokens or allowance.
+Claude is healthy when the CLI is spawnable, the ephemeral `/usage` run does not
+return an error result, and the bundled CLI's `auth status` reports
+`loggedIn: true`. This proves a configured, spawnable CLI whose `/usage` run
+succeeds; it does not prove the credential is still valid server-side (an
+expired or revoked token can pass until a real turn runs). `GET /v1/agents`
+never returns 429 because of the Claude probe: while the Claude slot is busy it
+returns the last cached health value. (With Codex enabled and its slot busy,
+the Codex entry can still return 429.)
+Queries return 503 when the selected agent is unavailable.
