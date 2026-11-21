@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
+from muse_code.facade.approval import ApprovalRouter
+from muse_code.facade.turn_handle import _Completed, _TerminalUnknown, _Unqueued  # pyright: ignore[reportPrivateUsage]
 
 from agsrv import main, muse
 from agsrv.config import Settings
@@ -16,6 +20,9 @@ from agsrv.main import (
     create_app,
 )
 from agsrv.schemas import MuseQueryRequest
+
+if TYPE_CHECKING:
+    from muse_code import MuseClientSpawnOptions
 
 
 def _choice(choice_id: str, decision: str) -> dict[str, str]:
@@ -58,8 +65,8 @@ def test_deny_approval_label_fallback() -> None:
     req: dict[str, list[dict[str, str]]] = _request([
         {"choiceId": "x", "decision": "approved", "label": "Deny it", "scope": "once"},
     ])
-    decision = muse.deny_approval(req)  # pyright: ignore[reportArgumentType,reportUnknownArgumentType,reportUnknownVariableType]
-    assert decision.choice_id == "x"
+    with pytest.raises(RuntimeError):
+        muse.deny_approval(req)  # pyright: ignore[reportArgumentType]
 
 
 def test_deny_approval_raises_without_denied() -> None:
@@ -117,9 +124,15 @@ def test_usage_to_dict() -> None:
 
 def test_outcome_str() -> None:
     """Outcome coercion handles enums and strings."""
-    assert muse._outcome_str(SimpleNamespace(value="Completed")) == "completed"  # pyright: ignore[reportPrivateUsage]
-    assert muse._outcome_str(SimpleNamespace(name="FAILED")) == "failed"  # pyright: ignore[reportPrivateUsage]
-    assert muse._outcome_str("cancelled") == "cancelled"  # pyright: ignore[reportPrivateUsage]
+    assert (
+        muse._outcome_str(  # pyright: ignore[reportPrivateUsage]
+            _Completed(params={"terminal": "completed"}, observed_start=True)  # pyright: ignore[reportArgumentType]
+        )
+        == "completed"
+    )  # pyright: ignore[reportPrivateUsage,reportArgumentType]
+    assert muse._outcome_str(_Unqueued(params={})) == "unqueued"  # pyright: ignore[reportPrivateUsage,reportArgumentType]
+    assert muse._outcome_str(_TerminalUnknown()) == "terminalUnknown"  # pyright: ignore[reportPrivateUsage]
+    assert muse._outcome_str(SimpleNamespace(kind="other")) == "unknown"  # pyright: ignore[reportPrivateUsage]
 
 
 @pytest.mark.asyncio
@@ -131,6 +144,7 @@ async def test_probe_success_and_failure(monkeypatch: pytest.MonkeyPatch) -> Non
 
         def __init__(self, kind: str) -> None:
             self._kind = kind
+            self.initialize_result = {"sandboxAvailability": "available"}
 
         @property
         def durability(self) -> SimpleNamespace:
@@ -141,7 +155,13 @@ async def test_probe_success_and_failure(monkeypatch: pytest.MonkeyPatch) -> Non
             """Close stub."""
             return None
 
-    async def _spawn_ephemeral_async(_: object) -> FakeClient:  # pyright: ignore[reportUnusedFunction]
+    async def _spawn_ephemeral_async(options: MuseClientSpawnOptions) -> FakeClient:  # pyright: ignore[reportUnusedFunction]
+        assert options.args == [
+            "serve",
+            "--no-session-log",
+            "--contributor-mode",
+            "off",
+        ]  # pyright: ignore[reportAttributeAccessIssue,reportUnknownMemberType]
         await asyncio.sleep(0)
         return FakeClient("ephemeral")
 
@@ -166,7 +186,7 @@ async def test_probe_success_and_failure(monkeypatch: pytest.MonkeyPatch) -> Non
 async def test_run_completed(monkeypatch: pytest.MonkeyPatch) -> None:
     """Completed turn maps to success response."""
     result = SimpleNamespace(
-        outcome="completed",
+        outcome=_Completed(params={"terminal": "completed"}, observed_start=True),  # pyright: ignore[reportArgumentType]
         final_text="done",
         turn_id="t1",
         usage={"input_tokens": 1, "output_tokens": 2},
@@ -178,7 +198,13 @@ async def test_run_completed(monkeypatch: pytest.MonkeyPatch) -> None:
     client.start_session = AsyncMock(return_value=session)
     client.close = AsyncMock()
 
-    async def _spawn(_: object) -> MagicMock:
+    async def _spawn(options: MuseClientSpawnOptions) -> MagicMock:
+        assert options.args == [
+            "serve",
+            "--no-session-log",
+            "--contributor-mode",
+            "off",
+        ]  # pyright: ignore[reportAttributeAccessIssue,reportUnknownMemberType]
         await asyncio.sleep(0)
         return client
 
@@ -207,7 +233,7 @@ async def test_run_terminal_errors_are_is_error(
 ) -> None:
     """Failed or cancelled turns map to is_error."""
     result = SimpleNamespace(
-        outcome=outcome,
+        outcome=_Completed(params={"terminal": outcome}, observed_start=True),  # pyright: ignore[reportArgumentType]
         final_text="partial",
         turn_id="t2",
         usage=None,
@@ -353,7 +379,7 @@ def test_endpoints(tmp_path: object, monkeypatch: pytest.MonkeyPatch) -> None:
     assert agents["muse"]["supports"] == {
         "sandbox": True,
         "network_access": True,
-        "rate_limits": False,
+        "rate_limits": True,
         "streaming": False,
     }
     probe.assert_awaited()
@@ -435,14 +461,16 @@ def test_deny_extra_branches() -> None:
             },
         ]
     }
-    assert muse.deny_approval(req).choice_id == "denied-opt"  # pyright: ignore[reportArgumentType]
+    with pytest.raises(RuntimeError):
+        muse.deny_approval(req)  # pyright: ignore[reportArgumentType]
     req2 = {
         "availableChoices": [
             {"choiceId": "a", "decision": "approved", "label": "a", "scope": "once"},
             {"choiceId": "b", "decision": "timedOut", "label": "b", "scope": "once"},
         ]
     }
-    assert muse.deny_approval(req2).choice_id == "b"  # pyright: ignore[reportArgumentType]
+    with pytest.raises(RuntimeError):
+        muse.deny_approval(req2)  # pyright: ignore[reportArgumentType]
 
 
 def test_stderr_and_client_info() -> None:
@@ -450,38 +478,36 @@ def test_stderr_and_client_info() -> None:
     muse._on_stderr("test")  # pyright: ignore[reportPrivateUsage]
 
 
-def test_on_error_via_capture(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Capture approval error handler from run."""
-    result = SimpleNamespace(
-        outcome="completed", final_text="ok", turn_id="t", usage=None
-    )
+@pytest.mark.asyncio
+async def test_approval_failure_through_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An SDK-reported approval failure terminates the waiting run."""
+    router = ApprovalRouter("s", None)
+    session = MagicMock()
+    session.on_approval = router.on_approval
+    session.on_approval_error = router.on_approval_error
+
+    async def run(*args: object, **kwargs: object) -> None:
+        _ = (args, kwargs)
+        router.requested({
+            "approvalId": "a",
+            "currentRequirementId": {"approvalId": "a", "sourceIndex": 0},
+            "availableChoices": [],
+        })  # pyright: ignore[reportArgumentType]
+        await asyncio.Event().wait()
+
+    session.run = run
     client = MagicMock()
     client.durability = SimpleNamespace(kind="ephemeral")
-    session = MagicMock()
-    session.run = AsyncMock(return_value=result)
-    captured = {}
-
-    def _cap(handler: object) -> None:
-        captured["h"] = handler
-
-    session.on_approval = MagicMock()
-    session.on_approval_error = _cap
     client.start_session = AsyncMock(return_value=session)
     client.close = AsyncMock()
-
-    async def _spawn(_: object) -> MagicMock:
-        await asyncio.sleep(0)
-        return client
-
-    monkeypatch.setattr(muse.MuseClient, "spawn", _spawn)
-    asyncio.run(
-        muse.run_muse(
-            prompt="hi", cwd="/workspace", model=None, effort=None, binary=None
+    monkeypatch.setattr(muse.MuseClient, "spawn", AsyncMock(return_value=client))
+    with pytest.raises(RuntimeError, match="approval failed"):
+        await asyncio.wait_for(
+            muse.run_muse(
+                prompt="hi", cwd="/workspace", model=None, effort=None, binary=None
+            ),
+            1,
         )
-    )
-    assert "h" in captured
-    with pytest.raises(RuntimeError):
-        captured["h"](ValueError("boom"))
 
 
 def test_muse_probe_slot_429(tmp_path: object, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -825,10 +851,208 @@ async def test_muse_disconnect_and_external_cancellation(
 
 
 @pytest.mark.asyncio
-async def test_disabled_muse_job(tmp_path: Path) -> None:
-    """A disabled Muse backend cannot execute a queued job."""
-    app = create_app(Settings(workspace_root=tmp_path, muse_enabled=False))
-    with pytest.raises(RuntimeError, match="Muse unavailable"):
-        await app.state.jobs._execute(
-            MuseQueryRequest(agent="muse", prompt="hi"), tmp_path
+async def test_disabled_muse_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Disabled jobs persist failure and release the shared workspace."""
+    app = create_app(
+        Settings(
+            workspace_root=tmp_path,
+            muse_enabled=False,
+            jobs_db_path=tmp_path / "jobs.db",
         )
+    )
+    manager = app.state.jobs
+    manager.start()
+    body = MuseQueryRequest(agent="muse", prompt="hi")
+    job = manager.submit(body, "Bearer key", None)
+    await manager.tasks[job["job_id"]]
+    result = manager.get(job["job_id"], "Bearer key")
+    assert result["status"] == "failed"
+    assert result["error"]["code"] == "execution_failed"
+    app.state.settings = replace(app.state.settings, muse_enabled=True)
+    monkeypatch.setattr(muse, "run_muse", AsyncMock(return_value={"is_error": False}))
+    job2 = manager.submit(body, "Bearer key", None)
+    await asyncio.wait_for(manager.tasks[job2["job_id"]], 1)
+    assert manager.get(job2["job_id"], "Bearer key")["status"] == "succeeded"
+    await manager.stop()
+
+
+def test_muse_rate_limits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Usage endpoint reads cached windows and handles missing data and errors."""
+    monkeypatch.setattr(muse, "probe", AsyncMock(return_value=True))
+    raw = {
+        "usage": {
+            "observedAtMs": 1700000000000,
+            "tier": "pro",
+            "window": {
+                "usedPercent": 30,
+                "resetsAtMs": 1700000000000,
+                "windowDurationMins": 300,
+            },
+            "weekly": {"usedPercent": 50, "resetsAtMs": 1700000000000},
+        }
+    }
+    read = AsyncMock(return_value=raw)
+    monkeypatch.setattr(muse, "read_usage", read)
+    app = create_app(
+        Settings(api_key="key", workspace_root=tmp_path, muse_enabled=True)
+    )
+    client = TestClient(app)
+    headers = {"Authorization": "Bearer key"}
+    url = "/v1/agents/muse/rate-limits"
+    response = client.get(url, headers=headers)
+    assert response.status_code == 200
+    assert response.json()["five_hour"]["used_percent"] == 30
+    assert response.json()["seven_day"]["used_percent"] == 50
+    assert response.json()["raw"] == raw
+    read.return_value = {}
+    assert client.get(url, headers=headers).json()["available"] is False
+    read.side_effect = RuntimeError("error")
+    assert client.get(url, headers=headers).status_code == 502
+    app.state.settings = replace(app.state.settings, muse_enabled=False)
+    assert client.get(url, headers=headers).status_code == 503
+    app.state.settings = replace(app.state.settings, muse_enabled=True)
+    app.state.muse_healthy = False
+    assert client.get(url, headers=headers).status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_muse_cleanup_and_unresponsive_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closing owns cleanup across cancellation, including a stuck turn."""
+    client = MagicMock()
+    client.durability = SimpleNamespace(kind="ephemeral")
+    client.initialize_result = {"sandboxAvailability": "available"}
+    closing, release, started = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def close() -> None:
+        closing.set()
+        await release.wait()
+
+    async def run(*args: object, **kwargs: object) -> None:
+        _ = (args, kwargs)
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await release.wait()
+
+    session = MagicMock()
+    session.run = run
+    client.start_session = AsyncMock(return_value=session)
+    client.close = close
+    monkeypatch.setattr(muse.MuseClient, "spawn", AsyncMock(return_value=client))
+    task = asyncio.create_task(
+        muse.run_muse(prompt="x", cwd="/", model=None, effort=None, binary=None)
+    )
+    await started.wait()
+    task.cancel()
+    await asyncio.wait_for(closing.wait(), 2)
+    task.cancel()
+    assert client in muse._active_hosts  # pyright: ignore[reportPrivateUsage]
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0)
+    assert client not in muse._active_hosts  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_muse_sandbox_and_usage_read(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both probe and execution reject unavailable sandbox; usage uses SDK read."""
+    client = MagicMock()
+    client.durability = SimpleNamespace(kind="ephemeral")
+    client.initialize_result = {"sandboxAvailability": "unavailable"}
+    client.close = AsyncMock()
+    client.read_usage = AsyncMock(return_value={"usage": {}})
+    monkeypatch.setattr(muse.MuseClient, "spawn", AsyncMock(return_value=client))
+    assert not await muse.probe(None)
+    with pytest.raises(RuntimeError, match="sandbox"):
+        await muse.run_muse(prompt="x", cwd="/", model=None, effort=None, binary=None)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        await muse.read_usage(None)
+    client.initialize_result = {"sandboxAvailability": "available"}
+    assert await muse.read_usage(None) == {"usage": {}}
+    client.read_usage.assert_awaited_once()
+
+
+def test_invalid_usage() -> None:
+    """Malformed and out-of-range observations fail soft."""
+    samples: list[dict[str, Any]] = [
+        {"usage": {"window": None, "weekly": {}}},
+        {"usage": {"window": {"usedPercent": 101, "resetsAtMs": 1}}},
+        {"usage": {"window": {"usedPercent": 1, "resetsAtMs": 10**30}}},
+    ]
+    for raw in samples:
+        assert not muse.parse_usage(raw)["available"]
+
+
+def test_muse_unavailable_and_rate_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cold negative probes and usage deadlines return the documented status."""
+    monkeypatch.setattr(muse, "probe", AsyncMock(return_value=False))
+    app = create_app(
+        Settings(
+            api_key="key",
+            workspace_root=tmp_path,
+            muse_enabled=True,
+            max_timeout_seconds=0.05,
+        )
+    )
+    client = TestClient(app)
+    headers = {"Authorization": "Bearer key"}
+    url = "/v1/agents/muse/rate-limits"
+    assert client.get(url, headers=headers).status_code == 503
+    app.state.muse_probe_expires = 0
+    assert (
+        client.post(
+            "/v1/query", headers=headers, json={"agent": "muse", "prompt": "x"}
+        ).status_code
+        == 503
+    )
+    app.state.muse_probe_expires = 0
+    monkeypatch.setattr(muse, "probe", AsyncMock(return_value=True))
+    monkeypatch.setattr(muse, "read_usage", AsyncMock(side_effect=asyncio.TimeoutError))
+    assert client.get(url, headers=headers).status_code == 504
+
+
+@pytest.mark.asyncio
+async def test_query_cancel_owns_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """External cancellation leaves capacity held until host cleanup finishes."""
+    started, release = asyncio.Event(), asyncio.Event()
+
+    async def run(**kwargs: object) -> dict[str, object]:
+        _ = kwargs
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            await release.wait()
+        return {}
+
+    monkeypatch.setattr(muse, "probe", AsyncMock(return_value=True))
+    monkeypatch.setattr(muse, "run_muse", run)
+    app = create_app(
+        Settings(workspace_root=tmp_path, muse_enabled=True, muse_max_concurrency=1)
+    )
+    request = MagicMock()
+    request.app = app
+    task = asyncio.create_task(
+        main._muse_query(MuseQueryRequest(agent="muse", prompt="x"), request)  # pyright: ignore[reportPrivateUsage]
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert app.state.muse_semaphore.locked()
+    release.set()
+    for _ in range(20):
+        await asyncio.sleep(0)
+        if not app.state.muse_semaphore.locked():
+            break
+    assert not app.state.muse_semaphore.locked()

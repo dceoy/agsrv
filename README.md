@@ -18,6 +18,7 @@ disconnect, and retrieve the result later.
 | GET    | `/v1/agents`       | yes  | Agent capabilities and health              |
 | GET    | `/v1/agents/claude/rate-limits` | yes | Claude subscription quota |
 | GET    | `/v1/agents/codex/rate-limits` | yes | Codex account limits              |
+| GET    | `/v1/agents/muse/rate-limits` | yes | Muse last-observed subscription usage |
 | POST   | `/v1/query`        | yes  | Run one agent query, return the result |
 | POST   | `/v1/jobs`        | yes  | Submit a durable asynchronous job (202)  |
 | GET    | `/v1/jobs/{job_id}` | yes | Poll status and terminal result         |
@@ -221,3 +222,5 @@ Dependency versions are tracked in the committed `uv.lock`.
 ## License
 
 AGPL-3.0-only. See [LICENSE](LICENSE).
+
+Muse rate limits use the host’s `usage/read` cache without a model turn or subscription allowance. A fresh host may have no observation; in that case `available` is false.

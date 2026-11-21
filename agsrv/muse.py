@@ -6,7 +6,8 @@ import asyncio
 import contextlib
 import logging
 import time
-from typing import TYPE_CHECKING, Any
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING, Any, cast
 
 from muse_code import (
     MuseClient,
@@ -52,25 +53,6 @@ def deny_approval(request: ApprovalRequestParams) -> ApprovalDecisionInput:
         decision = str(choice.get("decision", ""))
         if decision in {"denied", "deniedPolicyAmendment"}:
             return ApprovalDecisionInput(choice_id=str(choice["choiceId"]))
-    for choice in choices:
-        cid = str(choice.get("choiceId", ""))
-        label = str(choice.get("label", ""))
-        if "deny" in cid.lower() or "deny" in label.lower():
-            return ApprovalDecisionInput(choice_id=str(choice["choiceId"]))
-    for choice in choices:
-        if "denied" in str(choice.get("choiceId", "")).lower():
-            return ApprovalDecisionInput(choice_id=str(choice["choiceId"]))
-    if not choices:
-        msg = "Muse approval has no deny choice"
-        raise RuntimeError(msg)
-    for choice in choices:
-        decision = str(choice.get("decision", ""))
-        if decision not in {
-            "approved",
-            "approvedForSession",
-            "approvedPolicyAmendment",
-        }:
-            return ApprovalDecisionInput(choice_id=str(choice["choiceId"]))
     msg = "Muse approval has no deny choice"
     raise RuntimeError(msg)
 
@@ -104,6 +86,30 @@ async def _spawn(binary: str | None, cwd: str | None) -> MuseClient[Any]:
     return client
 
 
+def _sandbox_available(client: MuseClient[Any]) -> bool:
+    return client.initialize_result.get("sandboxAvailability") != "unavailable"
+
+
+async def _close(client: MuseClient[Any]) -> None:
+    async def cleanup() -> None:
+        try:
+            with contextlib.suppress(Exception):
+                await client.close()
+        finally:
+            _active_hosts.discard(client)
+
+    task = asyncio.create_task(cleanup())
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+    task.result()
+    if cancelled:
+        raise asyncio.CancelledError
+
+
 async def probe(binary: str | None) -> bool:
     """Check ephemerality without running a turn.
 
@@ -113,14 +119,12 @@ async def probe(binary: str | None) -> bool:
     client: MuseClient[Any] | None = None
     try:
         client = await _spawn(binary, None)
-        return _is_ephemeral(client)
+        return _is_ephemeral(client) and _sandbox_available(client)
     except Exception:  # ruff: ignore[blind-except]  # any failure means unhealthy
         return False
     finally:
         if client is not None:
-            with contextlib.suppress(Exception):
-                await client.close()
-            _active_hosts.discard(client)
+            await _close(client)
 
 
 def _usage_to_dict(usage: Any | None) -> dict[str, Any] | None:  # ruff: ignore[any-type]  # pyright: ignore[reportAny]
@@ -151,13 +155,12 @@ def _usage_to_dict(usage: Any | None) -> dict[str, Any] | None:  # ruff: ignore[
 
 
 def _outcome_str(value: Any) -> str:  # ruff: ignore[any-type]
-    name = getattr(value, "name", None)
-    if isinstance(name, str):
-        return name.lower()
-    val = getattr(value, "value", None)
-    if isinstance(val, str):
-        return val.lower()
-    return str(value).lower()
+    kind = value.kind
+    if kind == "completed":
+        return str(value.params["terminal"])
+    if kind in {"unqueued", "terminalUnknown"}:
+        return str(kind)
+    return "unknown"
 
 
 async def run_muse(
@@ -182,7 +185,6 @@ async def run_muse(
 
     Raises:
         RuntimeError: If the backend is not ephemeral or approval fails.
-        asyncio.CancelledError: If cancelled.
     """
     started = time.monotonic()
     client: MuseClient[Any] | None = None
@@ -190,6 +192,9 @@ async def run_muse(
         client = await _spawn(binary, cwd)
         if not _is_ephemeral(client):
             msg = "Muse backend requires ephemeral sessions"
+            raise RuntimeError(msg)
+        if not _sandbox_available(client):
+            msg = "Muse sandbox unavailable"
             raise RuntimeError(msg)
         session = await client.start_session(
             StartSessionOptions(
@@ -200,23 +205,37 @@ async def run_muse(
         )
         session.on_approval(deny_approval)
 
+        failure_event = asyncio.Event()
+
         def _on_error(failure: Any) -> None:  # ruff: ignore[any-type]
-            msg = "Muse approval failed"
-            raise RuntimeError(msg) from failure
+            _ = failure
+            failure_event.set()
 
         session.on_approval_error(_on_error)
         run_task = asyncio.create_task(
             session.run(prompt, reasoning_effort=effort)  # pyright: ignore[reportArgumentType]
         )
+        failure_task = asyncio.create_task(failure_event.wait())
         try:
-            result = await asyncio.shield(run_task)
-        except asyncio.CancelledError:
-            run_task.cancel()
-            with _suppress_cancel():
-                await run_task
-            raise
+            done, _ = await asyncio.wait(
+                {run_task, failure_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if failure_task in done:
+                msg = "Muse approval failed"
+                raise RuntimeError(msg)
+            result = run_task.result()
+        finally:
+            failure_task.cancel()
+            if not run_task.done():
+                run_task.cancel()
+                await asyncio.wait({run_task}, timeout=0.5)
+            if run_task.done():
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    run_task.result()
+            else:
+                run_task.add_done_callback(_consume_task)
         duration_ms = int((time.monotonic() - started) * 1000)
-        outcome = _outcome_str(getattr(result, "outcome", "completed"))
+        outcome = _outcome_str(result.outcome)
         is_error = outcome != "completed"
         usage = _usage_to_dict(getattr(result, "usage", None))
         return {
@@ -233,26 +252,67 @@ async def run_muse(
         }
     finally:
         if client is not None:
-            with contextlib.suppress(Exception):
-                await client.close()
-            _active_hosts.discard(client)
+            await _close(client)
 
 
-@contextlib.contextmanager
-def _suppress_cancel() -> Any:  # ruff: ignore[any-type]
-    """Suppress CancelledError while draining a cancelled run.
+def _consume_task(task: asyncio.Task[Any]) -> None:
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        task.result()
 
-    Yields:
-        Suppresses CancelledError until the block exits.
+
+def parse_usage(raw: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the SDK subscription payload.
+
+    Returns:
+        Normalized windows and the original payload.
     """
-    with contextlib.suppress(asyncio.CancelledError):
-        yield
+    usage = raw.get("usage")
+    windows: dict[str, Any] = {"five_hour": None, "seven_day": None}
+    if isinstance(usage, dict):
+        for source, target in (("window", "five_hour"), ("weekly", "seven_day")):
+            item = cast("dict[str, Any]", usage).get(source)
+            if isinstance(item, dict):
+                item = cast("dict[str, Any]", item)
+                percent, reset = item.get("usedPercent"), item.get("resetsAtMs")
+                if (
+                    isinstance(percent, (int, float))
+                    and 0 <= percent <= 100  # ruff: ignore[magic-value-comparison]
+                    and isinstance(reset, (int, float))
+                ):
+                    try:
+                        stamp = datetime.fromtimestamp(reset / 1000, UTC).isoformat()
+                    except (ValueError, OverflowError, OSError):
+                        continue
+                    windows[target] = {"used_percent": percent, "resets_at": stamp}
+    return {
+        "available": any(v is not None for v in windows.values()),
+        **windows,
+        "raw": raw,
+        "fetched_at": datetime.now(UTC).isoformat(),
+    }
+
+
+async def read_usage(binary: str | None) -> dict[str, Any]:
+    """Read the host cache without a model turn.
+
+    Returns:
+        The last-observed usage payload.
+
+    Raises:
+        RuntimeError: If the host is unavailable.
+    """
+    client = await _spawn(binary, None)
+    try:
+        if not _is_ephemeral(client) or not _sandbox_available(client):
+            msg = "Muse unavailable"
+            raise RuntimeError(msg)
+        return dict(await client.read_usage())
+    finally:
+        await _close(client)
 
 
 async def shutdown() -> None:
     """Close any active Muse hosts for app shutdown."""
     hosts = list(_active_hosts)
-    _active_hosts.clear()
     for host in hosts:
-        with contextlib.suppress(Exception):
-            await host.close()
+        await _close(host)

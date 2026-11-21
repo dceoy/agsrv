@@ -426,16 +426,24 @@ async def _muse_query(body: MuseQueryRequest, request: Request) -> dict[str, Any
             status.HTTP_400_BAD_REQUEST,
             f"timeout_seconds exceeds server maximum {settings.max_timeout_seconds}",
         )
-    semaphore: asyncio.Semaphore = request.app.state.muse_semaphore
-    if semaphore.locked():
+    if not settings.muse_enabled or (
+        time.monotonic() < request.app.state.muse_probe_expires
+        and not request.app.state.muse_healthy
+    ):
         raise HTTPException(
-            status.HTTP_429_TOO_MANY_REQUESTS, "agent concurrency limit reached"
+            status.HTTP_503_SERVICE_UNAVAILABLE, "Muse is disabled or unavailable"
         )
-    await semaphore.acquire()
-    lease = _SlotLease(semaphore)
 
     async def execute() -> dict[str, Any]:
-        async with request.app.state.jobs.workspace(cwd):
+        async with (
+            request.app.state.jobs.workspace(cwd),
+            _muse_slot(request.app) as lease,
+        ):
+            if not await _muse_available(request.app, lease=lease):
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Muse is disabled or unavailable",
+                )
             return await muse.run_muse(
                 prompt=body.prompt,
                 cwd=str(cwd),
@@ -444,18 +452,25 @@ async def _muse_query(body: MuseQueryRequest, request: Request) -> dict[str, Any
                 binary=settings.muse_bin,
             )
 
+    task = asyncio.create_task(execute())
     try:
         async with asyncio.timeout(timeout):
-            if not await _muse_available(request.app, lease=lease):
-                raise HTTPException(  # ruff: ignore[raise-within-try]
-                    status.HTTP_503_SERVICE_UNAVAILABLE,
-                    "Muse is disabled or unavailable",
-                )
-            return await _await_muse(execute(), lease)
-    except TimeoutError as exc:
-        raise HTTPException(
-            status.HTTP_504_GATEWAY_TIMEOUT, "agent run timed out"
-        ) from exc
+            return await asyncio.shield(task)
+    except (TimeoutError, asyncio.CancelledError) as exc:
+        task.cancel()
+        _pump_tasks.add(task)
+
+        def finished(operation: asyncio.Task[Any]) -> None:
+            _pump_tasks.discard(operation)
+            with suppress(asyncio.CancelledError, Exception):
+                operation.result()
+
+        task.add_done_callback(finished)
+        if isinstance(exc, TimeoutError):
+            raise HTTPException(
+                status.HTTP_504_GATEWAY_TIMEOUT, "agent run timed out"
+            ) from exc
+        raise
     except HTTPException:
         raise
     except Exception as exc:
@@ -463,9 +478,6 @@ async def _muse_query(body: MuseQueryRequest, request: Request) -> dict[str, Any
         raise HTTPException(
             status.HTTP_502_BAD_GATEWAY, "agent execution failed"
         ) from exc
-    finally:
-        if not lease.claimed:
-            lease.release()
 
 
 async def _muse_query_with_disconnect(
@@ -557,7 +569,7 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
                 "supports": {
                     "sandbox": True,
                     "network_access": True,
-                    "rate_limits": False,
+                    "rate_limits": True,
                     "streaming": False,
                 },
             },
@@ -657,7 +669,42 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
                 status.HTTP_502_BAD_GATEWAY, "Codex rate limits failed"
             ) from exc
 
-    _ = (health, info, agents, claude_rate_limits, rate_limits)
+    @app.get(
+        "/v1/agents/muse/rate-limits",
+        dependencies=[Auth],
+        response_model=dict[str, Any],
+    )
+    async def muse_rate_limits(request: Request) -> dict[str, Any]:
+        settings: Settings = request.app.state.settings
+        if not settings.muse_enabled or (
+            time.monotonic() < app.state.muse_probe_expires
+            and not app.state.muse_healthy
+        ):
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE, "Muse is disabled or unavailable"
+            )
+        try:
+            async with asyncio.timeout(settings.max_timeout_seconds):
+                async with _muse_slot(app) as lease:
+                    if not await _muse_available(app, lease=lease):
+                        raise HTTPException(  # ruff: ignore[raise-within-try]
+                            status.HTTP_503_SERVICE_UNAVAILABLE,
+                            "Muse is disabled or unavailable",
+                        )
+                    raw = await _await_muse(muse.read_usage(settings.muse_bin), lease)
+                    return {**muse.parse_usage(raw), "backend": raw}
+        except TimeoutError as exc:
+            raise HTTPException(
+                status.HTTP_504_GATEWAY_TIMEOUT, "Muse rate limits timed out"
+            ) from exc
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY, "Muse rate limits failed"
+            ) from exc
+
+    _ = (health, info, agents, claude_rate_limits, rate_limits, muse_rate_limits)
 
 
 def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure]
