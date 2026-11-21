@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 APPROVAL_MODE = "onRequest"
 SERVE_ARGS: tuple[str, ...] = ("serve", "--no-session-log", "--contributor-mode", "off")
 
+DISABLE_SANDBOX_ARG = "--disable-sandbox"
+
 _active_hosts: set[MuseClient[Any]] = set()
 
 
@@ -34,13 +36,21 @@ class MuseUnavailableError(RuntimeError):
     """The Muse host cannot provide the required availability guarantees."""
 
 
-def serve_args() -> list[str]:
-    """Return fixed serve arguments for the Muse host.
+def serve_args(*, sandbox: bool = True) -> list[str]:
+    """Return serve arguments for the Muse host.
+
+    Args:
+        sandbox: Keep the host sandbox enabled. Only an explicit ``False``
+            adds ``--disable-sandbox``.
 
     Returns:
-        Memory-only arguments with contributor mode off.
+        Memory-only arguments with contributor mode off, plus
+        ``--disable-sandbox`` when the sandbox is explicitly disabled.
     """
-    return list(SERVE_ARGS)
+    args = list(SERVE_ARGS)
+    if not sandbox:
+        args.append(DISABLE_SANDBOX_ARG)
+    return args
 
 
 def deny_approval(request: ApprovalRequestParams) -> ApprovalDecisionInput:
@@ -85,13 +95,14 @@ async def _spawn(
     cwd: str | None,
     tmpdir: str | None = None,
     *,
+    sandbox: bool = True,
     experimental: bool = False,
 ) -> MuseClient[Any]:
     env = {**os.environ, "TMPDIR": tmpdir} if tmpdir else None
     opts = MuseClientSpawnOptions(
         binary,
         _client_info(),  # pyright: ignore[reportArgumentType]
-        args=serve_args(),
+        args=serve_args(sandbox=sandbox),
         cwd=cwd,
         env=env,
         capabilities={"experimentalApi": True} if experimental else None,
@@ -187,6 +198,7 @@ async def run_muse(
     effort: str | None,
     binary: str | None,
     tmpdir: str | None = None,
+    sandbox: bool = True,
 ) -> dict[str, Any]:
     """Run a single ephemeral Muse turn.
 
@@ -197,6 +209,9 @@ async def run_muse(
         effort: Optional reasoning effort.
         binary: Optional Muse binary path.
         tmpdir: Private per-turn directory exported to the host as ``TMPDIR``.
+        sandbox: Keep the host sandbox on (default). ``False`` spawns this
+            turn's host with ``--disable-sandbox`` and skips the sandbox
+            availability check for this turn only.
 
     Returns:
         Normalized response dict.
@@ -207,11 +222,11 @@ async def run_muse(
     started = time.monotonic()
     client: MuseClient[Any] | None = None
     try:
-        client = await _spawn(binary, cwd, tmpdir)
+        client = await _spawn(binary, cwd, tmpdir, sandbox=sandbox)
         if not _is_ephemeral(client):
             msg = "Muse backend requires ephemeral sessions"
             raise RuntimeError(msg)
-        if not _sandbox_available(client):
+        if sandbox and not _sandbox_available(client):
             msg = "Muse sandbox unavailable"
             raise RuntimeError(msg)
         session = await client.start_session(
@@ -266,6 +281,7 @@ async def run_muse(
             "backend": {
                 "turn_id": getattr(result, "turn_id", None),
                 "outcome": outcome,
+                "sandbox": sandbox,
             },
         }
     finally:

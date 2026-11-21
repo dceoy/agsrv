@@ -519,6 +519,7 @@ class JobManager:
                 effort=body.effort,
                 binary=settings.muse_bin,
                 tmpdir=str(tmpdir),
+                sandbox=body.sandbox,
             )
 
     async def _run(
