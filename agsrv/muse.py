@@ -18,6 +18,8 @@ from muse_code import (
 from muse_code.facade.approval import ApprovalDecisionInput
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from muse_code_msp import ApprovalRequestParams
 
 logger = logging.getLogger(__name__)
@@ -304,7 +306,9 @@ def parse_usage(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def read_usage(binary: str | None) -> dict[str, Any]:
+async def read_usage(
+    binary: str | None, on_dispatch: Callable[[], None]
+) -> dict[str, Any]:
     """Refresh subscription usage without a model turn.
 
     Returns:
@@ -322,6 +326,7 @@ async def read_usage(binary: str | None) -> dict[str, Any]:
             msg = "Muse unavailable"
             raise MuseUnavailableError(msg)
         try:
+            on_dispatch()
             return dict(await client.request("usage/refresh"))
         except Exception:  # ruff: ignore[blind-except]  # unavailable usage fails closed
             return {}

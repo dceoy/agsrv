@@ -812,7 +812,7 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
         dependencies=[Auth],
         response_model=dict[str, Any],
     )
-    async def muse_rate_limits(request: Request) -> dict[str, Any]:
+    async def muse_rate_limits(request: Request) -> dict[str, Any]:  # ruff: ignore[complex-structure]
         settings: Settings = request.app.state.settings
         if not settings.muse_enabled or (
             time.monotonic() < app.state.muse_probe_expires
@@ -821,7 +821,7 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
             raise HTTPException(
                 status.HTTP_503_SERVICE_UNAVAILABLE, "Muse is disabled or unavailable"
             )
-        try:  # ruff: ignore[too-many-statements-in-try-clause]
+        try:  # ruff: ignore[too-many-nested-blocks, too-many-statements-in-try-clause]
             async with asyncio.timeout(settings.max_timeout_seconds):
                 async with app.state.muse_usage_lock:
                     if time.monotonic() < app.state.muse_usage_expires:
@@ -834,16 +834,24 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
                             )
 
                         async def refresh() -> None:
+                            was_dispatched = False
+
+                            def dispatched() -> None:
+                                nonlocal was_dispatched
+                                was_dispatched = True
+                                app.state.muse_usage_expires = time.monotonic() + 60
+
                             try:
-                                raw = await muse.read_usage(settings.muse_bin)
+                                raw = await muse.read_usage(
+                                    settings.muse_bin, dispatched
+                                )
                                 app.state.muse_usage = {
                                     **muse.parse_usage(raw),
                                     "backend": raw,
                                 }
-                            except BaseException:
-                                app.state.muse_usage_expires = 0
-                                raise
-                            app.state.muse_usage_expires = time.monotonic() + 60
+                            finally:
+                                if not was_dispatched:
+                                    app.state.muse_usage_expires = 0
 
                         empty: dict[str, Any] = {}
                         app.state.muse_usage = {

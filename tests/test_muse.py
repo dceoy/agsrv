@@ -24,6 +24,8 @@ from agsrv.main import (
 from agsrv.schemas import MuseQueryRequest
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from muse_code import MuseClientSpawnOptions
 
 
@@ -896,6 +898,14 @@ def test_muse_rate_limits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
         }
     }
     read = AsyncMock(return_value=raw)
+
+    def read_and_dispatch(
+        _binary: str | None, dispatched: Callable[[], None]
+    ) -> dict[str, object]:
+        dispatched()
+        return cast("dict[str, object]", read.return_value)
+
+    read.side_effect = read_and_dispatch
     monkeypatch.setattr(muse, "read_usage", read)
     app = create_app(
         Settings(api_key="key", workspace_root=tmp_path, muse_enabled=True)
@@ -965,6 +975,50 @@ async def test_usage_concurrent_polls_share_refresh(
 
 
 @pytest.mark.asyncio
+async def test_usage_timeout_during_close_keeps_cooldown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A timed-out host cleanup cannot permit a second refresh dispatch."""
+    monkeypatch.setattr(muse, "probe", AsyncMock(return_value=True))
+    closing, release = asyncio.Event(), asyncio.Event()
+    host = MagicMock()
+    host.durability = SimpleNamespace(kind="ephemeral")
+    host.initialize_result = {"sandboxAvailability": "available"}
+    host.request = AsyncMock(
+        return_value={"usage": {"window": {"usedPercent": 30, "resetsAtMs": 1}}}
+    )
+
+    async def close() -> None:
+        closing.set()
+        await release.wait()
+
+    host.close = AsyncMock(side_effect=close)
+    monkeypatch.setattr(muse.MuseClient, "spawn", AsyncMock(return_value=host))
+    app = create_app(
+        Settings(
+            api_key="key",
+            workspace_root=tmp_path,
+            muse_enabled=True,
+            max_timeout_seconds=0.05,
+        )
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        url = "/v1/agents/muse/rate-limits"
+        headers = {"Authorization": "Bearer key"}
+        first = asyncio.create_task(client.get(url, headers=headers))
+        await closing.wait()
+        assert (await first).status_code == 504
+        assert (await client.get(url, headers=headers)).json()["available"] is False
+        release.set()
+        await app.state.muse_semaphore.acquire()
+        app.state.muse_semaphore.release()
+        assert (await client.get(url, headers=headers)).status_code == 200
+    host.request.assert_awaited_once_with("usage/refresh")
+
+
+@pytest.mark.asyncio
 async def test_muse_cleanup_and_unresponsive_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1019,16 +1073,16 @@ async def test_muse_sandbox_and_usage_read(monkeypatch: pytest.MonkeyPatch) -> N
     with pytest.raises(RuntimeError, match="sandbox"):
         await muse.run_muse(prompt="x", cwd="/", model=None, effort=None, binary=None)
     with pytest.raises(RuntimeError, match="unavailable"):
-        await muse.read_usage(None)
+        await muse.read_usage(None, lambda: None)
     client.initialize_result = {"sandboxAvailability": "available"}
-    assert await muse.read_usage(None) == {"usage": {}}
+    assert await muse.read_usage(None, lambda: None) == {"usage": {}}
     client.request.assert_awaited_once_with("usage/refresh")
     spawn = cast("AsyncMock", muse.MuseClient.spawn)
     assert spawn.call_args.args[0].capabilities == {"experimentalApi": True}
     client.request.side_effect = RuntimeError("refresh failed")
-    assert await muse.read_usage(None) == {}
+    assert await muse.read_usage(None, lambda: None) == {}
     spawn.side_effect = OSError("spawn failed")
-    assert await muse.read_usage(None) == {}
+    assert await muse.read_usage(None, lambda: None) == {}
 
 
 def test_invalid_usage() -> None:
