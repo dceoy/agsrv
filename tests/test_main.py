@@ -40,7 +40,7 @@ from agsrv.claude import (
     message_to_dict,
 )
 from agsrv.config import DEFAULT_SANDBOX_ALLOWED_DOMAINS, Settings
-from agsrv.main import _SlotLease, app, create_app  # pyright: ignore[reportPrivateUsage]
+from agsrv.main import _SlotLease, create_app  # pyright: ignore[reportPrivateUsage]
 from agsrv.sandbox import (
     SandboxSetupError,
     build_sandbox_settings,
@@ -195,9 +195,10 @@ def client_for(
 AUTH = {"Authorization": "Bearer secret"}
 
 
-def test_health() -> None:
+def test_health(tmp_path: Path) -> None:
     """Verify the public health endpoint."""
-    with TestClient(app) as client:
+    client, _ = client_for(make_settings(tmp_path))
+    with client:
         response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
@@ -482,6 +483,7 @@ def test_runner_failures(tmp_path: Path) -> None:
     client, _ = client_for(settings, FakeRunner(delay=1.0))
     slow = {"agent": "claude", "sandbox": False, "prompt": "x", "timeout_seconds": 0.05}
     assert client.post("/v1/query", json=slow, headers=AUTH).status_code == 504
+    assert not list(tmp_path.glob(".agsrv-tmp-*"))
 
 
 def test_concurrency_limit(tmp_path: Path) -> None:
@@ -977,6 +979,7 @@ async def test_query_disconnect_cancels_and_releases(
     result = await asyncio.wait_for(first, 1)
     assert result.status_code == 499
     assert runner.closed.is_set()
+    assert not await asyncio.to_thread(lambda: list(tmp_path.glob(".agsrv-tmp-*")))
     runner.release.set()
     transport = httpx.ASGITransport(app=test_app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:

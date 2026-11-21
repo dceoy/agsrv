@@ -206,6 +206,7 @@ async def run_codex(
     sandbox: str,
     network_access: bool,
     binary: str | None,
+    tmpdir: str | None = None,
 ) -> dict[str, Any]:
     """Run a single ephemeral Codex turn.
 
@@ -217,6 +218,7 @@ async def run_codex(
         sandbox: Sandbox mode.
         network_access: Whether sandbox network access is enabled.
         binary: Optional Codex binary path.
+        tmpdir: Private per-turn temporary directory.
 
     Returns:
         The collected turn and thread metadata.
@@ -226,6 +228,11 @@ async def run_codex(
             "cwd": cwd,
             "model": model,
             "ephemeral": True,
+            **(
+                {"config": {"shell_environment_policy": {"set": {"TMPDIR": tmpdir}}}}
+                if tmpdir
+                else {}
+            ),
             "approvalPolicy": "never",
             "sandbox": sandbox,
         })

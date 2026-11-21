@@ -67,7 +67,10 @@ curl -sS https://agsrv.example.net/v1/jobs \
 | `AGSRV_MUSE_MODEL`               | unset                            | Default model for Muse runs                              |
 | `AGSRV_API_KEY`                  | unset                            | Bearer token clients must send                           |
 | `AGSRV_ALLOW_UNAUTHENTICATED`    | `false`                          | Allow requests with no key configured (local dev only)   |
+| `AGSRV_TMP_MIN_FREE_BYTES`      | `536870912`                      | Minimum free bytes on /tmp; 0 disables the check |
+| `AGSRV_WORKSPACE_MIN_FREE_BYTES`| `1073741824`                     | Minimum free bytes on the workspace filesystem; 0 disables the check |
 | `AGSRV_WORKSPACE_ROOT`           | current directory                | All request `cwd` values must resolve inside this path   |
+| `AGSRV_TMP_STAGING_DIRS`         | **required** (unset: server refuses to start) | `mount_root=staging_dir` pairs, comma-separated; see below |
 | `AGSRV_DEFAULT_MODEL`            | unset (SDK default)              | Model used when a request omits `model`                  |
 | `AGSRV_PERMISSION_MODE`          | `acceptEdits`                    | Default permission mode                                  |
 | `AGSRV_ALLOWED_TOOLS`            | `Read,Write,Edit,Bash,Glob,Grep` | Default auto-approve list (not a restriction; see below) |
@@ -79,6 +82,134 @@ curl -sS https://agsrv.example.net/v1/jobs \
 | `AGSRV_JOBS_MAX_PAYLOAD_BYTES`   | `65536`                          | Maximum canonical request size |
 | `AGSRV_JOBS_MAX_RESULT_BYTES`    | `1048576`                        | Maximum persisted result size |
 | `AGSRV_SANDBOX_ALLOWED_DOMAINS`  | GitHub, PyPI, and npm hosts (see below) | Comma-separated egress allow-list for sandboxed Bash; set-but-empty means no egress |
+
+Each turn uses a private `.agsrv-tmp-<random>` directory in its working
+directory. Claude receives it as `TMPDIR` in the SDK environment. For Codex, the
+per-turn thread configuration carries
+`shell_environment_policy.set.TMPDIR`; this is verified at the request-payload
+level only (a mocked `thread_start` test). A live Codex child observing the value
+has **not** been verified, because bubblewrap's socket-directory constraint
+blocks that observation. Codex read-only sandboxes still enforce their normal
+write restrictions. Before a turn, agsrv checks free space on `/tmp`, the
+workspace root and the working directory (measured on the held descriptors, so
+a working directory on a separate mount must pass its own check) and returns
+HTTP 503 when either enabled threshold is unmet. Queued work is checked again,
+after its last wait, immediately before creation. The Claude rate-limits route
+spawns a Claude child process and gets the same admission, preflight and
+`TMPDIR` handling; the Codex rate-limits route starts no workspace turn.
+Muse queries and jobs spawn a `muse serve` child per turn in the working
+directory and get the same admission, preflight and per-turn directory, exported
+as `TMPDIR` in the child's environment (verified at the spawn-options level only;
+a live Muse host observing the value has not been verified). The Muse probe and
+rate-limits route spawn a host with no working directory and start no workspace
+turn, so they have no guard treatment.
+
+### Temporary directory design and threat model
+
+> **Breaking deployment requirement (0.4.0).** `AGSRV_TMP_STAGING_DIRS` has no
+> default and is **mandatory**. If the workspace root's mount has no configured
+> staging directory, **startup fails with a fatal error** naming the missing
+> configuration; agsrv no longer starts and then answers every turn (including
+> `/v1/query`, `/v1/jobs` and `/v1/agents/claude/rate-limits`) with HTTP 503.
+> Existing deployments must provision a staging directory *before* upgrading.
+
+**Required deployment property.** Turns need one pre-provisioned,
+service-controlled *staging* directory per workspace mount, configured with
+`AGSRV_TMP_STAGING_DIRS` (comma-separated `mount_root=staging_dir` pairs; the most
+specific mount root containing the working directory wins). The workspace root's
+own mount must have one. Each staging directory must be owned by the service,
+mode `0700`, outside the workspace root, on the **same mount** as its mount root
+(not merely the same filesystem: a bind mount of one filesystem shares `st_dev`
+yet makes `renameat2` fail with `EXDEV`), and unreachable by workspace writers.
+Startup opens and validates every staging directory and fails on an unsafe one:
+not a service-owned `0700` directory, inside the workspace root, below `/tmp`,
+`/var/tmp`, `/dev/shm` or the system temp directory (all child-writable), or not
+on the mount of its mount root. The mount check is a rename round trip of a
+probe directory from staging into the mount root and back, so the service must be
+able to create entries in each configured mount root. Descriptors are held for the
+life of the server. A working directory on a nested mount that is not covered by
+its own staging directory fails closed per turn (HTTP 503). A local filesystem
+with atomic rename and `RENAME_NOREPLACE` support is required; `EXDEV`,
+unsupported flags or a missing `renameat2` fail closed. Example:
+`AGSRV_WORKSPACE_ROOT=/srv/ws`
+`AGSRV_TMP_STAGING_DIRS=/srv/ws=/var/lib/agsrv/stage`.
+
+Other writers may share the working directory and can list it, rename or remove
+entries, substitute real directories or symlinks, and change ancestors. Random
+names and the workspace lease do not establish ownership of an entry, so
+ownership is decided by an open descriptor, never by a name. The protected object
+is the top-level tree agsrv created for the turn (its contents are disposable);
+a different entry substituted for it must survive, even if empty or owned by the
+service user.
+
+- **Admission.** The accepted working directory is opened once by walking from
+  the workspace-root descriptor, one component at a time, with
+  `O_DIRECTORY | O_NOFOLLOW`, and that descriptor is held by the request or job
+  (including through the job queue and detached Codex execution). After the last
+  wait the walk is repeated and compared with `os.path.samestat`; a missing
+  component, symlink or different directory fails the turn (HTTP 503) before
+  anything is published or launched. All later server mutations use the held
+  descriptor, so a later symlink swap cannot redirect them.
+- **Create privately, publish atomically.** The directory is created in staging
+  (`mkdir` under a random name, then opened relative to the staging descriptor
+  with `O_NOFOLLOW | O_DIRECTORY`; the held descriptor must be an empty
+  directory, receives mode `0700` via `fchmod`, and supplies the identity used
+  later; there is no name-based `chmod`) and then published into the working directory
+  with `renameat2(RENAME_NOREPLACE)`, which never overwrites an existing entry,
+  even an empty directory. `O_CREAT | O_EXCL | O_DIRECTORY` is not used (it fails
+  with `EINVAL` on Linux 6.4 and later).
+- **Reclaim before delete.** Cleanup renames the public entry from the held
+  working-directory descriptor back into staging (no-replace), checks it against
+  the held descriptor, and only on a match deletes the contents *through the
+  held directory descriptor* (`shutil.rmtree(entry, dir_fd=child_fd)` for each
+  entry; symlink-attack resistant, required at startup). The only name-based
+  removal is the final `rmdir` of the then-empty directory under the staging
+  parent. These checks assume staging is reachable only by the service account
+  (see the limits below). On a mismatch
+  nothing is traversed or deleted: the entry is renamed back if the public name
+  is free; otherwise it stays in staging and its recovery name is logged.
+- **Off the event loop, shielded.** Cleanup runs in one worker thread. If the
+  owning task is cancelled (repeatedly, too) the same worker is awaited to the
+  end, and only then is cancellation propagated and the workspace lease released.
+  Each cleanup worker owns private duplicates of the descriptors it uses, and
+  at shutdown pending cleanups and turn owners are drained before the shared
+  descriptors are closed.
+- **Rollback.** A failure after the private `mkdir` removes the staged directory
+  by its private name; a failure after publication runs the full
+  reclaim-and-verify sequence. The original error, result or cancellation is
+  preserved; uncertain or partly removed entries are retained and logged.
+
+Residual risks:
+
+- Children receive a `TMPDIR` path *string* and resolve it (and their cwd) in
+  their own namespace at the time of use. A writer can substitute the leaf or an
+  ancestor, so a child can fail, write into a replacement, or follow a symlink if
+  its sandbox permits. agsrv's own operations stay on the held descriptors and
+  cannot be redirected, but give the child's path lookup no identity guarantee.
+- A descriptor identifies its object even if an ancestor is moved; continuous
+  containment against reparenting needs additional namespace or permission
+  constraints.
+- Turn contents are disposable: anyone able to put data *inside* the genuine turn
+  tree puts it in cleanup scope. A writer that repeatedly moves entries, a
+  surviving writer that keeps modifying contents, filesystem errors or process
+  death can prevent reclamation. A crash can leave a public or staged entry;
+  there is deliberately no name-based scavenger. Subdirectories made
+  non-listable by a child may keep a partially removed entry in staging (logged).
+- `0700` is also a deployment property: an unrestricted same-UID child that can
+  reach staging (for example by reading `AGSRV_TMP_STAGING_DIRS` from the
+  service's `/proc/<pid>/environ`) can enumerate and rename entries there. A writer
+  that can reach the staging directory defeats the setup and cleanup guarantees:
+  the published-tree identity, the target of the mode change and the deletion of
+  content are no longer assured. The guarantees hold only while staging is
+  reachable solely by the service account; processes under the same UID are
+  outside them, and real isolation requires separate credentials or
+  namespaces. A `umask` that clears the owner bits makes the new directory
+  unopenable; the turn then fails (HTTP 503) and the staged entry is left
+  for the operator. Mount
+  administration, service compromise, malicious filesystems and the trusted
+  anchors (workspace root, staging directory and their ancestors) are outside
+  the model.
+- A live Codex child observing `TMPDIR` is unverified, as noted above.
 
 The default sandbox domains are `github.com`, `api.github.com`,
 `codeload.github.com`, `uploads.github.com`, `raw.githubusercontent.com`,

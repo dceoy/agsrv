@@ -73,11 +73,35 @@ def _env_sandbox_domains() -> tuple[str, ...]:
     return tuple(d.lower() for d in entries)
 
 
+def _env_staging_dirs() -> tuple[tuple[Path, Path], ...]:
+    """Parse ``AGSRV_TMP_STAGING_DIRS`` (``mount=staging`` pairs, comma-separated).
+
+    Returns:
+        Resolved ``(mount root, staging directory)`` pairs.
+
+    Raises:
+        ValueError: If an entry is not ``mount=staging``.
+    """
+    raw = os.environ.get("AGSRV_TMP_STAGING_DIRS", "")
+    pairs: list[tuple[Path, Path]] = []
+    for entry in (e.strip() for e in raw.split(",")):
+        if not entry:
+            continue
+        mount, sep, stage = entry.partition("=")
+        if not sep or not mount.strip() or not stage.strip():
+            msg = f"invalid AGSRV_TMP_STAGING_DIRS entry: {entry!r}"
+            raise ValueError(msg)
+        pairs.append((Path(mount.strip()).resolve(), Path(stage.strip()).resolve()))
+    return tuple(pairs)
+
+
 @dataclass(frozen=True)
 class Settings:
     """Server configuration.
 
     Attributes:
+        tmp_min_free_bytes: Minimum free bytes on /tmp (0 disables).
+        workspace_min_free_bytes: Minimum free bytes on the workspace (0 disables).
         api_key: Bearer token required from clients, if any.
         allow_unauthenticated: Permit requests when no API key is configured.
         workspace_root: Directory that all agent working directories must stay in.
@@ -99,6 +123,10 @@ class Settings:
         jobs_retention_seconds: Retention for completed jobs and deduplication keys.
         jobs_max_payload_bytes: Maximum validated request size.
         jobs_max_result_bytes: Maximum persisted response size.
+        tmp_staging_dirs: ``(workspace mount root, staging directory)`` pairs.
+            Each staging directory must be service-owned, mode 0700, outside the
+            workspace root and on the mount it serves. Required: startup fails
+            if the workspace root's mount has none.
     """
 
     api_key: str | None = None
@@ -125,6 +153,25 @@ class Settings:
     jobs_max_payload_bytes: int = 65536
     jobs_max_result_bytes: int = 1048576
 
+    tmp_min_free_bytes: int = 536870912
+    workspace_min_free_bytes: int = 1073741824
+    tmp_staging_dirs: tuple[tuple[Path, Path], ...] = ()
+
+    def __post_init__(self) -> None:
+        """Validate disk thresholds and staging locations.
+
+        Raises:
+            ValueError: If a threshold is negative or a staging path is relative.
+        """
+        for mount, stage in self.tmp_staging_dirs:
+            if not (mount.is_absolute() and stage.is_absolute()):
+                msg = "AGSRV_TMP_STAGING_DIRS paths must be absolute"
+                raise ValueError(msg)
+        for name in ("tmp_min_free_bytes", "workspace_min_free_bytes"):
+            if getattr(self, name) < 0:
+                msg = f"AGSRV_{name.upper()} must be nonnegative"
+                raise ValueError(msg)
+
     @classmethod
     def from_env(cls) -> Settings:
         """Build settings from ``AGSRV_*`` environment variables.
@@ -134,6 +181,13 @@ class Settings:
         """
         tools = os.environ.get("AGSRV_ALLOWED_TOOLS", _DEFAULT_TOOLS)
         return cls(
+            tmp_staging_dirs=_env_staging_dirs(),
+            tmp_min_free_bytes=int(
+                os.environ.get("AGSRV_TMP_MIN_FREE_BYTES", "536870912")
+            ),
+            workspace_min_free_bytes=int(
+                os.environ.get("AGSRV_WORKSPACE_MIN_FREE_BYTES", "1073741824")
+            ),
             api_key=_env_api_key(),
             allow_unauthenticated=_env_bool("AGSRV_ALLOW_UNAUTHENTICATED"),
             workspace_root=Path(

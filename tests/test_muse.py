@@ -1145,8 +1145,9 @@ async def test_query_cancel_owns_cleanup(
         await task
     assert app.state.muse_semaphore.locked()
     release.set()
-    for _ in range(20):
-        await asyncio.sleep(0)
+    # Reclaiming the per-turn directory runs in an executor, so yield for real.
+    for _ in range(200):
+        await asyncio.sleep(0.01)
         if not app.state.muse_semaphore.locked():
             break
     assert not app.state.muse_semaphore.locked()

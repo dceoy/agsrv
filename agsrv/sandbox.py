@@ -207,17 +207,19 @@ def build_sandbox_settings(settings: Settings, home: Path) -> dict[str, Any]:
     }
 
 
-def sandbox_env(home: Path) -> dict[str, str]:
+def sandbox_env(home: Path, tmpdir: Path | None = None) -> dict[str, str]:
     """Build environment variables that redirect caches into the sandbox dir.
 
     Args:
         home: Home directory of the server user.
+        tmpdir: Private per-turn temporary directory.
 
     Returns:
         Environment variables for the CLI process.
     """
     cache = sandbox_cache_dir(home)
     return {
+        **({"TMPDIR": str(tmpdir)} if tmpdir is not None else {}),
         "XDG_CACHE_HOME": str(cache),
         "npm_config_cache": str(cache / "npm"),
         "npm_config_store_dir": str(cache / "pnpm-store"),

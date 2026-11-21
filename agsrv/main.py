@@ -39,12 +39,14 @@ from agsrv.security import (
     check_sandbox_request,
     resolve_cwd,
 )
+from agsrv.tmpguard import Admitted, Anchors, check_space, turn_tmpdir
 from agsrv.usage import parse_usage
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable, Coroutine
+    from pathlib import Path
 
-    from claude_agent_sdk import ClaudeAgentOptions, Message
+    from claude_agent_sdk import Message
 
 logger = logging.getLogger(__name__)
 
@@ -63,28 +65,22 @@ Auth = Depends(auth_dependency)
 
 async def _prepare(
     request: Request, body: QueryRequest, *, check_claude_cache: bool = False
-) -> tuple[ClaudeAgentOptions, float, asyncio.Semaphore]:
-    """Validate a request and acquire a concurrency slot.
+) -> tuple[Admitted, Path | None, float, asyncio.Semaphore]:
+    """Validate a request, admit its cwd and acquire a concurrency slot.
 
     Returns:
-        SDK options, effective timeout, and the semaphore (already acquired).
+        Admitted working directory (the caller must close it), sandbox home,
+        effective timeout, and the semaphore (already acquired).
 
     Raises:
-        HTTPException: On validation, permission, or capacity errors.
+        HTTPException: On validation, admission, permission, or capacity errors.
     """
     settings: Settings = request.app.state.settings
     cwd = resolve_cwd(settings, body.cwd)
+    # Cheap input validation first: a bad request is a 400 even when admission
+    # (staging, opening the cwd) would fail with 503.
     check_permission_mode(settings, body.permission_mode)
     check_sandbox_request(settings, body.sandbox, body.permission_mode)
-    home = None
-    home_error: SandboxSetupError | None = None
-    if body.sandbox:
-        try:
-            home = service_home()
-        except SandboxSetupError as exc:
-            home_error = exc  # 503 is deferred so that 429 takes precedence
-        else:
-            check_sandbox_cwd(cwd, home)
     timeout = (
         settings.max_timeout_seconds
         if body.timeout_seconds is None
@@ -103,6 +99,36 @@ async def _prepare(
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE, "Claude is disabled or unavailable"
         )
+    admitted = request.app.state.anchors.admit(cwd)
+    try:
+        check_space(settings, request.app.state.anchors, admitted)
+        return await _prepare_admitted(request, body, admitted, timeout)
+    except BaseException:
+        admitted.close()
+        raise
+
+
+async def _prepare_admitted(
+    request: Request, body: QueryRequest, admitted: Admitted, limit: float
+) -> tuple[Admitted, Path | None, float, asyncio.Semaphore]:
+    """Validate policy for an admitted cwd and acquire a concurrency slot.
+
+    Returns:
+        See :func:`_prepare`.
+
+    Raises:
+        HTTPException: On validation, permission, or capacity errors.
+    """
+    cwd = admitted.path
+    home = None
+    home_error: SandboxSetupError | None = None
+    if body.sandbox:
+        try:
+            home = service_home()
+        except SandboxSetupError as exc:
+            home_error = exc  # 503 is deferred so that 429 takes precedence
+        else:
+            check_sandbox_cwd(cwd, home)
     semaphore: asyncio.Semaphore = request.app.state.semaphore
     if semaphore.locked():
         raise HTTPException(
@@ -113,14 +139,7 @@ async def _prepare(
             status.HTTP_503_SERVICE_UNAVAILABLE, str(home_error)
         ) from home_error
     await semaphore.acquire()  # immediate: not locked, so no suspension
-    try:
-        options = build_options(body, settings, cwd, home)
-    except BaseException as exc:
-        semaphore.release()
-        if isinstance(exc, SandboxSetupError):
-            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
-        raise
-    return options, timeout, semaphore
+    return admitted, home, limit, semaphore
 
 
 class _SlotLease:
@@ -275,8 +294,18 @@ def _detach_probe(task: asyncio.Task[Any], lease: _SlotLease) -> None:
     task.cancel()
 
 
-async def _await_codex(operation: Coroutine[Any, Any, T], lease: _SlotLease) -> T:
+async def _await_codex(
+    operation: Coroutine[Any, Any, T],
+    lease: _SlotLease,
+    on_done: Callable[[], None] | None = None,
+) -> T:
     """Run an operation while allowing its cleanup to outlive the caller.
+
+    Args:
+        operation: Coroutine to run as a detachable task.
+        lease: Capacity lease transferred to the task if the caller is cancelled.
+        on_done: Called when the task ends, even if it never started; it owns
+            resources the operation needs until then.
 
     Returns:
         The operation result.
@@ -285,6 +314,8 @@ async def _await_codex(operation: Coroutine[Any, Any, T], lease: _SlotLease) -> 
         asyncio.CancelledError: If the caller is cancelled.
     """
     task = asyncio.create_task(operation)
+    if on_done is not None:
+        task.add_done_callback(lambda _: on_done())
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
@@ -294,6 +325,7 @@ async def _await_codex(operation: Coroutine[Any, Any, T], lease: _SlotLease) -> 
 
 async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, Any]:
     settings: Settings = request.app.state.settings
+    anchors: Anchors = request.app.state.anchors
     cwd = resolve_cwd(settings, body.cwd)
     timeout = body.timeout_seconds or settings.max_timeout_seconds
     if timeout > settings.max_timeout_seconds:
@@ -301,34 +333,43 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
             status.HTTP_400_BAD_REQUEST,
             f"timeout_seconds exceeds server maximum {settings.max_timeout_seconds}",
         )
-    semaphore: asyncio.Semaphore = request.app.state.codex_semaphore
-    if semaphore.locked():
-        raise HTTPException(
-            status.HTTP_429_TOO_MANY_REQUESTS, "agent concurrency limit reached"
-        )
-    await semaphore.acquire()
-    lease = _SlotLease(semaphore)
-
-    async def execute() -> dict[str, Any]:
-        async with request.app.state.jobs.workspace(cwd):
-            return await codex.run_codex(
-                prompt=body.prompt,
-                cwd=str(cwd),
-                model=body.model,
-                effort=body.effort,
-                sandbox=body.options.sandbox,
-                network_access=body.options.network_access,
-                binary=settings.codex_bin,
+    admitted = anchors.admit(cwd)
+    handed_off = False
+    lease: _SlotLease | None = None
+    try:  # ruff: ignore[too-many-statements-in-try-clause]
+        check_space(settings, anchors, admitted)
+        semaphore: asyncio.Semaphore = request.app.state.codex_semaphore
+        if semaphore.locked():
+            raise HTTPException(  # ruff: ignore[raise-within-try]
+                status.HTTP_429_TOO_MANY_REQUESTS, "agent concurrency limit reached"
             )
+        await semaphore.acquire()
+        lease = _SlotLease(semaphore)
 
-    try:
+        async def execute() -> dict[str, Any]:
+            async with (
+                request.app.state.jobs.workspace(cwd),
+                turn_tmpdir(settings, anchors, admitted) as tmpdir,
+            ):
+                return await codex.run_codex(
+                    prompt=body.prompt,
+                    cwd=str(cwd),
+                    model=body.model,
+                    effort=body.effort,
+                    sandbox=body.options.sandbox,
+                    network_access=body.options.network_access,
+                    binary=settings.codex_bin,
+                    tmpdir=str(tmpdir),
+                )
+
         async with asyncio.timeout(timeout):
             if not await _codex_available(request.app, lease=lease):
                 raise HTTPException(  # ruff: ignore[raise-within-try]
                     status.HTTP_503_SERVICE_UNAVAILABLE,
                     "Codex is disabled or unavailable",
                 )
-            return await _await_codex(execute(), lease)
+            handed_off = True  # the detachable task now owns the descriptor
+            return await _await_codex(execute(), lease, on_done=admitted.close)
     except TimeoutError as exc:
         raise HTTPException(
             status.HTTP_504_GATEWAY_TIMEOUT, "agent run timed out"
@@ -341,7 +382,9 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
             status.HTTP_502_BAD_GATEWAY, "agent execution failed"
         ) from exc
     finally:
-        if not lease.claimed:
+        if not handed_off:
+            admitted.close()
+        if lease is not None and not lease.claimed:
             lease.release()
 
 
@@ -482,8 +525,11 @@ async def _await_muse(operation: Coroutine[Any, Any, T], lease: _SlotLease) -> T
         raise
 
 
-async def _muse_query(body: MuseQueryRequest, request: Request) -> dict[str, Any]:
+async def _muse_query(  # ruff: ignore[complex-structure]
+    body: MuseQueryRequest, request: Request
+) -> dict[str, Any]:
     settings: Settings = request.app.state.settings
+    anchors: Anchors = request.app.state.anchors
     cwd = resolve_cwd(settings, body.cwd)
     timeout = body.timeout_seconds or settings.max_timeout_seconds
     if timeout > settings.max_timeout_seconds:
@@ -498,6 +544,9 @@ async def _muse_query(body: MuseQueryRequest, request: Request) -> dict[str, Any
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE, "Muse is disabled or unavailable"
         )
+    # Admission and the cheap preflight precede any queueing, as for the
+    # other agent paths; the descriptor is released when the task finishes.
+    admitted = anchors.admit(cwd)
 
     async def execute() -> dict[str, Any]:
         async with (
@@ -509,15 +558,23 @@ async def _muse_query(body: MuseQueryRequest, request: Request) -> dict[str, Any
                     status.HTTP_503_SERVICE_UNAVAILABLE,
                     "Muse is disabled or unavailable",
                 )
-            return await muse.run_muse(
-                prompt=body.prompt,
-                cwd=str(cwd),
-                model=body.model or settings.muse_model,
-                effort=body.effort,
-                binary=settings.muse_bin,
-            )
+            async with turn_tmpdir(settings, anchors, admitted) as tmpdir:
+                return await muse.run_muse(
+                    prompt=body.prompt,
+                    cwd=str(cwd),
+                    model=body.model or settings.muse_model,
+                    effort=body.effort,
+                    binary=settings.muse_bin,
+                    tmpdir=str(tmpdir),
+                )
 
-    task = asyncio.create_task(execute())
+    try:
+        check_space(settings, anchors, admitted)
+        task = asyncio.create_task(execute())
+    except BaseException:
+        admitted.close()
+        raise
+    task.add_done_callback(lambda _: admitted.close())
     try:
         async with asyncio.timeout(timeout):
             return await asyncio.shield(task)
@@ -645,7 +702,9 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
         dependencies=[Auth],
         response_model=dict[str, Any],
     )
-    async def claude_rate_limits(request: Request) -> dict[str, Any] | Response:  # pyright: ignore[reportUnusedFunction]
+    async def claude_rate_limits(  # ruff: ignore[complex-structure, too-many-statements, too-many-locals]  # pyright: ignore[reportUnusedFunction]
+        request: Request,
+    ) -> dict[str, Any] | Response:
         body = QueryRequest(
             agent="claude",
             prompt="/usage",
@@ -653,8 +712,9 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
             max_turns=1,
             include_messages=False,
         )
-        options, timeout, semaphore = await _prepare(request, body)
-        options.tools = []
+        anchors: Anchors = app.state.anchors
+        admitted, home, timeout, semaphore = await _prepare(request, body)
+        cwd = admitted.path
         task = cast("asyncio.Task[object]", asyncio.current_task())
         client_gone = False
 
@@ -666,10 +726,16 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
             task.cancel()
 
         watcher = asyncio.create_task(watch_disconnect())
+        options_built = False
         try:  # ruff: ignore[too-many-statements-in-try-clause]
             async with asyncio.timeout(timeout):
-                cwd = resolve_cwd(settings, body.cwd)
-                async with app.state.jobs.workspace(cwd):
+                async with (
+                    app.state.jobs.workspace(cwd),
+                    turn_tmpdir(settings, anchors, admitted) as tmpdir,
+                ):
+                    options = build_options(body, settings, cwd, home, tmpdir)
+                    options.tools = []
+                    options_built = True
                     stream = app.state.runner.stream(body.prompt, options)
                     async with aclosing(
                         cast("AsyncGenerator[Message]", stream)
@@ -690,7 +756,13 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
             raise HTTPException(
                 status.HTTP_504_GATEWAY_TIMEOUT, "Claude rate limits timed out"
             ) from exc
+        except HTTPException:
+            raise
+        except SandboxSetupError as exc:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         except Exception as exc:
+            if not options_built:
+                raise
             logger.exception("Claude rate limits failed")
             raise HTTPException(
                 status.HTTP_502_BAD_GATEWAY, "Claude rate limits failed"
@@ -705,6 +777,7 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
                     if task.cancelling() > cancelling:
                         raise
             finally:
+                admitted.close()
                 semaphore.release()
 
     @app.get("/v1/agents/codex/rate-limits", dependencies=[Auth])
@@ -776,7 +849,7 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
     _ = (health, info, agents, claude_rate_limits, rate_limits, muse_rate_limits)
 
 
-def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure]
+def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure, too-many-statements]
     """Register the agent execution routes."""
 
     @app.post(
@@ -787,7 +860,7 @@ def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure]
             Field(discriminator="agent"),
         ],
     )
-    async def run_query(  # pyright: ignore[reportUnusedFunction]  # ruff: ignore[complex-structure]
+    async def run_query(  # ruff: ignore[complex-structure, too-many-statements, too-many-branches]  # pyright: ignore[reportUnusedFunction]
         body: Annotated[
             QueryRequest | CodexQueryRequest | MuseQueryRequest,
             Field(discriminator="agent"),
@@ -811,9 +884,12 @@ def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure]
             return await _codex_query_with_disconnect(body, request)
         if isinstance(body, MuseQueryRequest):
             return await _muse_query_with_disconnect(body, request)
-        options, timeout, semaphore = await _prepare(
+        settings: Settings = request.app.state.settings
+        anchors: Anchors = request.app.state.anchors
+        admitted, home, timeout, semaphore = await _prepare(
             request, body, check_claude_cache=True
         )
+        cwd = admitted.path
         lease = _SlotLease(semaphore)
         agent_runner: AgentRunner = request.app.state.runner
         task = cast("asyncio.Task[object]", asyncio.current_task())
@@ -829,6 +905,7 @@ def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure]
             task.cancel()
 
         watcher = asyncio.create_task(watch_disconnect())
+        options_built = False
         try:  # ruff: ignore[too-many-statements-in-try-clause]
             async with asyncio.timeout(timeout):
                 if not await _claude_available(request.app, lease=lease):
@@ -836,8 +913,12 @@ def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure]
                         status.HTTP_503_SERVICE_UNAVAILABLE,
                         "Claude is disabled or unavailable",
                     )
-                cwd = resolve_cwd(request.app.state.settings, body.cwd)
-                async with request.app.state.jobs.workspace(cwd):
+                async with (
+                    request.app.state.jobs.workspace(cwd),
+                    turn_tmpdir(settings, anchors, admitted) as tmpdir,
+                ):
+                    options = build_options(body, settings, cwd, home, tmpdir)
+                    options_built = True
                     stream = agent_runner.stream(body.prompt, options)
                     async with aclosing(
                         cast("AsyncGenerator[Message]", stream)
@@ -855,9 +936,13 @@ def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure]
             ) from exc
         except HTTPException:
             raise
+        except SandboxSetupError as exc:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
         except AgentExecutionError as exc:
             raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
         except Exception as exc:
+            if not options_built:
+                raise
             logger.exception("agent execution failed")
             raise HTTPException(
                 status.HTTP_502_BAD_GATEWAY, "agent execution failed"
@@ -868,6 +953,7 @@ def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure]
                 with suppress(asyncio.CancelledError):
                     await watcher
             finally:
+                admitted.close()
                 if not lease.claimed:
                     lease.release()
 
@@ -877,12 +963,18 @@ def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure]
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Open the durable queue and stop all owned jobs on shutdown."""
+    app.state.anchors.open()
     app.state.jobs.start()
     try:
         yield
     finally:
-        await muse.shutdown()
-        await app.state.jobs.stop()
+        try:
+            await muse.shutdown()
+            await app.state.jobs.stop()
+            if _pump_tasks:
+                await asyncio.gather(*_pump_tasks, return_exceptions=True)
+        finally:
+            await app.state.anchors.aclose()
 
 
 def _add_job_routes(app: FastAPI) -> None:
@@ -953,6 +1045,7 @@ def create_app(
     app.state.codex_probe_lock = asyncio.Lock()
     app.state.codex_probe_expires = 0.0
     app.state.codex_healthy = False
+    app.state.anchors = Anchors(settings)
     app.state.muse_semaphore = asyncio.Semaphore(settings.muse_max_concurrency)
     app.state.muse_probe_lock = asyncio.Lock()
     app.state.muse_probe_expires = 0.0

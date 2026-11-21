@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, cast
@@ -77,12 +78,16 @@ def _is_ephemeral(client: MuseClient[Any]) -> bool:
     return kind == "ephemeral"
 
 
-async def _spawn(binary: str | None, cwd: str | None) -> MuseClient[Any]:
+async def _spawn(
+    binary: str | None, cwd: str | None, tmpdir: str | None = None
+) -> MuseClient[Any]:
+    env = {**os.environ, "TMPDIR": tmpdir} if tmpdir else None
     opts = MuseClientSpawnOptions(
         binary,
         _client_info(),  # pyright: ignore[reportArgumentType]
         args=serve_args(),
         cwd=cwd,
+        env=env,
         on_stderr=_on_stderr,
     )
     client: MuseClient[Any] = await MuseClient.spawn(opts)
@@ -174,6 +179,7 @@ async def run_muse(
     model: str | None,
     effort: str | None,
     binary: str | None,
+    tmpdir: str | None = None,
 ) -> dict[str, Any]:
     """Run a single ephemeral Muse turn.
 
@@ -183,6 +189,7 @@ async def run_muse(
         model: Optional requested model.
         effort: Optional reasoning effort.
         binary: Optional Muse binary path.
+        tmpdir: Private per-turn directory exported to the host as ``TMPDIR``.
 
     Returns:
         Normalized response dict.
@@ -193,7 +200,7 @@ async def run_muse(
     started = time.monotonic()
     client: MuseClient[Any] | None = None
     try:
-        client = await _spawn(binary, cwd)
+        client = await _spawn(binary, cwd, tmpdir)
         if not _is_ephemeral(client):
             msg = "Muse backend requires ephemeral sessions"
             raise RuntimeError(msg)
