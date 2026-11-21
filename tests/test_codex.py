@@ -340,7 +340,7 @@ async def test_probe_coalesces_and_times_out(
     mock.assert_awaited_once()
     app.state.codex_probe_expires = 0
     release.clear()
-    monkeypatch.setattr(main, "CODEX_PROBE_TIMEOUT", 0.01)
+    monkeypatch.setattr(main, "PROBE_TIMEOUT", 0.01)
     assert not await main._codex_available(app)  # pyright: ignore[reportPrivateUsage]
 
 
@@ -387,7 +387,7 @@ async def test_probe_timeout_releases_waiters_but_keeps_slot(
     monkeypatch.setattr(client._client._sync, "start", start)  # pyright: ignore[reportPrivateUsage]
     monkeypatch.setattr(client._client._sync, "close", close)  # pyright: ignore[reportPrivateUsage]
     monkeypatch.setattr(codex, "make_client", MagicMock(return_value=client))
-    monkeypatch.setattr(main, "CODEX_PROBE_TIMEOUT", 0.05)
+    monkeypatch.setattr(main, "PROBE_TIMEOUT", 0.05)
     async with AsyncClient(
         transport=ASGITransport(app=app),
         base_url="http://test",
@@ -555,7 +555,7 @@ async def test_cached_agents_with_busy_executor_and_probe_lock(
     )
     probe = AsyncMock(return_value=True)
     monkeypatch.setattr(codex, "probe", probe)
-    monkeypatch.setattr(main, "CODEX_PROBE_TIMEOUT", 0.05)
+    monkeypatch.setattr(main, "PROBE_TIMEOUT", 0.05)
     release = threading.Event()
     occupied = threading.Event()
 

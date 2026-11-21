@@ -184,6 +184,14 @@ Returns `claude` and `codex` objects with `enabled`, `healthy`, `default_model`,
 and `supports` flags for `sandbox`, `network_access`, `rate_limits`, and
 `streaming`. Claude and Codex health probes are cached for approximately 30 seconds. Claude uses the local `/usage` command, without consuming tokens or allowance.
 
+Claude is `healthy` when the CLI is spawnable, the ephemeral `/usage` run does not
+return an error result, and the bundled CLI's `auth status` reports
+`loggedIn: true`. The probe never uses the sandbox. This proves a configured,
+spawnable CLI whose `/usage` run succeeds; it does not prove the credential is
+still valid server-side (an expired or revoked token can pass until a real turn
+runs). While the Claude concurrency slot is busy, this endpoint returns the last
+cached health value (even if expired) and never responds 429 because of the probe.
+
 ## `GET /v1/agents/codex/rate-limits`
 
 Returns `plan`, `primary` and `secondary` windows (`used_percent` and
