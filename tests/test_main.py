@@ -601,7 +601,7 @@ def test_info(tmp_path: Path) -> None:
     client, _ = client_for(make_settings(tmp_path, default_model="m1"))
     body = client.get("/v1/info", headers=AUTH).json()
     assert body == {
-        "version": "0.5.0",
+        "version": "0.5.1",
         "stateless": True,
         "default_model": "m1",
         "workspace_root": str(tmp_path.resolve()),

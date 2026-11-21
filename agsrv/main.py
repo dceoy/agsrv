@@ -52,7 +52,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 DISCONNECT_POLL_INTERVAL = 0.1
 PROBE_TIMEOUT = 10.0
 MUSE_PROBE_TIMEOUT = 10.0
