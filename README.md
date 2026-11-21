@@ -209,3 +209,7 @@ Dependency versions are tracked in the committed `uv.lock`.
 ## License
 
 AGPL-3.0-only. See [LICENSE](LICENSE).
+
+Agent health is measured using cached availability probes (approximately 30 seconds).
+Claude uses its local `/usage` command without consuming tokens or allowance.
+Queries return 503 when the selected agent is unavailable.

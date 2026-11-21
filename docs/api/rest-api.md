@@ -182,7 +182,7 @@ or unavailable backend returns 503 without affecting Claude.
 
 Returns `claude` and `codex` objects with `enabled`, `healthy`, `default_model`,
 and `supports` flags for `sandbox`, `network_access`, `rate_limits`, and
-`streaming`. Codex initialization health is cached for approximately 30 seconds.
+`streaming`. Claude and Codex health probes are cached for approximately 30 seconds. Claude uses the local `/usage` command, without consuming tokens or allowance.
 
 ## `GET /v1/agents/codex/rate-limits`
 
@@ -258,7 +258,7 @@ The old SSE stream endpoint is deliberately removed.
 | 422    | Invalid body (empty prompt, unknown/stateful fields, bad ranges)       |
 | 429    | Concurrency or pending-job capacity reached (jobs include Retry-After) |
 | 502    | SDK/CLI failure, or the run ended without a result message             |
-| 503    | `AGSRV_API_KEY` not configured and unauthenticated access not allowed; sandbox prerequisites unavailable or Codex disabled/unavailable |
+| 503    | `AGSRV_API_KEY` not configured and unauthenticated access not allowed; sandbox prerequisites unavailable or Claude or Codex disabled/unavailable |
 | 504    | Run exceeded its timeout                                               |
 
 Errors use FastAPI's `{"detail": "..."}` body.

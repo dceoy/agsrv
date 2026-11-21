@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import re
+from contextlib import aclosing
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
 from claude_agent_sdk import (
@@ -292,3 +293,25 @@ async def collect_result(
         stop_reason=final.stop_reason,
         messages=messages,
     )
+
+
+async def probe(runner: AgentRunner, settings: Settings) -> bool:
+    """Run the local usage command.
+
+    Returns:
+        Whether the run produced a result.
+    """
+    from agsrv.schemas import QueryRequest  # ruff: ignore[import-outside-top-level]
+
+    try:  # ruff: ignore[too-many-statements-in-try-clause]
+        body = QueryRequest(
+            agent="claude", prompt="/usage", allowed_tools=[], max_turns=1
+        )
+        options = build_options(body, settings, settings.workspace_root)
+        options.tools = []
+        stream = runner.stream(body.prompt, options)
+        async with aclosing(cast("Any", stream)) as messages:
+            await collect_result(messages, include_messages=False)
+    except Exception:  # ruff: ignore[blind-except]
+        return False
+    return True
