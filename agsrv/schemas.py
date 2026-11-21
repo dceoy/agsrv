@@ -94,6 +94,7 @@ class MuseQueryRequest(BaseModel):
     cwd: str | None = None
     timeout_seconds: float | None = Field(default=None, gt=0)
     include_messages: bool = True
+    sandbox: bool = True
 
 
 class MuseQueryResponse(BaseModel):

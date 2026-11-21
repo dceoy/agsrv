@@ -32,7 +32,7 @@ No authentication.
 
 ```json
 {
-  "version": "0.4.0",
+  "version": "0.5.0",
   "stateless": true,
   "default_model": null,
   "workspace_root": "/srv/workspaces",
@@ -183,13 +183,23 @@ or unavailable backend returns 503 without affecting Claude.
 ```json
 { "agent": "muse", "prompt": "Summarize this project", "cwd": ".",
   "model": null, "effort": "high", "timeout_seconds": 300,
-  "include_messages": false }
+  "include_messages": false, "sandbox": true }
 ```
 
 `effort` is one of `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`,
-`ultra`. Muse uses `muse serve --no-session-log --contributor-mode off` with a
-fixed sandbox posture (never `--disable-sandbox` or `--trust-workspace`), a
-deny-all `on_approval` handler and approval mode `onRequest`. Sessions are
+`ultra`. Muse uses `muse serve --no-session-log --contributor-mode off`, a
+deny-all `on_approval` handler and approval mode `onRequest` (never
+`--trust-workspace`).
+
+`sandbox` (boolean, default `true`) applies to both `POST /v1/query` and
+`POST /v1/jobs`. Only an explicit `"sandbox": false` opts out: that turn's
+`muse serve` host is spawned with `--disable-sandbox` and the sandbox
+availability check is skipped for that turn. Omitting the field, or any value
+other than `false`, keeps the sandboxed posture and the fail-closed
+availability check. The opt-out is per request; there is no server-wide
+setting or separate control endpoint, and the health probe and
+`GET /v1/agents/muse/rate-limits` always use the sandboxed posture. The
+effective value is recorded as `backend.sandbox` in the response. Sessions are
 memory-only; if `client.durability` is not ephemeral the backend fails closed
 and `GET /v1/agents` reports unhealthy. `include_messages` is accepted for
 parity but no transcript is returned in v1. The backend is disabled by default
@@ -202,7 +212,9 @@ request/response.
 
 Returns `claude`, `codex` and `muse` objects with `enabled`, `healthy`, `default_model`,
 and `supports` flags for `sandbox`, `network_access`, `rate_limits`, and
-`streaming`. Claude and Codex health probes are cached for approximately 30 seconds. Muse initialization follows the same cached (~30s) probe pattern, checking ephemeral durability and sandbox availability. Claude uses the local `/usage` command, without consuming tokens or allowance.
+`streaming`. For Muse, `supports.sandbox` means the backend honours the
+per-request `sandbox` field (sandboxed by default, opt-out with `false`); it
+does not mean every turn is sandboxed. Claude and Codex health probes are cached for approximately 30 seconds. Muse initialization follows the same cached (~30s) probe pattern, checking ephemeral durability and sandbox availability. Claude uses the local `/usage` command, without consuming tokens or allowance.
 
 Claude is `healthy` when the CLI is spawnable, the ephemeral `/usage` run does not
 return an error result, and the bundled CLI's `auth status` reports

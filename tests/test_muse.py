@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -48,6 +49,17 @@ def test_serve_args_fixed() -> None:
     assert "--disable-sandbox" not in args
     assert "--trust-workspace" not in args
     assert muse.APPROVAL_MODE in {"onRequest", "promptUnmatched", "denyUnmatched"}
+    assert muse.serve_args(sandbox=True) == args
+
+
+def test_serve_args_disable_sandbox_only_when_false() -> None:
+    """--disable-sandbox appears if and only if sandbox is False."""
+    base = ["serve", "--no-session-log", "--contributor-mode", "off"]
+    assert muse.serve_args(sandbox=False) == [*base, "--disable-sandbox"]
+    assert "--disable-sandbox" not in muse.serve_args(sandbox=True)
+    assert "--disable-sandbox" not in muse.serve_args()
+    assert "--trust-workspace" not in muse.serve_args(sandbox=False)
+    assert "--disable-sandbox" not in muse.SERVE_ARGS
 
 
 def test_deny_approval_picks_denied() -> None:
@@ -216,7 +228,11 @@ async def test_run_completed(monkeypatch: pytest.MonkeyPatch) -> None:
     assert response["result"] == "done"
     assert response["is_error"] is False
     assert response["model"] == "m1"
-    assert response["backend"] == {"turn_id": "t1", "outcome": "completed"}
+    assert response["backend"] == {
+        "turn_id": "t1",
+        "outcome": "completed",
+        "sandbox": True,
+    }
     assert response["usage"] == {"input_tokens": 1, "output_tokens": 2}
     client.start_session.assert_awaited_once()
     options = client.start_session.call_args.args[0]
@@ -977,6 +993,109 @@ async def test_muse_sandbox_and_usage_read(monkeypatch: pytest.MonkeyPatch) -> N
     client.initialize_result = {"sandboxAvailability": "available"}
     assert await muse.read_usage(None) == {"usage": {}}
     client.read_usage.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_sandbox_false_spawns_disabled_and_skips_check(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """sandbox=False adds --disable-sandbox, skips the check and records it."""
+    result = SimpleNamespace(
+        outcome=_Completed(params={"terminal": "completed"}, observed_start=True),  # pyright: ignore[reportArgumentType]
+        final_text="done",
+        turn_id="t1",
+        usage=None,
+    )
+    client = MagicMock()
+    client.durability = SimpleNamespace(kind="ephemeral")
+    client.initialize_result = {"sandboxAvailability": "unavailable"}
+    session = MagicMock()
+    session.run = AsyncMock(return_value=result)
+    client.start_session = AsyncMock(return_value=session)
+    client.close = AsyncMock()
+    spawned: list[Any] = []
+
+    async def _spawn(options: MuseClientSpawnOptions) -> MagicMock:
+        spawned.append(options.args)  # pyright: ignore[reportAttributeAccessIssue,reportUnknownMemberType]
+        await asyncio.sleep(0)
+        return client
+
+    monkeypatch.setattr(muse.MuseClient, "spawn", _spawn)
+    response = await muse.run_muse(
+        prompt="x", cwd="/w", model=None, effort=None, binary=None, sandbox=False
+    )
+    assert spawned == [[*muse.SERVE_ARGS, "--disable-sandbox"]]
+    assert response["backend"]["sandbox"] is False
+    # Default stays fail-closed on the same host, and probe/read_usage stay sandboxed.
+    spawned.clear()
+    with pytest.raises(RuntimeError, match="sandbox"):
+        await muse.run_muse(prompt="x", cwd="/w", model=None, effort=None, binary=None)
+    assert not await muse.probe(None)
+    with pytest.raises(muse.MuseUnavailableError):
+        await muse.read_usage(None)
+    assert spawned == [muse.serve_args()] * 3
+
+
+@pytest.mark.parametrize("sandbox", [True, False])
+def test_query_and_job_plumb_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, sandbox: bool
+) -> None:
+    """body.sandbox reaches run_muse on both /v1/query and the jobs path."""
+    monkeypatch.setattr(muse, "probe", AsyncMock(return_value=True))
+    run = AsyncMock(
+        return_value={
+            "agent": "muse",
+            "result": "ok",
+            "model": None,
+            "is_error": False,
+            "duration_ms": 0,
+            "usage": None,
+            "backend": {"turn_id": "t", "outcome": "completed", "sandbox": sandbox},
+        }
+    )
+    monkeypatch.setattr(muse, "run_muse", run)
+    app = create_app(
+        Settings(
+            api_key="key",
+            workspace_root=tmp_path,
+            muse_enabled=True,
+            jobs_db_path=tmp_path / "jobs.sqlite3",
+        )
+    )
+    headers = {"Authorization": "Bearer key"}
+    body = {"agent": "muse", "prompt": "hi", "sandbox": sandbox}
+    with TestClient(app) as client:
+        response = client.post("/v1/query", headers=headers, json=body)
+        assert response.status_code == 200
+        assert response.json()["backend"]["sandbox"] is sandbox
+        assert run.await_args is not None
+        assert run.await_args.kwargs["sandbox"] is sandbox
+        run.reset_mock()
+        accepted = client.post("/v1/jobs", headers=headers, json=body)
+        assert accepted.status_code == 202
+        job_id = accepted.json()["job_id"]
+        job: dict[str, Any] = {}
+        for _ in range(100):
+            job = client.get(f"/v1/jobs/{job_id}", headers=headers).json()
+            if job["status"] in {"succeeded", "failed"}:
+                break
+            time.sleep(0.05)
+        assert job["status"] == "succeeded"
+        assert run.await_args is not None
+        assert run.await_args.kwargs["sandbox"] is sandbox
+        assert job["result"]["backend"]["sandbox"] is sandbox
+        run.reset_mock()
+        default = client.post(
+            "/v1/query", headers=headers, json={"agent": "muse", "prompt": "hi"}
+        )
+        assert default.status_code == 200
+        assert run.await_args is not None
+        assert run.await_args.kwargs["sandbox"] is True
+        for bad_value in (None, "maybe"):
+            bad = client.post(
+                "/v1/query", headers=headers, json={**body, "sandbox": bad_value}
+            )
+            assert bad.status_code == 422
 
 
 def test_invalid_usage() -> None:
