@@ -221,7 +221,6 @@ class JobManager:
         ):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid Idempotency-Key")
         cwd = self._validate(body)
-        check_space(self.app.state.settings)
         payload = _canonical(body)
         settings: Settings = self.app.state.settings
         if len(payload.encode()) > settings.jobs_max_payload_bytes:
@@ -250,6 +249,7 @@ class JobManager:
                         status.HTTP_409_CONFLICT, "Idempotency-Key payload mismatch"
                     )
                 return self._accepted(existing["job_id"], existing["status"])
+            check_space(settings, cwd)
             pending = db.execute(
                 "SELECT COUNT(*) FROM jobs WHERE status IN ('queued','running')"
             ).fetchone()[0]
@@ -430,10 +430,10 @@ class JobManager:
         self, body: QueryRequest | CodexQueryRequest, cwd: Path
     ) -> dict[str, Any]:
         settings: Settings = self.app.state.settings
-        check_space(settings)
-        with turn_tmpdir(cwd) as tmpdir:
-            if isinstance(body, QueryRequest):
-                async with self.app.state.semaphore:
+        if isinstance(body, QueryRequest):
+            async with self.app.state.semaphore:
+                check_space(settings, cwd)
+                with turn_tmpdir(cwd) as tmpdir:
                     home = service_home() if body.sandbox else None
                     options = build_options(body, settings, cwd, home, tmpdir)
                     runner = self.app.state.runner
@@ -445,10 +445,12 @@ class JobManager:
                             messages, include_messages=body.include_messages
                         )
                     return result.model_dump(mode="json")
-            if not settings.codex_enabled:
-                msg = "Codex unavailable"
-                raise RuntimeError(msg)
-            async with self.app.state.codex_semaphore:
+        if not settings.codex_enabled:
+            msg = "Codex unavailable"
+            raise RuntimeError(msg)
+        async with self.app.state.codex_semaphore:
+            check_space(settings, cwd)
+            with turn_tmpdir(cwd) as tmpdir:
                 return await codex_agent.run_codex(
                     prompt=body.prompt,
                     cwd=str(cwd),

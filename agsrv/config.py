@@ -99,8 +99,6 @@ class Settings:
         jobs_max_result_bytes: Maximum persisted response size.
     """
 
-    tmp_min_free_bytes: int = 536870912
-    workspace_min_free_bytes: int = 1073741824
     api_key: str | None = None
     allow_unauthenticated: bool = False
     workspace_root: Path = field(default_factory=lambda: Path.cwd().resolve())
@@ -120,6 +118,20 @@ class Settings:
     jobs_retention_seconds: int = 86400
     jobs_max_payload_bytes: int = 65536
     jobs_max_result_bytes: int = 1048576
+
+    tmp_min_free_bytes: int = 536870912
+    workspace_min_free_bytes: int = 1073741824
+
+    def __post_init__(self) -> None:
+        """Validate disk thresholds.
+
+        Raises:
+            ValueError: If a threshold is negative.
+        """
+        for name in ("tmp_min_free_bytes", "workspace_min_free_bytes"):
+            if getattr(self, name) < 0:
+                msg = f"AGSRV_{name.upper()} must be nonnegative"
+                raise ValueError(msg)
 
     @classmethod
     def from_env(cls) -> Settings:

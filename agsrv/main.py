@@ -43,7 +43,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Coroutine
     from pathlib import Path
 
-    from claude_agent_sdk import ClaudeAgentOptions, Message
+    from claude_agent_sdk import Message
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +60,8 @@ Auth = Depends(auth_dependency)
 
 
 async def _prepare(
-    request: Request, body: QueryRequest, tmpdir: Path
-) -> tuple[ClaudeAgentOptions, float, asyncio.Semaphore]:
+    request: Request, body: QueryRequest
+) -> tuple[Path, Path | None, float, asyncio.Semaphore]:
     """Validate a request and acquire a concurrency slot.
 
     Returns:
@@ -103,14 +103,7 @@ async def _prepare(
             status.HTTP_503_SERVICE_UNAVAILABLE, str(home_error)
         ) from home_error
     await semaphore.acquire()  # immediate: not locked, so no suspension
-    try:
-        options = build_options(body, settings, cwd, home, tmpdir)
-    except BaseException as exc:
-        semaphore.release()
-        if isinstance(exc, SandboxSetupError):
-            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
-        raise
-    return options, timeout, semaphore
+    return cwd, home, timeout, semaphore
 
 
 class _SlotLease:
@@ -241,7 +234,7 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
             status.HTTP_400_BAD_REQUEST,
             f"timeout_seconds exceeds server maximum {settings.max_timeout_seconds}",
         )
-    check_space(settings)
+    check_space(settings, cwd)
     semaphore: asyncio.Semaphore = request.app.state.codex_semaphore
     if semaphore.locked():
         raise HTTPException(
@@ -252,6 +245,7 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
 
     async def execute() -> dict[str, Any]:
         async with request.app.state.jobs.workspace(cwd):
+            check_space(settings, cwd)
             with turn_tmpdir(cwd) as tmpdir:
                 return await codex_agent.run_codex(
                     prompt=body.prompt,
@@ -402,7 +396,7 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:
     _ = (health, info, agents, rate_limits)
 
 
-def _add_query_routes(app: FastAPI) -> None:
+def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure, too-many-statements]
     """Register the agent execution routes."""
 
     @app.post(
@@ -412,7 +406,7 @@ def _add_query_routes(app: FastAPI) -> None:
             QueryResponse | CodexQueryResponse, Field(discriminator="agent")
         ],
     )
-    async def run_query(  # pyright: ignore[reportUnusedFunction]
+    async def run_query(  # ruff: ignore[complex-structure, too-many-statements]  # pyright: ignore[reportUnusedFunction]
         body: Annotated[QueryRequest | CodexQueryRequest, Field(discriminator="agent")],
         request: Request,
     ) -> QueryResponse | Response | dict[str, Any]:
@@ -431,28 +425,32 @@ def _add_query_routes(app: FastAPI) -> None:
         """
         if isinstance(body, CodexQueryRequest):
             return await _codex_query_with_disconnect(body, request)
-        check_space(request.app.state.settings)
-        cwd = resolve_cwd(request.app.state.settings, body.cwd)
-        with turn_tmpdir(cwd) as tmpdir:
-            options, timeout, semaphore = await _prepare(request, body, tmpdir)
-            agent_runner: AgentRunner = request.app.state.runner
-            task = cast("asyncio.Task[object]", asyncio.current_task())
+        settings: Settings = request.app.state.settings
+        cwd = resolve_cwd(settings, body.cwd)
+        check_space(settings, cwd)
+        cwd, home, timeout, semaphore = await _prepare(request, body)
+        agent_runner: AgentRunner = request.app.state.runner
+        task = cast("asyncio.Task[object]", asyncio.current_task())
 
-            client_gone = False
+        client_gone = False
 
-            async def watch_disconnect() -> None:
-                nonlocal client_gone
-                while not await request.is_disconnected():  # ASGI disconnect polling  # ruff: ignore[async-busy-wait]
-                    await asyncio.sleep(DISCONNECT_POLL_INTERVAL)
-                logger.info("client disconnected; cancelling agent run")
-                client_gone = True
-                task.cancel()
+        async def watch_disconnect() -> None:
+            nonlocal client_gone
+            while not await request.is_disconnected():  # ASGI disconnect polling  # ruff: ignore[async-busy-wait]
+                await asyncio.sleep(DISCONNECT_POLL_INTERVAL)
+            logger.info("client disconnected; cancelling agent run")
+            client_gone = True
+            task.cancel()
 
-            watcher = asyncio.create_task(watch_disconnect())
-            try:
-                async with asyncio.timeout(timeout):
-                    cwd = resolve_cwd(request.app.state.settings, body.cwd)
-                    async with request.app.state.jobs.workspace(cwd):
+        watcher = asyncio.create_task(watch_disconnect())
+        options_built = False
+        try:  # ruff: ignore[too-many-statements-in-try-clause]
+            async with asyncio.timeout(timeout):
+                async with request.app.state.jobs.workspace(cwd):
+                    check_space(settings, cwd)
+                    with turn_tmpdir(cwd) as tmpdir:
+                        options = build_options(body, settings, cwd, home, tmpdir)
+                        options_built = True
                         stream = agent_runner.stream(body.prompt, options)
                         async with aclosing(
                             cast("AsyncGenerator[Message]", stream)
@@ -460,28 +458,34 @@ def _add_query_routes(app: FastAPI) -> None:
                             return await collect_result(
                                 messages, include_messages=body.include_messages
                             )
-            except asyncio.CancelledError:
-                if client_gone and task.uncancel() == 0:
-                    return Response(status_code=499)
+        except asyncio.CancelledError:
+            if client_gone and task.uncancel() == 0:
+                return Response(status_code=499)
+            raise
+        except TimeoutError as exc:
+            raise HTTPException(
+                status.HTTP_504_GATEWAY_TIMEOUT, "agent run timed out"
+            ) from exc
+        except HTTPException:
+            raise
+        except SandboxSetupError as exc:
+            raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+        except AgentExecutionError as exc:
+            raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+        except Exception as exc:
+            if not options_built:
                 raise
-            except TimeoutError as exc:
-                raise HTTPException(
-                    status.HTTP_504_GATEWAY_TIMEOUT, "agent run timed out"
-                ) from exc
-            except AgentExecutionError as exc:
-                raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
-            except Exception as exc:
-                logger.exception("agent execution failed")
-                raise HTTPException(
-                    status.HTTP_502_BAD_GATEWAY, "agent execution failed"
-                ) from exc
+            logger.exception("agent execution failed")
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY, "agent execution failed"
+            ) from exc
+        finally:
+            watcher.cancel()
+            try:
+                with suppress(asyncio.CancelledError):
+                    await watcher
             finally:
-                watcher.cancel()
-                try:
-                    with suppress(asyncio.CancelledError):
-                        await watcher
-                finally:
-                    semaphore.release()
+                semaphore.release()
 
     _ = run_query
 
