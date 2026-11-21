@@ -248,7 +248,7 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
     async def execute() -> dict[str, Any]:
         async with request.app.state.jobs.workspace(cwd):
             check_space(settings, cwd)
-            with turn_tmpdir(cwd) as tmpdir:
+            async with turn_tmpdir(settings.workspace_root, cwd) as tmpdir:
                 return await codex.run_codex(
                     prompt=body.prompt,
                     cwd=str(cwd),
@@ -402,7 +402,7 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
             async with asyncio.timeout(timeout):
                 async with app.state.jobs.workspace(cwd):
                     check_space(settings, cwd)
-                    with turn_tmpdir(cwd) as tmpdir:
+                    async with turn_tmpdir(settings.workspace_root, cwd) as tmpdir:
                         options = build_options(body, settings, cwd, home, tmpdir)
                         options.tools = []
                         options_built = True
@@ -533,7 +533,7 @@ def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure, 
             async with asyncio.timeout(timeout):
                 async with request.app.state.jobs.workspace(cwd):
                     check_space(settings, cwd)
-                    with turn_tmpdir(cwd) as tmpdir:
+                    async with turn_tmpdir(settings.workspace_root, cwd) as tmpdir:
                         options = build_options(body, settings, cwd, home, tmpdir)
                         options_built = True
                         stream = agent_runner.stream(body.prompt, options)

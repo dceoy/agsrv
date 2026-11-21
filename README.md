@@ -77,12 +77,53 @@ curl -sS https://agsrv.example.net/v1/jobs \
 | `AGSRV_JOBS_MAX_RESULT_BYTES`    | `1048576`                        | Maximum persisted result size |
 | `AGSRV_SANDBOX_ALLOWED_DOMAINS`  | GitHub, PyPI, and npm hosts (see below) | Comma-separated egress allow-list for sandboxed Bash; set-but-empty means no egress |
 
-Each turn uses a private `.agsrv-tmp-<uuid>` directory in its working
-directory as `TMPDIR`. It is removed after the turn, including on errors and
-cancellation. Claude and Codex command environments receive this value. Codex
-read-only sandboxes still enforce their normal write restrictions. Before a turn,
-agsrv checks free space on `/tmp` and the workspace root and returns HTTP 503
-when either enabled threshold is unmet. Queued jobs are checked again at execution.
+Each turn uses a private `.agsrv-tmp-<random>` directory in its working
+directory. Claude receives it as `TMPDIR` in the SDK environment. For Codex, the
+per-turn thread configuration carries
+`shell_environment_policy.set.TMPDIR`; this is verified at the request-payload
+level only (a mocked `thread_start` test). A live Codex child observing the value
+has **not** been verified, because bubblewrap's socket-directory constraint
+blocks that observation. Codex read-only sandboxes still enforce their normal
+write restrictions. Before a turn, agsrv checks free space on `/tmp` and the
+workspace root and returns HTTP 503 when either enabled threshold is unmet.
+Queued jobs are checked again at execution. The Claude rate-limits route spawns a
+Claude child process and gets the same preflight and `TMPDIR` handling.
+
+### Temporary directory design and threat model
+
+Other writers may share the parent directory and can rename or replace entries
+in it, so agsrv never trusts a pathname once it has been used:
+
+- **Ancestors.** The working directory is canonicalised once at admission. The
+  server then opens it by walking from the workspace-root descriptor, one
+  component at a time, with `O_DIRECTORY | O_NOFOLLOW`. A symlink swapped into
+  any ancestor makes the turn fail (HTTP 503) before anything is created, and
+  the walk cannot leave the workspace root.
+- **Creation.** `mkdir` is relative to the held parent descriptor under a random
+  128-bit name (atomic; an existing entry is never reused). The directory is then
+  opened (`O_DIRECTORY | O_NOFOLLOW`), its `(st_dev, st_ino)` recorded, and its
+  mode set to `0700` through the descriptor. `O_CREAT | O_EXCL | O_DIRECTORY` is
+  not used (it fails with `EINVAL` on Linux 6.4 and later).
+- **Removal.** The entry is renamed through the parent descriptor to a fresh
+  tombstone name and its identity is checked against the recorded one. Only then
+  is the tree deleted, with descriptor-relative, `O_NOFOLLOW` operations anchored
+  on the held descriptor. On a mismatch nothing is deleted, an error is logged,
+  and the foreign entry is put back if its original name is free (otherwise it
+  stays under the tombstone name). Deletion runs in a worker thread, off the
+  event loop.
+- **Rollback.** If setup fails after `mkdir`, whatever was created is removed
+  through the same anchored path before the error propagates.
+
+Residual risks: children necessarily receive a path *string*, so a hostile
+writer can influence what a child does with it; it cannot redirect agsrv's own
+creation or deletion onto foreign data. A writer that enumerates the parent and
+swaps the new entry in the instant between `mkdir` and the following `open` is
+not detectable by identity alone; agsrv therefore refuses to adopt anything that
+is not an empty directory owned by the server user, but cannot rule out an
+attacker-owned empty directory being adopted. The workspace root path and
+everything above it are administrator-controlled and trusted. A directory that a
+turn moves away itself is reported and left in place. The Codex child itself is
+not observed live, as noted above.
 
 The default sandbox domains are `github.com`, `api.github.com`,
 `codeload.github.com`, `uploads.github.com`, `raw.githubusercontent.com`,

@@ -433,7 +433,7 @@ class JobManager:
         if isinstance(body, QueryRequest):
             async with self.app.state.semaphore:
                 check_space(settings, cwd)
-                with turn_tmpdir(cwd) as tmpdir:
+                async with turn_tmpdir(settings.workspace_root, cwd) as tmpdir:
                     home = service_home() if body.sandbox else None
                     options = build_options(body, settings, cwd, home, tmpdir)
                     runner = self.app.state.runner
@@ -450,7 +450,7 @@ class JobManager:
             raise RuntimeError(msg)
         async with self.app.state.codex_semaphore:
             check_space(settings, cwd)
-            with turn_tmpdir(cwd) as tmpdir:
+            async with turn_tmpdir(settings.workspace_root, cwd) as tmpdir:
                 return await codex.run_codex(
                     prompt=body.prompt,
                     cwd=str(cwd),
