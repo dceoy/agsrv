@@ -5,7 +5,7 @@ from __future__ import annotations
 # pyright: reportPrivateUsage=false
 import asyncio
 from dataclasses import replace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -19,6 +19,7 @@ from tests.test_jobs import AUTH, BODY, _wait
 from tests.test_main import FakeRunner, canned
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
     from pathlib import Path
 
 
@@ -108,6 +109,34 @@ async def test_auth_status_uses_query_environment(
 
 
 @pytest.mark.asyncio
+async def test_auth_status_matches_sdk_turn_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``auth status`` has no CLAUDECODE and runs in the workspace."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    monkeypatch.setenv("CLAUDECODE", "1")
+    fake_cli(
+        tmp_path,
+        monkeypatch,
+        body=(
+            '[ -z "${CLAUDECODE+x}" ] || exit 3\n'
+            f'[ "$(pwd -P)" = "{workspace.resolve()}" ] || exit 4'
+        ),
+    )
+    assert await claude.probe(FakeRunner(), Settings(workspace_root=workspace))
+
+
+@pytest.mark.asyncio
+async def test_auth_status_tolerates_leading_noise(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A warning line before the JSON object still parses."""
+    fake_cli(tmp_path, monkeypatch, body="echo 'warning: something odd'")
+    assert await claude.probe(FakeRunner(), Settings(workspace_root=tmp_path))
+
+
+@pytest.mark.asyncio
 async def test_auth_status_spawn_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -131,7 +160,21 @@ async def test_auth_status_timeout(
     """A hanging ``auth status`` is killed and reported unhealthy."""
     fake_cli(tmp_path, monkeypatch, body="exec sleep 30")
     monkeypatch.setattr(claude, "AUTH_STATUS_TIMEOUT", 0.2)
+    spawned: list[asyncio.subprocess.Process] = []
+    real = cast(
+        "Callable[..., Awaitable[asyncio.subprocess.Process]]",
+        asyncio.create_subprocess_exec,
+    )
+
+    async def spy(*args: object, **kwargs: object) -> asyncio.subprocess.Process:
+        process = await real(*args, **kwargs)
+        spawned.append(process)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spy)
     assert not await claude.probe(FakeRunner(), Settings(workspace_root=tmp_path))
+    assert len(spawned) == 1
+    assert spawned[0].returncode is not None
 
 
 @pytest.mark.asyncio

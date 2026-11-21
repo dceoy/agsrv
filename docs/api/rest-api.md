@@ -190,7 +190,9 @@ return an error result, and the bundled CLI's `auth status` reports
 spawnable CLI whose `/usage` run succeeds; it does not prove the credential is
 still valid server-side (an expired or revoked token can pass until a real turn
 runs). While the Claude concurrency slot is busy, this endpoint returns the last
-cached health value (even if expired) and never responds 429 because of the probe.
+cached health value (even if expired) and never responds 429 because of the
+Claude probe. The Codex entry is unaffected: with Codex enabled and its
+concurrency slot busy, this endpoint can still respond 429.
 
 ## `GET /v1/agents/codex/rate-limits`
 

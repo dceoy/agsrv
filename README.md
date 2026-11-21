@@ -217,6 +217,7 @@ return an error result, and the bundled CLI's `auth status` reports
 `loggedIn: true`. This proves a configured, spawnable CLI whose `/usage` run
 succeeds; it does not prove the credential is still valid server-side (an
 expired or revoked token can pass until a real turn runs). `GET /v1/agents`
-never returns 429 because of the probe: while the Claude slot is busy it
-returns the last cached health value.
+never returns 429 because of the Claude probe: while the Claude slot is busy it
+returns the last cached health value. (With Codex enabled and its slot busy,
+the Codex entry can still return 429.)
 Queries return 503 when the selected agent is unavailable.
