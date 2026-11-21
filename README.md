@@ -34,6 +34,10 @@ Server:
 uv sync
 export AGSRV_API_KEY="$(openssl rand -hex 32)"
 export AGSRV_WORKSPACE_ROOT=/srv/workspaces
+# Mandatory since 0.4.0: a service-owned staging directory (mode 0700, outside
+# the workspace root, on the same mount) — without it the server refuses to start.
+sudo mkdir -p /var/lib/agsrv/stage && sudo chmod 700 /var/lib/agsrv/stage
+export AGSRV_TMP_STAGING_DIRS=/srv/workspaces=/var/lib/agsrv/stage
 export ANTHROPIC_API_KEY=...   # or log in with `claude` as the server user
 uv run uvicorn agsrv.main:app --host 127.0.0.1 --port 8000
 ```
@@ -56,8 +60,19 @@ curl -sS https://agsrv.example.net/v1/jobs \
 
 ## Configuration
 
+Three settings decide whether the server starts at all: `AGSRV_API_KEY`
+(without it, execution endpoints return 503 unless
+`AGSRV_ALLOW_UNAUTHENTICATED=true`), `AGSRV_WORKSPACE_ROOT`, and
+`AGSRV_TMP_STAGING_DIRS` — the last is mandatory since 0.4.0 and has no
+default; startup fails without a staging directory for the workspace root's
+mount (see the deployment property below).
+
 | Variable                          | Default                          | Description                                              |
 | --------------------------------- | -------------------------------- | -------------------------------------------------------- |
+| `AGSRV_API_KEY`                  | unset                            | Bearer token clients must send                           |
+| `AGSRV_ALLOW_UNAUTHENTICATED`    | `false`                          | Allow requests with no key configured (local dev only)   |
+| `AGSRV_WORKSPACE_ROOT`           | current directory                | All request `cwd` values must resolve inside this path   |
+| `AGSRV_TMP_STAGING_DIRS`         | **required** (unset: server refuses to start) | `mount_root=staging_dir` pairs, comma-separated; see below |
 | `AGSRV_CODEX_BIN`                | unset (SDK bundled binary)       | Optional Codex executable path                           |
 | `AGSRV_CODEX_ENABLED`            | `true`                           | Enable Codex                                             |
 | `AGSRV_CODEX_MAX_CONCURRENCY`    | `2`                              | Simultaneous Codex runs                                  |
@@ -65,12 +80,8 @@ curl -sS https://agsrv.example.net/v1/jobs \
 | `AGSRV_MUSE_ENABLED`             | `false`                          | Enable Muse (disabled by default, requires login)        |
 | `AGSRV_MUSE_MAX_CONCURRENCY`     | `2`                              | Simultaneous Muse runs                                   |
 | `AGSRV_MUSE_MODEL`               | unset                            | Default model for Muse runs                              |
-| `AGSRV_API_KEY`                  | unset                            | Bearer token clients must send                           |
-| `AGSRV_ALLOW_UNAUTHENTICATED`    | `false`                          | Allow requests with no key configured (local dev only)   |
 | `AGSRV_TMP_MIN_FREE_BYTES`      | `536870912`                      | Minimum free bytes on /tmp; 0 disables the check |
 | `AGSRV_WORKSPACE_MIN_FREE_BYTES`| `1073741824`                     | Minimum free bytes on the workspace filesystem; 0 disables the check |
-| `AGSRV_WORKSPACE_ROOT`           | current directory                | All request `cwd` values must resolve inside this path   |
-| `AGSRV_TMP_STAGING_DIRS`         | **required** (unset: server refuses to start) | `mount_root=staging_dir` pairs, comma-separated; see below |
 | `AGSRV_DEFAULT_MODEL`            | unset (SDK default)              | Model used when a request omits `model`                  |
 | `AGSRV_PERMISSION_MODE`          | `acceptEdits`                    | Default permission mode                                  |
 | `AGSRV_ALLOWED_TOOLS`            | `Read,Write,Edit,Bash,Glob,Grep` | Default auto-approve list (not a restriction; see below) |
@@ -87,10 +98,11 @@ Each turn uses a private `.agsrv-tmp-<random>` directory in its working
 directory. Claude receives it as `TMPDIR` in the SDK environment. For Codex, the
 per-turn thread configuration carries
 `shell_environment_policy.set.TMPDIR`; this is verified at the request-payload
-level only (a mocked `thread_start` test). A live Codex child observing the value
-has **not** been verified, because bubblewrap's socket-directory constraint
-blocks that observation. Codex read-only sandboxes still enforce their normal
-write restrictions. Before a turn, agsrv checks free space on `/tmp`, the
+level (a mocked `thread_start` test) and was also observed live on 2026-11-21:
+in the reference deployment a Codex child printed a `TMPDIR` inside its working
+directory during a smoke run. Treat the live behaviour as environment-dependent —
+bubblewrap's socket-directory constraint can block it on other hosts. Codex
+read-only sandboxes still enforce their normal write restrictions. Before a turn, agsrv checks free space on `/tmp`, the
 workspace root and the working directory (measured on the held descriptors, so
 a working directory on a separate mount must pass its own check) and returns
 HTTP 503 when either enabled threshold is unmet. Queued work is checked again,
@@ -216,7 +228,9 @@ Residual risks:
   administration, service compromise, malicious filesystems and the trusted
   anchors (workspace root, staging directory and their ancestors) are outside
   the model.
-- A live Codex child observing `TMPDIR` is unverified, as noted above.
+- A live Codex child observing `TMPDIR` was verified in the reference
+  deployment, as noted above; on other hosts the bubblewrap constraint may
+  still block it.
 
 The default sandbox domains are `github.com`, `api.github.com`,
 `codeload.github.com`, `uploads.github.com`, `raw.githubusercontent.com`,
@@ -248,6 +262,25 @@ SDK/host version coupling as Codex (`muse-code-sdk==1.4.24` matches `muse 1.4.24
 upgrade them together. Sessions are memory-only (`--no-session-log`) and the
 backend fails closed when durability is not ephemeral. `GET /v1/agents` reports
 `muse` health with a cached probe and never leaks paths or credentials.
+
+## Agent health and rate limits
+
+`GET /v1/agents` reports each agent's `enabled` / `healthy` state from cached
+availability probes (approximately 30 seconds), and queries return 503 when
+the selected agent is disabled or unavailable. The Claude probe runs the local
+`/usage` command and consumes no tokens or subscription allowance; the Muse
+probe checks that a `muse serve` host starts with ephemeral durability. The
+endpoint never returns 429 because of the Claude probe — while the Claude slot
+is busy it serves the last cached value; with Codex enabled and its slot busy,
+the Codex entry can still produce 429.
+
+Each agent also has a rate-limits route (see the endpoints table): Claude's
+returns the local `/usage` result, Codex's the typed
+`account/rateLimits/read` response, and Muse's the host's last-observed
+`usage/read` cache, all without a model turn. A fresh Muse host may have no
+observation yet; its route then returns `available: false`. See
+[docs/api/rest-api.md](docs/api/rest-api.md) for the exact response shapes and
+the precise health definitions.
 
 ## Security model
 
@@ -345,6 +378,9 @@ uv sync
 uv run uvicorn agsrv.main:app --host 127.0.0.1 --port 8000
 ```
 
+Since 0.4.0 the last command needs `AGSRV_TMP_STAGING_DIRS` set first — see
+[docs/api/deployment.md](docs/api/deployment.md) (Local development).
+
 Swagger UI is at `http://127.0.0.1:8000/docs`.
 
 ```sh
@@ -360,17 +396,3 @@ Dependency versions are tracked in the committed `uv.lock`.
 ## License
 
 AGPL-3.0-only. See [LICENSE](LICENSE).
-
-Muse rate limits use the host’s `usage/read` cache without a model turn or subscription allowance. A fresh host may have no observation; in that case `available` is false.
-
-Agent health is measured using cached availability probes (approximately 30 seconds).
-Claude uses its local `/usage` command without consuming tokens or allowance.
-Claude is healthy when the CLI is spawnable, the ephemeral `/usage` run does not
-return an error result, and the bundled CLI's `auth status` reports
-`loggedIn: true`. This proves a configured, spawnable CLI whose `/usage` run
-succeeds; it does not prove the credential is still valid server-side (an
-expired or revoked token can pass until a real turn runs). `GET /v1/agents`
-never returns 429 because of the Claude probe: while the Claude slot is busy it
-returns the last cached health value. (With Codex enabled and its slot busy,
-the Codex entry can still return 429.)
-Queries return 503 when the selected agent is unavailable.
