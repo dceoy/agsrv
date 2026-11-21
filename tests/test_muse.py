@@ -6,7 +6,7 @@ import asyncio
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -880,7 +880,7 @@ async def test_disabled_muse_job(
 
 
 def test_muse_rate_limits(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Usage endpoint reads cached windows and handles missing data and errors."""
+    """Usage endpoint reads refreshed windows and handles missing data and errors."""
     monkeypatch.setattr(muse, "probe", AsyncMock(return_value=True))
     raw = {
         "usage": {
@@ -962,12 +962,12 @@ async def test_muse_cleanup_and_unresponsive_turn(
 
 @pytest.mark.asyncio
 async def test_muse_sandbox_and_usage_read(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Both probe and execution reject unavailable sandbox; usage uses SDK read."""
+    """Both probe and execution reject unavailable sandbox; usage refreshes."""
     client = MagicMock()
     client.durability = SimpleNamespace(kind="ephemeral")
     client.initialize_result = {"sandboxAvailability": "unavailable"}
     client.close = AsyncMock()
-    client.read_usage = AsyncMock(return_value={"usage": {}})
+    client.request = AsyncMock(return_value={"usage": {}})
     monkeypatch.setattr(muse.MuseClient, "spawn", AsyncMock(return_value=client))
     assert not await muse.probe(None)
     with pytest.raises(RuntimeError, match="sandbox"):
@@ -976,7 +976,13 @@ async def test_muse_sandbox_and_usage_read(monkeypatch: pytest.MonkeyPatch) -> N
         await muse.read_usage(None)
     client.initialize_result = {"sandboxAvailability": "available"}
     assert await muse.read_usage(None) == {"usage": {}}
-    client.read_usage.assert_awaited_once()
+    client.request.assert_awaited_once_with("usage/refresh")
+    spawn = cast("AsyncMock", muse.MuseClient.spawn)
+    assert spawn.call_args.args[0].capabilities == {"experimentalApi": True}
+    client.request.side_effect = RuntimeError("refresh failed")
+    assert await muse.read_usage(None) == {}
+    spawn.side_effect = OSError("spawn failed")
+    assert await muse.read_usage(None) == {}
 
 
 def test_invalid_usage() -> None:
@@ -1019,7 +1025,7 @@ def test_usage_reader_availability_route(
     host.durability = SimpleNamespace(kind="ephemeral")
     host.initialize_result = {"sandboxAvailability": "unavailable"}
     host.close = AsyncMock()
-    host.read_usage = AsyncMock(side_effect=RuntimeError("read failed"))
+    host.request = AsyncMock(side_effect=RuntimeError("refresh failed"))
     monkeypatch.setattr(muse.MuseClient, "spawn", AsyncMock(return_value=host))
     app = create_app(
         Settings(api_key="key", workspace_root=tmp_path, muse_enabled=True)
@@ -1030,10 +1036,12 @@ def test_usage_reader_availability_route(
     response = client.get(url, headers=headers)
     assert response.status_code == 503
     assert response.json()["detail"] == "Muse is disabled or unavailable"
-    host.read_usage.assert_not_awaited()
+    host.request.assert_not_awaited()
     host.initialize_result = {"sandboxAvailability": "available"}
-    assert client.get(url, headers=headers).status_code == 502
-    host.read_usage.assert_awaited_once()
+    response = client.get(url, headers=headers)
+    assert response.status_code == 200
+    assert response.json()["available"] is False
+    host.request.assert_awaited_once_with("usage/refresh")
 
 
 @pytest.mark.asyncio

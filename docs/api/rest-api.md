@@ -228,11 +228,10 @@ workspace turn.
 
 ## `GET /v1/agents/muse/rate-limits`
 
-Returns the host's last-observed subscription usage without a model call or a
-session. `five_hour` and `seven_day` contain `used_percent` and an ISO 8601
+Actively refreshes subscription usage via the experimental Muse host
+`usage/refresh` API without a model call or a session. `five_hour` and `seven_day` contain `used_percent` and an ISO 8601
 `resets_at`, or null when unavailable. `raw` and `backend` preserve the SDK
-payload; `fetched_at` is the read time. A fresh host may have no cached usage,
-in which case `available` is false. Disabled or unavailable Muse returns 503;
+payload; `fetched_at` is the read time. If the refresh fails or has no usable windows, `available` is false. Disabled or unavailable Muse returns 503;
 backend failures return 502 and timeouts return 504.
 
 ## `GET /v1/agents/codex/rate-limits`

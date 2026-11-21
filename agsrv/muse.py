@@ -79,7 +79,11 @@ def _is_ephemeral(client: MuseClient[Any]) -> bool:
 
 
 async def _spawn(
-    binary: str | None, cwd: str | None, tmpdir: str | None = None
+    binary: str | None,
+    cwd: str | None,
+    tmpdir: str | None = None,
+    *,
+    experimental: bool = False,
 ) -> MuseClient[Any]:
     env = {**os.environ, "TMPDIR": tmpdir} if tmpdir else None
     opts = MuseClientSpawnOptions(
@@ -88,6 +92,7 @@ async def _spawn(
         args=serve_args(),
         cwd=cwd,
         env=env,
+        capabilities={"experimentalApi": True} if experimental else None,
         on_stderr=_on_stderr,
     )
     client: MuseClient[Any] = await MuseClient.spawn(opts)
@@ -300,20 +305,26 @@ def parse_usage(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 async def read_usage(binary: str | None) -> dict[str, Any]:
-    """Read the host cache without a model turn.
+    """Refresh subscription usage without a model turn.
 
     Returns:
-        The last-observed usage payload.
+        The refreshed usage payload, or an empty dict if the refresh fails.
 
     Raises:
         MuseUnavailableError: If the host is unavailable.
     """
-    client = await _spawn(binary, None)
+    try:
+        client = await _spawn(binary, None, experimental=True)
+    except Exception:  # ruff: ignore[blind-except]  # unavailable usage fails closed
+        return {}
     try:
         if not _is_ephemeral(client) or not _sandbox_available(client):
             msg = "Muse unavailable"
             raise MuseUnavailableError(msg)
-        return dict(await client.read_usage())
+        try:
+            return dict(await client.request("usage/refresh"))
+        except Exception:  # ruff: ignore[blind-except]  # unavailable usage fails closed
+            return {}
     finally:
         await _close(client)
 
