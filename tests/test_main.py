@@ -602,6 +602,7 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
         "AGSRV_API_KEY",
         "AGSRV_ALLOW_UNAUTHENTICATED",
+        "AGSRV_ALLOW_UNSANDBOXED",
         "AGSRV_WORKSPACE_ROOT",
         "AGSRV_DEFAULT_MODEL",
         "AGSRV_PERMISSION_MODE",
@@ -617,6 +618,7 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = Settings.from_env()
     assert settings.api_key is None
     assert settings.allow_unauthenticated is False
+    assert settings.allow_unsandboxed is True
     assert settings.workspace_root == Path.cwd().resolve()
     assert settings.default_model is None
     assert settings.permission_mode == "acceptEdits"
@@ -634,6 +636,7 @@ def test_settings_from_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     """Verify explicit environment parsing."""
     monkeypatch.setenv("AGSRV_API_KEY", "k")
     monkeypatch.setenv("AGSRV_ALLOW_UNAUTHENTICATED", "TRUE")
+    monkeypatch.setenv("AGSRV_ALLOW_UNSANDBOXED", "false")
     monkeypatch.setenv("AGSRV_WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setenv("AGSRV_DEFAULT_MODEL", "mm")
     monkeypatch.setenv("AGSRV_PERMISSION_MODE", "plan")
@@ -647,6 +650,7 @@ def test_settings_from_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     settings = Settings.from_env()
     assert settings.api_key == "k"
     assert settings.allow_unauthenticated is True
+    assert settings.allow_unsandboxed is False
     assert settings.workspace_root == tmp_path.resolve()
     assert settings.default_model == "mm"
     assert settings.permission_mode == "plan"

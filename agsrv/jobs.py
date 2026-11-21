@@ -27,6 +27,7 @@ from agsrv.schemas import CodexQueryRequest, MuseQueryRequest, QueryRequest
 from agsrv.security import (
     check_permission_mode,
     check_sandbox_cwd,
+    check_sandbox_opt_out,
     check_sandbox_request,
     resolve_cwd,
 )
@@ -199,6 +200,8 @@ class JobManager:
                         status.HTTP_503_SERVICE_UNAVAILABLE,
                         "sandbox unavailable",
                     ) from exc
+        elif isinstance(body, MuseQueryRequest):
+            check_sandbox_opt_out(settings, sandbox=body.sandbox)
         return cwd
 
     def submit(

@@ -95,6 +95,16 @@ def resolve_cwd(settings: Settings, cwd: str | None) -> Path:
 EGRESS_EXPANDING_MODES = frozenset({"auto", "bypassPermissions"})
 
 
+def check_sandbox_opt_out(settings: Settings, *, sandbox: bool) -> None:
+    """Enforce the operator's sandbox policy for Claude and Muse.
+
+    Raises:
+        HTTPException: 403 if the request disables a required sandbox.
+    """
+    if not sandbox and not settings.allow_unsandboxed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "unsandboxed runs are disabled")
+
+
 def check_sandbox_request(
     settings: Settings, requested: bool, permission_mode: str | None = None
 ) -> None:
@@ -109,6 +119,7 @@ def check_sandbox_request(
     Raises:
         HTTPException: 403 if the effective permission mode can expand egress.
     """
+    check_sandbox_opt_out(settings, sandbox=requested)
     if not requested:
         return
     mode = permission_mode or settings.permission_mode

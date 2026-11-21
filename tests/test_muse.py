@@ -213,6 +213,7 @@ async def test_spawn_filters_env(
     monkeypatch.setattr(muse.MuseClient, "spawn", spawn)
     client = await muse._spawn(None, None, tmpdir)  # pyright: ignore[reportPrivateUsage]
     await muse._close(client)  # pyright: ignore[reportPrivateUsage]
+    assert spawn.await_args is not None
     options: MuseClientSpawnOptions = spawn.await_args.args[0]
     assert options.env is not None
     assert set(SANDBOX_DENIED_ENV_VARS).isdisjoint(options.env)

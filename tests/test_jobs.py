@@ -86,6 +86,19 @@ def test_submit_poll_and_idempotency(tmp_path: Path) -> None:
         assert client.get("/v1/jobs/unknown", headers=AUTH).status_code == 404
 
 
+@pytest.mark.parametrize("path", ["/v1/query", "/v1/jobs"])
+@pytest.mark.parametrize("agent", ["claude", "muse"])
+def test_operator_forbids_sandbox_opt_out(
+    tmp_path: Path, path: str, agent: str
+) -> None:
+    """Reject the opt-out before running a query or accepting a job."""
+    settings = _settings(tmp_path, allow_unsandboxed=False, muse_enabled=True)
+    with TestClient(create_app(settings, FakeRunner())) as client:
+        response = client.post(path, headers=AUTH, json={**BODY, "agent": agent})
+        assert response.status_code == 403
+        assert response.json()["detail"] == "unsandboxed runs are disabled"
+
+
 def test_queue_saturation_and_cancellation(tmp_path: Path) -> None:
     """Queue admission is bounded, and queued/running jobs can be cancelled."""
     runner = FakeRunner(delay=0.3)

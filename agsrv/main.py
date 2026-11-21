@@ -36,6 +36,7 @@ from agsrv.security import (
     auth_dependency,
     check_permission_mode,
     check_sandbox_cwd,
+    check_sandbox_opt_out,
     check_sandbox_request,
     resolve_cwd,
 )
@@ -530,6 +531,7 @@ async def _muse_query(  # ruff: ignore[complex-structure]
 ) -> dict[str, Any]:
     settings: Settings = request.app.state.settings
     anchors: Anchors = request.app.state.anchors
+    check_sandbox_opt_out(settings, sandbox=body.sandbox)
     cwd = resolve_cwd(settings, body.cwd)
     timeout = body.timeout_seconds or settings.max_timeout_seconds
     if timeout > settings.max_timeout_seconds:

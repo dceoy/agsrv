@@ -104,6 +104,7 @@ class Settings:
         workspace_min_free_bytes: Minimum free bytes on the workspace (0 disables).
         api_key: Bearer token required from clients, if any.
         allow_unauthenticated: Permit requests when no API key is configured.
+        allow_unsandboxed: Permit Claude and Muse requests to disable their sandbox.
         workspace_root: Directory that all agent working directories must stay in.
         default_model: Model used when a request does not specify one.
         permission_mode: Default permission mode for agent runs.
@@ -131,6 +132,7 @@ class Settings:
 
     api_key: str | None = None
     allow_unauthenticated: bool = False
+    allow_unsandboxed: bool = True
     workspace_root: Path = field(default_factory=lambda: Path.cwd().resolve())
     default_model: str | None = None
     permission_mode: str = "acceptEdits"
@@ -190,6 +192,7 @@ class Settings:
             ),
             api_key=_env_api_key(),
             allow_unauthenticated=_env_bool("AGSRV_ALLOW_UNAUTHENTICATED"),
+            allow_unsandboxed=_env_bool("AGSRV_ALLOW_UNSANDBOXED", default=True),
             workspace_root=Path(
                 os.environ.get("AGSRV_WORKSPACE_ROOT", str(Path.cwd()))
             ).resolve(),
