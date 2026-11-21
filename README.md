@@ -65,6 +65,7 @@ curl -sS https://agsrv.example.net/v1/jobs \
 | `AGSRV_TMP_MIN_FREE_BYTES`      | `536870912`                      | Minimum free bytes on /tmp; 0 disables the check |
 | `AGSRV_WORKSPACE_MIN_FREE_BYTES`| `1073741824`                     | Minimum free bytes on the workspace filesystem; 0 disables the check |
 | `AGSRV_WORKSPACE_ROOT`           | current directory                | All request `cwd` values must resolve inside this path   |
+| `AGSRV_TMP_STAGING_DIRS`         | unset (turns unavailable)        | `mount_root=staging_dir` pairs, comma-separated; see below |
 | `AGSRV_DEFAULT_MODEL`            | unset (SDK default)              | Model used when a request omits `model`                  |
 | `AGSRV_PERMISSION_MODE`          | `acceptEdits`                    | Default permission mode                                  |
 | `AGSRV_ALLOWED_TOOLS`            | `Read,Write,Edit,Bash,Glob,Grep` | Default auto-approve list (not a restriction; see below) |
@@ -84,46 +85,90 @@ per-turn thread configuration carries
 level only (a mocked `thread_start` test). A live Codex child observing the value
 has **not** been verified, because bubblewrap's socket-directory constraint
 blocks that observation. Codex read-only sandboxes still enforce their normal
-write restrictions. Before a turn, agsrv checks free space on `/tmp` and the
-workspace root and returns HTTP 503 when either enabled threshold is unmet.
-Queued jobs are checked again at execution. The Claude rate-limits route spawns a
-Claude child process and gets the same preflight and `TMPDIR` handling.
+write restrictions. Before a turn, agsrv checks free space on `/tmp`, the
+workspace root and the working directory (measured on the held descriptors, so
+a working directory on a separate mount must pass its own check) and returns
+HTTP 503 when either enabled threshold is unmet. Queued work is checked again,
+after its last wait, immediately before creation. The Claude rate-limits route
+spawns a Claude child process and gets the same admission, preflight and
+`TMPDIR` handling; the Codex rate-limits route starts no workspace turn.
 
 ### Temporary directory design and threat model
 
-Other writers may share the parent directory and can rename or replace entries
-in it, so agsrv never trusts a pathname once it has been used:
+**Required deployment property.** Turns need one pre-provisioned,
+service-controlled *staging* directory per workspace mount, configured with
+`AGSRV_TMP_STAGING_DIRS` (comma-separated `mount_root=staging_dir` pairs; the most
+specific mount root containing the working directory wins). Each staging
+directory must be owned by the service, mode `0700`, outside the workspace root,
+on the same filesystem as its mount root, and unreachable by workspace writers.
+They are opened and validated at startup (startup fails on an unsafe one) and the
+descriptors are held for the life of the server. A mount without a staging
+directory runs no turns (HTTP 503). A local filesystem with atomic rename and
+`RENAME_NOREPLACE` support is required; `EXDEV`, unsupported flags or a missing
+`renameat2` fail closed. Example: `AGSRV_WORKSPACE_ROOT=/srv/ws`
+`AGSRV_TMP_STAGING_DIRS=/srv/ws=/var/lib/agsrv/stage`.
 
-- **Ancestors.** The working directory is canonicalised once at admission. The
-  server then opens it by walking from the workspace-root descriptor, one
-  component at a time, with `O_DIRECTORY | O_NOFOLLOW`. A symlink swapped into
-  any ancestor makes the turn fail (HTTP 503) before anything is created, and
-  the walk cannot leave the workspace root.
-- **Creation.** `mkdir` is relative to the held parent descriptor under a random
-  128-bit name (atomic; an existing entry is never reused). The directory is then
-  opened (`O_DIRECTORY | O_NOFOLLOW`), its `(st_dev, st_ino)` recorded, and its
-  mode set to `0700` through the descriptor. `O_CREAT | O_EXCL | O_DIRECTORY` is
-  not used (it fails with `EINVAL` on Linux 6.4 and later).
-- **Removal.** The entry is renamed through the parent descriptor to a fresh
-  tombstone name and its identity is checked against the recorded one. Only then
-  is the tree deleted, with descriptor-relative, `O_NOFOLLOW` operations anchored
-  on the held descriptor. On a mismatch nothing is deleted, an error is logged,
-  and the foreign entry is put back if its original name is free (otherwise it
-  stays under the tombstone name). Deletion runs in a worker thread, off the
-  event loop.
-- **Rollback.** If setup fails after `mkdir`, whatever was created is removed
-  through the same anchored path before the error propagates.
+Other writers may share the working directory and can list it, rename or remove
+entries, substitute real directories or symlinks, and change ancestors. Random
+names and the workspace lease do not establish ownership of an entry, so
+ownership is decided by an open descriptor, never by a name. The protected object
+is the top-level tree agsrv created for the turn (its contents are disposable);
+a different entry substituted for it must survive, even if empty or owned by the
+service user.
 
-Residual risks: children necessarily receive a path *string*, so a hostile
-writer can influence what a child does with it; it cannot redirect agsrv's own
-creation or deletion onto foreign data. A writer that enumerates the parent and
-swaps the new entry in the instant between `mkdir` and the following `open` is
-not detectable by identity alone; agsrv therefore refuses to adopt anything that
-is not an empty directory owned by the server user, but cannot rule out an
-empty directory planted by a same-user attacker being adopted (deleting it harms nothing, but later contents it receives would be deleted). The workspace root path and
-everything above it are administrator-controlled and trusted. A directory that a
-turn moves away itself is reported and left in place. The Codex child itself is
-not observed live, as noted above.
+- **Admission.** The accepted working directory is opened once by walking from
+  the workspace-root descriptor, one component at a time, with
+  `O_DIRECTORY | O_NOFOLLOW`, and that descriptor is held by the request or job
+  (including through the job queue and detached Codex execution). After the last
+  wait the walk is repeated and compared with `os.path.samestat`; a missing
+  component, symlink or different directory fails the turn (HTTP 503) before
+  anything is published or launched. All later server mutations use the held
+  descriptor, so a later symlink swap cannot redirect them.
+- **Create privately, publish atomically.** The directory is created in staging
+  (`mkdir` under a random name, `chmod 0700` while still private, opened and
+  verified through its descriptor) and then published into the working directory
+  with `renameat2(RENAME_NOREPLACE)`, which never overwrites an existing entry,
+  even an empty directory. `O_CREAT | O_EXCL | O_DIRECTORY` is not used (it fails
+  with `EINVAL` on Linux 6.4 and later).
+- **Reclaim before delete.** Cleanup renames the public entry from the held
+  working-directory descriptor back into staging (no-replace), checks it against
+  the held descriptor, and only on a match runs `shutil.rmtree(name, dir_fd=...)`
+  (symlink-attack resistant; required at startup). All deletion, including the
+  final `rmdir`, happens under the protected staging parent. On a mismatch
+  nothing is traversed or deleted: the entry is renamed back if the public name
+  is free; otherwise it stays in staging and its recovery name is logged.
+- **Off the event loop, shielded.** Cleanup runs in one worker thread. If the
+  owning task is cancelled (repeatedly, too) the same worker is awaited to the
+  end, and only then is cancellation propagated and the workspace lease released.
+  At shutdown turn owners are drained before the shared descriptors are closed.
+- **Rollback.** A failure after the private `mkdir` removes the staged directory
+  by its private name; a failure after publication runs the full
+  reclaim-and-verify sequence. The original error, result or cancellation is
+  preserved; uncertain or partly removed entries are retained and logged.
+
+Residual risks:
+
+- Children receive a `TMPDIR` path *string* and resolve it (and their cwd) in
+  their own namespace at the time of use. A writer can substitute the leaf or an
+  ancestor, so a child can fail, write into a replacement, or follow a symlink if
+  its sandbox permits. agsrv's own operations stay on the held descriptors and
+  cannot be redirected, but give the child's path lookup no identity guarantee.
+- A descriptor identifies its object even if an ancestor is moved; continuous
+  containment against reparenting needs additional namespace or permission
+  constraints.
+- Turn contents are disposable: anyone able to put data *inside* the genuine turn
+  tree puts it in cleanup scope. A writer that repeatedly moves entries, a
+  surviving writer that keeps modifying contents, filesystem errors or process
+  death can prevent reclamation. A crash can leave a public or staged entry;
+  there is deliberately no name-based scavenger. Subdirectories made
+  non-listable by a child may keep a partially removed entry in staging (logged).
+- `0700` is also a deployment property: an unrestricted same-UID child that can
+  reach staging (for example through the service's `/proc` descriptors) defeats
+  it, and such a deployment needs credential or namespace isolation. Mount
+  administration, service compromise, malicious filesystems and the trusted
+  anchors (workspace root, staging directory and their ancestors) are outside
+  the model.
+- A live Codex child observing `TMPDIR` is unverified, as noted above.
 
 The default sandbox domains are `github.com`, `api.github.com`,
 `codeload.github.com`, `uploads.github.com`, `raw.githubusercontent.com`,
