@@ -2,9 +2,17 @@
 
 ## Local development
 
+Since 0.4.0 the server refuses to start without a staging directory for the
+workspace root's mount (see `AGSRV_TMP_STAGING_DIRS` in the README), even for
+local development. Provision one outside the workspace root and point the
+setting at it:
+
 ```sh
 uv sync
-AGSRV_ALLOW_UNAUTHENTICATED=true uv run uvicorn agsrv.main:app --host 127.0.0.1 --port 8000
+mkdir -p ~/.agsrv-stage && chmod 700 ~/.agsrv-stage
+AGSRV_ALLOW_UNAUTHENTICATED=true \
+AGSRV_TMP_STAGING_DIRS="$PWD=$HOME/.agsrv-stage" \
+  uv run uvicorn agsrv.main:app --host 127.0.0.1 --port 8000
 ```
 
 ## Remote server
@@ -20,19 +28,26 @@ AGSRV_ALLOW_UNAUTHENTICATED=true uv run uvicorn agsrv.main:app --host 127.0.0.1 
    either set `ANTHROPIC_API_KEY` in the environment file below, or log in once
    with `claude` as the user that runs the service.
 
-3. Create `/etc/agsrv.env` (mode `0600`):
+3. Provision a staging directory (mandatory since 0.4.0): service-owned,
+   mode `0700`, outside the workspace root, on the same mount as it — for
+   example `install -d -m 700 -o agsrv /var/lib/agsrv/stage`. Without it the
+   server fails to start.
+
+4. Create `/etc/agsrv.env` (mode `0600`):
 
    ```sh
    AGSRV_API_KEY=<long random secret, e.g. openssl rand -hex 32>
    AGSRV_WORKSPACE_ROOT=/srv/workspaces
+   AGSRV_TMP_STAGING_DIRS=/srv/workspaces=/var/lib/agsrv/stage
    ANTHROPIC_API_KEY=sk-ant-...
    ```
 
-4. Run uvicorn on loopback or a private interface, and expose it only through
+5. Run uvicorn on loopback or a private interface, and expose it only through
    TLS (a reverse proxy) or a private network such as Tailscale or an SSH
    tunnel (`ssh -L 8000:127.0.0.1:8000 server`).
 
-5. Run it as an unprivileged user that owns only the workspace directory.
+6. Run it as an unprivileged user that owns only the workspace directory (and
+   the staging directory above).
    Workspace confinement limits the starting `cwd`, not what `Bash` can reach.
    The agent inherits this environment file, so a run can read
    `AGSRV_API_KEY` and `ANTHROPIC_API_KEY` from its own environment — the

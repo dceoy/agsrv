@@ -5,7 +5,7 @@ FastAPI also serves `/docs` and `/openapi.json`.
 
 ## Statelessness contract
 
-Every request is one ephemeral Claude or Codex run. The server keeps no sessions
+Every request is one ephemeral Claude, Codex or Muse run. The server keeps no sessions
 and offers no resume, continue, or fork. The `session_id` in responses is
 informational only and cannot be sent back: request bodies with unknown fields
 (such as `resume` or `session_id`) are rejected with `422`. To continue work,
@@ -296,7 +296,7 @@ The old SSE stream endpoint is deliberately removed.
 | 422    | Invalid body (empty prompt, unknown/stateful fields, bad ranges)       |
 | 429    | Concurrency or pending-job capacity reached (jobs include Retry-After) |
 | 502    | SDK/CLI failure, or the run ended without a result message             |
-| 503    | `AGSRV_API_KEY` not configured and unauthenticated access not allowed; sandbox prerequisites unavailable or Claude, Codex or Muse disabled/unavailable |
+| 503    | `AGSRV_API_KEY` not configured and unauthenticated access not allowed; sandbox prerequisites unavailable; Claude, Codex or Muse disabled/unavailable; or the disk-space preflight failed (free space on `/tmp`, the workspace root or the working directory below its threshold, or no staging directory configured for the working directory's mount) |
 | 504    | Run exceeded its timeout                                               |
 
 Errors use FastAPI's `{"detail": "..."}` body.
