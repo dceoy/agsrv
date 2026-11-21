@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Annotated
 
 from fastapi import Header, HTTPException, Request, status
 
+from agsrv.sandbox import SandboxSetupError, service_home
+
 if TYPE_CHECKING:
     from agsrv.config import Settings
 
@@ -131,7 +133,7 @@ def check_sandbox_request(
         )
 
 
-def check_sandbox_cwd(cwd: Path, home: Path) -> None:
+def check_sandbox_cwd(cwd: Path, home: Path | None = None) -> None:
     """Reject working directories that would make the shared cache writable.
 
     The CLI grants write access to the whole working directory, so it must not
@@ -140,12 +142,18 @@ def check_sandbox_cwd(cwd: Path, home: Path) -> None:
 
     Args:
         cwd: Resolved working directory.
-        home: Home directory of the server user.
+        home: Service home directory, if already resolved.
 
     Raises:
-        HTTPException: 403 if the directory overlaps the shared cache.
+        HTTPException: 403 if the directory overlaps the shared cache; 503 if
+            the service home directory is unavailable.
     """
-    cache = home.resolve() / ".cache"
+    try:
+        cache = (home or service_home()).resolve() / ".cache"
+    except SandboxSetupError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "sandbox unavailable"
+        ) from exc
     if cwd.is_relative_to(cache / "agsrv-sandbox"):
         return
     if cache.is_relative_to(cwd) or cwd.is_relative_to(cache):

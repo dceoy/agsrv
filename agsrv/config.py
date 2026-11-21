@@ -160,11 +160,15 @@ class Settings:
     tmp_staging_dirs: tuple[tuple[Path, Path], ...] = ()
 
     def __post_init__(self) -> None:
-        """Validate disk thresholds and staging locations.
+        """Validate the workspace root, disk thresholds and staging locations.
 
         Raises:
-            ValueError: If a threshold is negative or a staging path is relative.
+            ValueError: If the root contains the service home, a threshold is
+                negative, or a staging path is relative.
         """
+        if Path.home().resolve().is_relative_to(self.workspace_root.resolve()):
+            msg = "AGSRV_WORKSPACE_ROOT must not contain the service home directory"
+            raise ValueError(msg)
         for mount, stage in self.tmp_staging_dirs:
             if not (mount.is_absolute() and stage.is_absolute()):
                 msg = "AGSRV_TMP_STAGING_DIRS paths must be absolute"

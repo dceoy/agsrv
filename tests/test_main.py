@@ -1292,30 +1292,27 @@ def test_unsandboxed_egress_mode_allowed(sbx: SandboxEnv) -> None:
     assert runner.stream_calls == 1
 
 
-@pytest.mark.parametrize("path", ["/v1/query"])
-def test_sandbox_rejects_cwd_at_home_root(sbx: SandboxEnv, path: str) -> None:
-    """Verify a workspace rooted at the service home is rejected without cwd."""
-    (sbx.home / ".cache").mkdir()
-    client, runner = sbx_client(sbx, root=sbx.home)
-    response = client.post(path, json=SANDBOX_BODY, headers=AUTH)
-    assert response.status_code == 403
-    assert "cache" in response.json()["detail"]
-    assert runner.stream_calls == 0
-    assert not sandbox_cache_dir(sbx.home).exists()
+def test_settings_reject_workspace_containing_home(sbx: SandboxEnv) -> None:
+    """Reject the service home and its ancestors, including symlink aliases."""
+    alias = sbx.workspace / "alias"
+    alias.symlink_to(sbx.home.parent)
+    for root in (sbx.home, sbx.home.parent, alias):
+        with pytest.raises(ValueError, match="must not contain the service home"):
+            Settings(workspace_root=root)
 
 
-def test_sandbox_rejects_cwd_ancestor_and_shared_cache(sbx: SandboxEnv) -> None:
-    """Verify ancestors of ~/.cache and non-dedicated cache subdirs are rejected."""
+def test_sandbox_rejects_shared_cache(sbx: SandboxEnv) -> None:
+    """Reject the cache and non-dedicated cache subdirectories."""
     cache = sbx.home / ".cache"
     (cache / "pip").mkdir(parents=True)
     (cache / "agsrv-sandbox" / "work").mkdir(parents=True)
-    client, runner = sbx_client(sbx, root=sbx.home)
-    for cwd in (".cache", ".cache/pip", "."):
+    client, runner = sbx_client(sbx, root=cache)
+    for cwd in (".", "pip"):
         body = {**SANDBOX_BODY, "cwd": cwd}
         response = client.post("/v1/query", json=body, headers=AUTH)
         assert response.status_code == 403, cwd
     assert runner.stream_calls == 0
-    ok = {**SANDBOX_BODY, "cwd": ".cache/agsrv-sandbox/work"}
+    ok = {**SANDBOX_BODY, "cwd": "agsrv-sandbox/work"}
     assert client.post("/v1/query", json=ok, headers=AUTH).status_code == 200
     assert runner.stream_calls == 1
 
@@ -1324,15 +1321,17 @@ def test_sandbox_allows_unrelated_cwd_under_home(sbx: SandboxEnv) -> None:
     """Verify a sibling directory of ~/.cache is allowed."""
     project = sbx.home / "project"
     project.mkdir()
-    client, runner = sbx_client(sbx, root=sbx.home)
-    body = {**SANDBOX_BODY, "cwd": "project"}
+    client, runner = sbx_client(sbx, root=project)
+    body = SANDBOX_BODY
     assert client.post("/v1/query", json=body, headers=AUTH).status_code == 200
     assert runner.stream_calls == 1
 
 
-def test_unsandboxed_cwd_at_home_allowed(sbx: SandboxEnv) -> None:
+def test_unsandboxed_cwd_at_cache_allowed(sbx: SandboxEnv) -> None:
     """Verify the cache guard applies to sandboxed runs only."""
-    client, runner = sbx_client(sbx, root=sbx.home)
+    cache = sbx.home / ".cache"
+    cache.mkdir()
+    client, runner = sbx_client(sbx, root=cache)
     assert (
         client.post(
             "/v1/query",

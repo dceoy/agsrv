@@ -533,6 +533,8 @@ async def _muse_query(  # ruff: ignore[complex-structure]
     anchors: Anchors = request.app.state.anchors
     check_sandbox_opt_out(settings, sandbox=body.sandbox)
     cwd = resolve_cwd(settings, body.cwd)
+    if body.sandbox:
+        check_sandbox_cwd(cwd)
     timeout = body.timeout_seconds or settings.max_timeout_seconds
     if timeout > settings.max_timeout_seconds:
         raise HTTPException(

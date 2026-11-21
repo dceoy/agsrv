@@ -99,6 +99,23 @@ def test_operator_forbids_sandbox_opt_out(
         assert response.json()["detail"] == "unsandboxed runs are disabled"
 
 
+@pytest.mark.parametrize("path", ["/v1/query", "/v1/jobs"])
+def test_muse_rejects_shared_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """Sandboxed Muse queries and jobs cannot use the shared cache as cwd."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cache = tmp_path / ".cache"
+    cache.mkdir()
+    settings = _settings(cache, muse_enabled=True)
+    with TestClient(create_app(settings)) as client:
+        response = client.post(
+            path, headers=AUTH, json={"agent": "muse", "prompt": "x"}
+        )
+        assert response.status_code == 403
+        assert "shared cache" in response.json()["detail"]
+
+
 def test_queue_saturation_and_cancellation(tmp_path: Path) -> None:
     """Queue admission is bounded, and queued/running jobs can be cancelled."""
     runner = FakeRunner(delay=0.3)
@@ -302,7 +319,7 @@ def test_job_admission_failure_cases(
             msg = "missing home"
             raise SandboxSetupError(msg)
 
-        monkeypatch.setattr("agsrv.jobs.service_home", no_home)
+        monkeypatch.setattr("agsrv.security.service_home", no_home)
         assert (
             client.post(
                 "/v1/jobs", headers=AUTH, json={"agent": "claude", "prompt": "x"}
