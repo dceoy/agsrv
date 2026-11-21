@@ -16,6 +16,7 @@ disconnect, and retrieve the result later.
 | GET    | `/health`          | no   | Readiness probe: `{"status": "ok"}`        |
 | GET    | `/v1/info`         | yes  | Server defaults and limits                 |
 | GET    | `/v1/agents`       | yes  | Agent capabilities and health              |
+| GET    | `/v1/agents/claude/rate-limits` | yes | Claude subscription quota |
 | GET    | `/v1/agents/codex/rate-limits` | yes | Codex account limits              |
 | POST   | `/v1/query`        | yes  | Run one agent query, return the result |
 | POST   | `/v1/jobs`        | yes  | Submit a durable asynchronous job (202)  |
@@ -97,7 +98,9 @@ Codex requests use `"agent": "codex"` and may set `options.sandbox` to
 `"read-only"` (default) or `"workspace-write"`, and `options.network_access`
 to a boolean (default `false`). Codex threads are ephemeral, approvals are
 denied, and explicit network access uses the SDK’s low-level sandbox policy.
-Rate limits come from `account/rateLimits/read`.
+Rate limits come from `account/rateLimits/read`. The Claude rate-limits route
+runs the local `/usage` command and returns normalized windows and the raw text.
+If the output cannot be parsed, it returns `available=false`.
 
 Muse runs (disabled unless `AGSRV_MUSE_ENABLED=true` and the service user is
 logged in to `muse`) use `muse serve --no-session-log --contributor-mode off`

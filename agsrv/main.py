@@ -12,8 +12,8 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import Response
 from pydantic import Field
 
-from agsrv import codex_agent, muse
-from agsrv.agent import (
+from agsrv import codex, muse
+from agsrv.claude import (
     AgentExecutionError,
     AgentRunner,
     SdkAgentRunner,
@@ -39,6 +39,7 @@ from agsrv.security import (
     check_sandbox_request,
     resolve_cwd,
 )
+from agsrv.usage import parse_usage
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Coroutine
@@ -47,7 +48,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 DISCONNECT_POLL_INTERVAL = 0.1
 CODEX_PROBE_TIMEOUT = 10.0
 MUSE_PROBE_TIMEOUT = 10.0
@@ -180,7 +181,7 @@ async def _timed_probe(app: FastAPI, lease: _SlotLease) -> bool:
     Raises:
         asyncio.CancelledError: If the caller is cancelled.
     """
-    task = asyncio.create_task(codex_agent.probe(app.state.settings.codex_bin))
+    task = asyncio.create_task(codex.probe(app.state.settings.codex_bin))
     try:
         done, _ = await asyncio.wait({task}, timeout=CODEX_PROBE_TIMEOUT)
     except asyncio.CancelledError:
@@ -252,7 +253,7 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
 
     async def execute() -> dict[str, Any]:
         async with request.app.state.jobs.workspace(cwd):
-            return await codex_agent.run_codex(
+            return await codex.run_codex(
                 prompt=body.prompt,
                 cwd=str(cwd),
                 model=body.model,
@@ -493,7 +494,7 @@ async def _muse_query_with_disconnect(
             await watcher
 
 
-def _add_meta_routes(app: FastAPI, settings: Settings) -> None:
+def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[complex-structure,too-many-statements]
     """Register the health and info routes."""
 
     @app.get("/health")
@@ -534,7 +535,7 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:
                 "supports": {
                     "sandbox": True,
                     "network_access": False,
-                    "rate_limits": False,
+                    "rate_limits": True,
                     "streaming": False,
                 },
             },
@@ -562,6 +563,73 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:
             },
         }
 
+    @app.get(
+        "/v1/agents/claude/rate-limits",
+        dependencies=[Auth],
+        response_model=dict[str, Any],
+    )
+    async def claude_rate_limits(request: Request) -> dict[str, Any] | Response:  # pyright: ignore[reportUnusedFunction]
+        body = QueryRequest(
+            agent="claude",
+            prompt="/usage",
+            allowed_tools=[],
+            max_turns=1,
+            include_messages=False,
+        )
+        options, timeout, semaphore = await _prepare(request, body)
+        options.tools = []
+        task = cast("asyncio.Task[object]", asyncio.current_task())
+        client_gone = False
+
+        async def watch_disconnect() -> None:
+            nonlocal client_gone
+            while not await request.is_disconnected():  # ruff: ignore[async-busy-wait]
+                await asyncio.sleep(DISCONNECT_POLL_INTERVAL)
+            client_gone = True
+            task.cancel()
+
+        watcher = asyncio.create_task(watch_disconnect())
+        try:  # ruff: ignore[too-many-statements-in-try-clause]
+            async with asyncio.timeout(timeout):
+                cwd = resolve_cwd(settings, body.cwd)
+                async with app.state.jobs.workspace(cwd):
+                    stream = app.state.runner.stream(body.prompt, options)
+                    async with aclosing(
+                        cast("AsyncGenerator[Message]", stream)
+                    ) as messages:
+                        result = await collect_result(messages, include_messages=False)
+                if result.is_error:
+                    msg = "Claude rate limits failed"
+                    raise AgentExecutionError(msg)  # ruff: ignore[raise-within-try]
+                return {
+                    **parse_usage(result.result or ""),
+                    "backend": result.model_dump(mode="json"),
+                }
+        except asyncio.CancelledError:
+            if client_gone and task.uncancel() == 0:
+                return Response(status_code=499)
+            raise
+        except TimeoutError as exc:
+            raise HTTPException(
+                status.HTTP_504_GATEWAY_TIMEOUT, "Claude rate limits timed out"
+            ) from exc
+        except Exception as exc:
+            logger.exception("Claude rate limits failed")
+            raise HTTPException(
+                status.HTTP_502_BAD_GATEWAY, "Claude rate limits failed"
+            ) from exc
+        finally:
+            watcher.cancel()
+            try:
+                cancelling = task.cancelling()
+                try:
+                    await watcher
+                except asyncio.CancelledError:
+                    if task.cancelling() > cancelling:
+                        raise
+            finally:
+                semaphore.release()
+
     @app.get("/v1/agents/codex/rate-limits", dependencies=[Auth])
     async def rate_limits() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         try:
@@ -575,7 +643,7 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:
                         "Codex is disabled or unavailable",
                     )
                 return await _await_codex(
-                    codex_agent.read_rate_limits(settings.codex_bin), lease
+                    codex.read_rate_limits(settings.codex_bin), lease
                 )
         except TimeoutError as exc:
             raise HTTPException(
@@ -589,7 +657,7 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:
                 status.HTTP_502_BAD_GATEWAY, "Codex rate limits failed"
             ) from exc
 
-    _ = (health, info, agents, rate_limits)
+    _ = (health, info, agents, claude_rate_limits, rate_limits)
 
 
 def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure]
