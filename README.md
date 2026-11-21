@@ -134,6 +134,13 @@ unsupported flags or a missing `renameat2` fail closed. Example:
 `AGSRV_WORKSPACE_ROOT=/srv/ws`
 `AGSRV_TMP_STAGING_DIRS=/srv/ws=/var/lib/agsrv/stage`.
 
+The `mount_root` key must be a directory the service can write to on the same
+mount as the staging directory (typically the workspace root); it need not be the
+mount point itself. Keying on the filesystem root `/` fails when the service
+cannot create its probe entries there (for example `Permission denied` on
+`.agsrv-probe-…`). A working shape:
+`AGSRV_TMP_STAGING_DIRS=/home/muse/workspaces=/home/muse/.agsrv-staging`.
+
 Other writers may share the working directory and can list it, rename or remove
 entries, substitute real directories or symlinks, and change ancestors. Random
 names and the workspace lease do not establish ownership of an entry, so
