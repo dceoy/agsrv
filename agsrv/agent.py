@@ -199,7 +199,11 @@ def message_to_dict(message: object) -> dict[str, Any]:
 
 
 def build_options(
-    request: QueryRequest, settings: Settings, cwd: Path, home: Path | None = None
+    request: QueryRequest,
+    settings: Settings,
+    cwd: Path,
+    home: Path | None = None,
+    tmpdir: Path | None = None,
 ) -> ClaudeAgentOptions:
     """Build stateless SDK options from a request and server defaults.
 
@@ -208,6 +212,7 @@ def build_options(
         settings: Server settings.
         cwd: Resolved working directory.
         home: Service home directory for sandboxed runs; looked up if omitted.
+        tmpdir: Private per-turn temporary directory.
 
     Returns:
         SDK options; never sets session/resume fields.
@@ -229,6 +234,8 @@ def build_options(
         "strict_mcp_config": True,
         "system_prompt": {"type": "preset", "preset": "claude_code"},
     }
+    if tmpdir is not None:
+        kwargs["env"]["TMPDIR"] = str(tmpdir)
     model = request.model or settings.default_model
     optional: dict[str, Any] = {
         "model": model,
@@ -241,7 +248,7 @@ def build_options(
         kwargs["cli_path"] = bundled_cli_path()
         prepare_sandbox_cache(home)
         kwargs["sandbox"] = build_sandbox_settings(settings, home)
-        kwargs["env"] = {**kwargs["env"], **sandbox_env(home)}
+        kwargs["env"] = {**kwargs["env"], **sandbox_env(home, tmpdir)}
     return ClaudeAgentOptions(**kwargs)
 
 

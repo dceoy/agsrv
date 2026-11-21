@@ -30,6 +30,7 @@ from agsrv.security import (
     check_sandbox_request,
     resolve_cwd,
 )
+from agsrv.tmpguard import check_space, turn_tmpdir
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -220,6 +221,7 @@ class JobManager:
         ):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "invalid Idempotency-Key")
         cwd = self._validate(body)
+        check_space(self.app.state.settings)
         payload = _canonical(body)
         settings: Settings = self.app.state.settings
         if len(payload.encode()) > settings.jobs_max_payload_bytes:
@@ -428,32 +430,35 @@ class JobManager:
         self, body: QueryRequest | CodexQueryRequest, cwd: Path
     ) -> dict[str, Any]:
         settings: Settings = self.app.state.settings
-        if isinstance(body, QueryRequest):
-            async with self.app.state.semaphore:
-                home = service_home() if body.sandbox else None
-                options = build_options(body, settings, cwd, home)
-                runner = self.app.state.runner
-                stream = runner.stream(body.prompt, options)
-                async with aclosing(
-                    cast("AsyncGenerator[Message]", stream)
-                ) as messages:
-                    result = await collect_result(
-                        messages, include_messages=body.include_messages
-                    )
-                return result.model_dump(mode="json")
-        if not settings.codex_enabled:
-            msg = "Codex unavailable"
-            raise RuntimeError(msg)
-        async with self.app.state.codex_semaphore:
-            return await codex_agent.run_codex(
-                prompt=body.prompt,
-                cwd=str(cwd),
-                model=body.model,
-                effort=body.effort,
-                sandbox=body.options.sandbox,
-                network_access=body.options.network_access,
-                binary=settings.codex_bin,
-            )
+        check_space(settings)
+        with turn_tmpdir(cwd) as tmpdir:
+            if isinstance(body, QueryRequest):
+                async with self.app.state.semaphore:
+                    home = service_home() if body.sandbox else None
+                    options = build_options(body, settings, cwd, home, tmpdir)
+                    runner = self.app.state.runner
+                    stream = runner.stream(body.prompt, options)
+                    async with aclosing(
+                        cast("AsyncGenerator[Message]", stream)
+                    ) as messages:
+                        result = await collect_result(
+                            messages, include_messages=body.include_messages
+                        )
+                    return result.model_dump(mode="json")
+            if not settings.codex_enabled:
+                msg = "Codex unavailable"
+                raise RuntimeError(msg)
+            async with self.app.state.codex_semaphore:
+                return await codex_agent.run_codex(
+                    prompt=body.prompt,
+                    cwd=str(cwd),
+                    model=body.model,
+                    effort=body.effort,
+                    sandbox=body.options.sandbox,
+                    network_access=body.options.network_access,
+                    binary=settings.codex_bin,
+                    tmpdir=str(tmpdir),
+                )
 
     async def _run(
         self, job_id: str, body: QueryRequest | CodexQueryRequest, cwd: Path

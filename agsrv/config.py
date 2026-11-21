@@ -78,6 +78,8 @@ class Settings:
     """Server configuration.
 
     Attributes:
+        tmp_min_free_bytes: Minimum free bytes on /tmp (0 disables).
+        workspace_min_free_bytes: Minimum free bytes on the workspace (0 disables).
         api_key: Bearer token required from clients, if any.
         allow_unauthenticated: Permit requests when no API key is configured.
         workspace_root: Directory that all agent working directories must stay in.
@@ -97,6 +99,8 @@ class Settings:
         jobs_max_result_bytes: Maximum persisted response size.
     """
 
+    tmp_min_free_bytes: int = 536870912
+    workspace_min_free_bytes: int = 1073741824
     api_key: str | None = None
     allow_unauthenticated: bool = False
     workspace_root: Path = field(default_factory=lambda: Path.cwd().resolve())
@@ -126,6 +130,12 @@ class Settings:
         """
         tools = os.environ.get("AGSRV_ALLOWED_TOOLS", _DEFAULT_TOOLS)
         return cls(
+            tmp_min_free_bytes=int(
+                os.environ.get("AGSRV_TMP_MIN_FREE_BYTES", "536870912")
+            ),
+            workspace_min_free_bytes=int(
+                os.environ.get("AGSRV_WORKSPACE_MIN_FREE_BYTES", "1073741824")
+            ),
             api_key=_env_api_key(),
             allow_unauthenticated=_env_bool("AGSRV_ALLOW_UNAUTHENTICATED"),
             workspace_root=Path(

@@ -37,9 +37,11 @@ from agsrv.security import (
     check_sandbox_request,
     resolve_cwd,
 )
+from agsrv.tmpguard import check_space, turn_tmpdir
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Coroutine
+    from pathlib import Path
 
     from claude_agent_sdk import ClaudeAgentOptions, Message
 
@@ -58,7 +60,7 @@ Auth = Depends(auth_dependency)
 
 
 async def _prepare(
-    request: Request, body: QueryRequest
+    request: Request, body: QueryRequest, tmpdir: Path
 ) -> tuple[ClaudeAgentOptions, float, asyncio.Semaphore]:
     """Validate a request and acquire a concurrency slot.
 
@@ -102,7 +104,7 @@ async def _prepare(
         ) from home_error
     await semaphore.acquire()  # immediate: not locked, so no suspension
     try:
-        options = build_options(body, settings, cwd, home)
+        options = build_options(body, settings, cwd, home, tmpdir)
     except BaseException as exc:
         semaphore.release()
         if isinstance(exc, SandboxSetupError):
@@ -239,6 +241,7 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
             status.HTTP_400_BAD_REQUEST,
             f"timeout_seconds exceeds server maximum {settings.max_timeout_seconds}",
         )
+    check_space(settings)
     semaphore: asyncio.Semaphore = request.app.state.codex_semaphore
     if semaphore.locked():
         raise HTTPException(
@@ -249,15 +252,17 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
 
     async def execute() -> dict[str, Any]:
         async with request.app.state.jobs.workspace(cwd):
-            return await codex_agent.run_codex(
-                prompt=body.prompt,
-                cwd=str(cwd),
-                model=body.model,
-                effort=body.effort,
-                sandbox=body.options.sandbox,
-                network_access=body.options.network_access,
-                binary=settings.codex_bin,
-            )
+            with turn_tmpdir(cwd) as tmpdir:
+                return await codex_agent.run_codex(
+                    prompt=body.prompt,
+                    cwd=str(cwd),
+                    model=body.model,
+                    effort=body.effort,
+                    sandbox=body.options.sandbox,
+                    network_access=body.options.network_access,
+                    binary=settings.codex_bin,
+                    tmpdir=str(tmpdir),
+                )
 
     try:
         async with asyncio.timeout(timeout):
@@ -426,54 +431,57 @@ def _add_query_routes(app: FastAPI) -> None:
         """
         if isinstance(body, CodexQueryRequest):
             return await _codex_query_with_disconnect(body, request)
-        options, timeout, semaphore = await _prepare(request, body)
-        agent_runner: AgentRunner = request.app.state.runner
-        task = cast("asyncio.Task[object]", asyncio.current_task())
+        check_space(request.app.state.settings)
+        cwd = resolve_cwd(request.app.state.settings, body.cwd)
+        with turn_tmpdir(cwd) as tmpdir:
+            options, timeout, semaphore = await _prepare(request, body, tmpdir)
+            agent_runner: AgentRunner = request.app.state.runner
+            task = cast("asyncio.Task[object]", asyncio.current_task())
 
-        client_gone = False
+            client_gone = False
 
-        async def watch_disconnect() -> None:
-            nonlocal client_gone
-            while not await request.is_disconnected():  # ASGI disconnect polling  # ruff: ignore[async-busy-wait]
-                await asyncio.sleep(DISCONNECT_POLL_INTERVAL)
-            logger.info("client disconnected; cancelling agent run")
-            client_gone = True
-            task.cancel()
+            async def watch_disconnect() -> None:
+                nonlocal client_gone
+                while not await request.is_disconnected():  # ASGI disconnect polling  # ruff: ignore[async-busy-wait]
+                    await asyncio.sleep(DISCONNECT_POLL_INTERVAL)
+                logger.info("client disconnected; cancelling agent run")
+                client_gone = True
+                task.cancel()
 
-        watcher = asyncio.create_task(watch_disconnect())
-        try:
-            async with asyncio.timeout(timeout):
-                cwd = resolve_cwd(request.app.state.settings, body.cwd)
-                async with request.app.state.jobs.workspace(cwd):
-                    stream = agent_runner.stream(body.prompt, options)
-                    async with aclosing(
-                        cast("AsyncGenerator[Message]", stream)
-                    ) as messages:
-                        return await collect_result(
-                            messages, include_messages=body.include_messages
-                        )
-        except asyncio.CancelledError:
-            if client_gone and task.uncancel() == 0:
-                return Response(status_code=499)
-            raise
-        except TimeoutError as exc:
-            raise HTTPException(
-                status.HTTP_504_GATEWAY_TIMEOUT, "agent run timed out"
-            ) from exc
-        except AgentExecutionError as exc:
-            raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
-        except Exception as exc:
-            logger.exception("agent execution failed")
-            raise HTTPException(
-                status.HTTP_502_BAD_GATEWAY, "agent execution failed"
-            ) from exc
-        finally:
-            watcher.cancel()
+            watcher = asyncio.create_task(watch_disconnect())
             try:
-                with suppress(asyncio.CancelledError):
-                    await watcher
+                async with asyncio.timeout(timeout):
+                    cwd = resolve_cwd(request.app.state.settings, body.cwd)
+                    async with request.app.state.jobs.workspace(cwd):
+                        stream = agent_runner.stream(body.prompt, options)
+                        async with aclosing(
+                            cast("AsyncGenerator[Message]", stream)
+                        ) as messages:
+                            return await collect_result(
+                                messages, include_messages=body.include_messages
+                            )
+            except asyncio.CancelledError:
+                if client_gone and task.uncancel() == 0:
+                    return Response(status_code=499)
+                raise
+            except TimeoutError as exc:
+                raise HTTPException(
+                    status.HTTP_504_GATEWAY_TIMEOUT, "agent run timed out"
+                ) from exc
+            except AgentExecutionError as exc:
+                raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from exc
+            except Exception as exc:
+                logger.exception("agent execution failed")
+                raise HTTPException(
+                    status.HTTP_502_BAD_GATEWAY, "agent execution failed"
+                ) from exc
             finally:
-                semaphore.release()
+                watcher.cancel()
+                try:
+                    with suppress(asyncio.CancelledError):
+                        await watcher
+                finally:
+                    semaphore.release()
 
     _ = run_query
 
