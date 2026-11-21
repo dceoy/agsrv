@@ -68,41 +68,16 @@ async def _prepare(
     Returns:
         Admitted working directory (the caller must close it), sandbox home,
         effective timeout, and the semaphore (already acquired).
-    """
-    settings: Settings = request.app.state.settings
-    admitted = request.app.state.anchors.admit(resolve_cwd(settings, body.cwd))
-    try:
-        check_space(settings, request.app.state.anchors, admitted)
-        return await _prepare_admitted(request, body, admitted)
-    except BaseException:
-        admitted.close()
-        raise
-
-
-async def _prepare_admitted(
-    request: Request, body: QueryRequest, admitted: Admitted
-) -> tuple[Admitted, Path | None, float, asyncio.Semaphore]:
-    """Validate policy for an admitted cwd and acquire a concurrency slot.
-
-    Returns:
-        See :func:`_prepare`.
 
     Raises:
-        HTTPException: On validation, permission, or capacity errors.
+        HTTPException: On validation, admission, permission, or capacity errors.
     """
     settings: Settings = request.app.state.settings
-    cwd = admitted.path
+    cwd = resolve_cwd(settings, body.cwd)
+    # Cheap input validation first: a bad request is a 400 even when admission
+    # (staging, opening the cwd) would fail with 503.
     check_permission_mode(settings, body.permission_mode)
     check_sandbox_request(settings, body.sandbox, body.permission_mode)
-    home = None
-    home_error: SandboxSetupError | None = None
-    if body.sandbox:
-        try:
-            home = service_home()
-        except SandboxSetupError as exc:
-            home_error = exc  # 503 is deferred so that 429 takes precedence
-        else:
-            check_sandbox_cwd(cwd, home)
     timeout = (
         settings.max_timeout_seconds
         if body.timeout_seconds is None
@@ -113,6 +88,36 @@ async def _prepare_admitted(
             status.HTTP_400_BAD_REQUEST,
             f"timeout_seconds exceeds server maximum {settings.max_timeout_seconds}",
         )
+    admitted = request.app.state.anchors.admit(cwd)
+    try:
+        check_space(settings, request.app.state.anchors, admitted)
+        return await _prepare_admitted(request, body, admitted, timeout)
+    except BaseException:
+        admitted.close()
+        raise
+
+
+async def _prepare_admitted(
+    request: Request, body: QueryRequest, admitted: Admitted, limit: float
+) -> tuple[Admitted, Path | None, float, asyncio.Semaphore]:
+    """Validate policy for an admitted cwd and acquire a concurrency slot.
+
+    Returns:
+        See :func:`_prepare`.
+
+    Raises:
+        HTTPException: On validation, permission, or capacity errors.
+    """
+    cwd = admitted.path
+    home = None
+    home_error: SandboxSetupError | None = None
+    if body.sandbox:
+        try:
+            home = service_home()
+        except SandboxSetupError as exc:
+            home_error = exc  # 503 is deferred so that 429 takes precedence
+        else:
+            check_sandbox_cwd(cwd, home)
     semaphore: asyncio.Semaphore = request.app.state.semaphore
     if semaphore.locked():
         raise HTTPException(
@@ -123,7 +128,7 @@ async def _prepare_admitted(
             status.HTTP_503_SERVICE_UNAVAILABLE, str(home_error)
         ) from home_error
     await semaphore.acquire()  # immediate: not locked, so no suspension
-    return admitted, home, timeout, semaphore
+    return admitted, home, limit, semaphore
 
 
 class _SlotLease:

@@ -13,6 +13,7 @@ import logging
 import os
 import shutil
 import stat
+import tempfile
 import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -31,6 +32,8 @@ from tests.conftest import statvfs_stub, vfs
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
+
+REAL_FORBIDDEN_ROOTS = tmpguard._forbidden_stage_roots  # pyright: ignore[reportPrivateUsage]
 
 
 def stg(n: int) -> str:
@@ -116,6 +119,11 @@ def clean_renameat2() -> Any:  # ruff: ignore[any-type]
     tmpguard._renameat2_fn.cache_clear()  # pyright: ignore[reportPrivateUsage, reportFunctionMemberAccess]
     yield
     tmpguard._renameat2_fn.cache_clear()  # pyright: ignore[reportPrivateUsage, reportFunctionMemberAccess]
+
+
+def same_fd(a: int, b: int) -> bool:
+    """Return whether two descriptors refer to the same object."""
+    return os.path.samestat(os.fstat(a), os.fstat(b))
 
 
 def fds() -> int:
@@ -365,7 +373,7 @@ async def test_name_retaken_before_restoration(
     def hook(
         real: Callable[..., None], src_fd: int, src: str, dst_fd: int, dst: str
     ) -> None:
-        if src_fd == adm.stage_fd and dst == pub(2):
+        if same_fd(src_fd, adm.stage_fd) and dst == pub(2):
             public.mkdir()
             taken.append(public.stat().st_ino)
         real(src_fd, src, dst_fd, dst)
@@ -572,7 +580,7 @@ def test_unsafe_rmtree_and_missing_renameat2(
     monkeypatch.setattr(shutil.rmtree, "avoids_symlink_attacks", False)
     with pytest.raises(TmpdirError, match="symlink-attack"):
         fresh.open()
-    monkeypatch.undo()
+    monkeypatch.setattr(shutil.rmtree, "avoids_symlink_attacks", True)
 
     class NoSymbol:
         def __init__(self, *_a: object, **_k: object) -> None: ...
@@ -817,7 +825,7 @@ async def test_capture_failure_retains_entry(
     adm = env.admit()
 
     def fail(real: Callable[..., None], src_fd: int, *rest: Any) -> None:  # ruff: ignore[any-type]
-        if src_fd == adm.fd:
+        if same_fd(src_fd, adm.fd):
             raise OSError(errno.EACCES, "denied")
         real(src_fd, *rest)
 
@@ -839,7 +847,8 @@ async def test_inspection_failure_retains_unverified_entry(
     adm = env.admit()
 
     def fail(real: Callable[..., Any], path: Any, **kwargs: Any) -> Any:  # ruff: ignore[any-type]
-        if kwargs.get("dir_fd") == adm.stage_fd and str(path) == rec(3):
+        dir_fd = kwargs.get("dir_fd")
+        if dir_fd is not None and same_fd(dir_fd, adm.stage_fd) and str(path) == rec(3):
             raise OSError(errno.EIO, "io")
         return real(path, **kwargs)
 
@@ -864,7 +873,7 @@ async def test_recursive_removal_failure_is_retained_and_logged(
     monkeypatch.setattr(
         tmpguard.shutil.rmtree, "avoids_symlink_attacks", True, raising=False
     )
-    await run_turn(env, env.root)
+    await run_turn(env, env.root, lambda directory: (directory / "sub").mkdir())
     monkeypatch.undo()
     assert env.listing(env.stage) == [rec(3)]
     assert rec(3) in caplog.text
@@ -915,12 +924,12 @@ async def test_aclose_drains_owners_and_times_out(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("names")
-async def test_cleanup_is_off_loop_and_survives_repeated_cancellation(  # ruff: ignore[too-many-statements]
+async def test_cleanup_is_off_loop_and_survives_repeated_cancellation(
     env: Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Removal blocks a worker, not the loop; cancellation cannot interrupt it."""
     entered, release = threading.Event(), threading.Event()
-    real = cast("Callable[..., None]", shutil.rmtree)
+    real = cast("Callable[..., None]", tmpguard._empty_through)  # pyright: ignore[reportPrivateUsage]
     threads: list[int] = []
 
     def blocking(*args: Any, **kwargs: Any) -> None:  # ruff: ignore[any-type]
@@ -929,8 +938,7 @@ async def test_cleanup_is_off_loop_and_survives_repeated_cancellation(  # ruff: 
         assert release.wait(5)
         real(*args, **kwargs)
 
-    blocking.avoids_symlink_attacks = True  # pyright: ignore[reportFunctionMemberAccess]
-    monkeypatch.setattr(tmpguard.shutil, "rmtree", blocking)
+    monkeypatch.setattr(tmpguard, "_empty_through", blocking)
     jobs_lock = asyncio.Lock()  # stands in for the workspace lease
     first_adm = env.admit()
     second_started = asyncio.Event()
@@ -985,15 +993,14 @@ async def test_cancelled_cleanup_task_does_not_spin(
 ) -> None:
     """If the cleanup task itself is cancelled (loop shutdown) the owner exits."""
     entered, release = threading.Event(), threading.Event()
-    real = cast("Callable[..., None]", shutil.rmtree)
+    real = cast("Callable[..., None]", tmpguard._empty_through)  # pyright: ignore[reportPrivateUsage]
 
     def blocking(*args: Any, **kwargs: Any) -> None:  # ruff: ignore[any-type]
         entered.set()
         assert release.wait(5)
         real(*args, **kwargs)
 
-    blocking.avoids_symlink_attacks = True  # pyright: ignore[reportFunctionMemberAccess]
-    monkeypatch.setattr(tmpguard.shutil, "rmtree", blocking)
+    monkeypatch.setattr(tmpguard, "_empty_through", blocking)
     adm = env.admit()
 
     async def owner() -> None:
@@ -1109,3 +1116,231 @@ def test_logging_is_quiet_when_everything_is_fine(
     caplog.set_level(logging.WARNING)
     asyncio.run(run_turn(env, env.root))
     assert not [r for r in caplog.records if r.name == tmpguard.logger.name]
+
+
+# --- startup: required configuration and mount identity ---------------------------
+
+
+def test_startup_requires_staging_for_the_workspace_root(env: Env) -> None:
+    """No staging for the root's mount is fatal, naming the setting; nothing leaks."""
+    base = fds()
+    for pairs in [(), ((env.root / "sub", env.stage),)]:
+        (env.root / "sub").mkdir(exist_ok=True)
+        anchors = Anchors(Settings(workspace_root=env.root, tmp_staging_dirs=pairs))
+        with pytest.raises(TmpdirError, match="AGSRV_TMP_STAGING_DIRS"):
+            anchors.open()
+        assert not anchors.is_open
+    assert fds() == base
+
+
+def test_mount_probe_leaves_nothing_behind(env: Env) -> None:
+    """The startup rename round trip works on a real mount and cleans up."""
+    assert env.listing(env.root) == []
+    assert env.listing(env.stage) == []
+
+
+@pytest.mark.parametrize("failing", ["mkdir", "out", "back"])
+def test_mount_mismatch_is_detected_at_startup(
+    env: Env, monkeypatch: pytest.MonkeyPatch, failing: str
+) -> None:
+    """EXDEV (a bind mount sharing ``st_dev``) fails startup and is cleaned up."""
+    calls = 0
+    real_rename = tmpguard._rename_noreplace  # pyright: ignore[reportPrivateUsage]
+    real_mkdir = os.mkdir
+
+    def rename(src_fd: int, src: str, dst_fd: int, dst: str) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == (1 if failing == "out" else 2):
+            raise OSError(errno.EXDEV, "cross-device link", dst)
+        real_rename(src_fd, src, dst_fd, dst)
+
+    def mkdir(path: Any, *args: Any, **kwargs: Any) -> None:  # ruff: ignore[any-type]
+        if failing == "mkdir" and str(path).startswith(tmpguard._PROBE):  # pyright: ignore[reportPrivateUsage]
+            raise OSError(errno.EIO, "io")
+        real_mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(tmpguard, "_rename_noreplace", rename)
+    monkeypatch.setattr(os, "mkdir", mkdir)
+    base = fds()
+    fresh = Anchors(env.settings)
+    with pytest.raises(TmpdirError, match="same mount"):
+        fresh.open()
+    assert not fresh.is_open
+    assert fds() == base
+    assert env.listing(env.root) == []  # the probe is not left in the mount root
+    assert env.listing(env.stage) == []
+
+
+def test_staging_below_child_writable_roots_is_refused(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A staging directory under /tmp or another shared root fails startup."""
+    assert Path("/tmp").resolve() in REAL_FORBIDDEN_ROOTS()  # ruff: ignore[hardcoded-temp-file]
+    assert Path("/var/tmp").resolve() in REAL_FORBIDDEN_ROOTS()  # ruff: ignore[hardcoded-temp-file]
+    monkeypatch.setattr(
+        tmpguard, "_forbidden_stage_roots", lambda: (env.root, env.stage.parent)
+    )
+    base = fds()
+    fresh = Anchors(env.settings)
+    with pytest.raises(TmpdirError, match="children can write"):
+        fresh.open()
+    assert fds() == base
+    monkeypatch.setattr(tmpguard, "_forbidden_stage_roots", REAL_FORBIDDEN_ROOTS)
+    if env.stage.is_relative_to(Path(tempfile.gettempdir()).resolve()):
+        with pytest.raises(TmpdirError, match="children can write"):
+            fresh.open()  # the real policy rejects pytest's own /tmp staging
+
+
+# --- staging-internal substitution between verification and deletion ---------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("names")
+@pytest.mark.parametrize("substitute", ["populated", "symlink"])
+async def test_substitution_inside_staging_after_verification(
+    env: Env,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    substitute: str,
+) -> None:
+    """A writer that reaches staging cannot redirect deletion to another tree."""
+    external = tmp_path / "external"
+    external.mkdir()
+    (external / "marker").write_text("keep")
+    (external / "inner").mkdir()
+    (external / "inner" / "deep").write_text("keep")
+    real = tmpguard._empty_through  # pyright: ignore[reportPrivateUsage]
+
+    def swap(child_fd: int) -> None:
+        recovery = env.stage / rec(3)
+        recovery.rename(env.stage / "aside")  # our verified tree moves away
+        if substitute == "populated":
+            recovery.mkdir()
+            (recovery / "marker").write_text("keep")
+        else:
+            recovery.symlink_to(external)
+        real(child_fd)
+
+    monkeypatch.setattr(tmpguard, "_empty_through", swap)
+
+    def body(directory: Path) -> None:
+        (directory / "mine").write_text("x")
+        (directory / "dir").mkdir()
+        (directory / "link").symlink_to(external)
+
+    await run_turn(env, env.root, body)
+    # The held descriptor emptied the genuine tree, wherever it now lives ...
+    assert env.listing(env.stage / "aside") == []
+    # ... and the substituted entry and its target were never traversed.
+    if substitute == "populated":
+        assert (env.stage / rec(3) / "marker").read_text() == "keep"
+    else:
+        assert (env.stage / rec(3)).is_symlink()
+    assert (external / "marker").read_text() == "keep"
+    assert (external / "inner" / "deep").read_text() == "keep"
+    assert "Failed to remove turn temporary directory" in caplog.text
+    assert rec(3) in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("names")
+async def test_empty_substitute_inside_staging_costs_at_most_itself(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The only name-based removal is ``rmdir``; it removes empty directories only."""
+    real = tmpguard._empty_through  # pyright: ignore[reportPrivateUsage]
+
+    def swap(child_fd: int) -> None:
+        (env.stage / rec(3)).rename(env.stage / "aside")
+        (env.stage / rec(3)).mkdir()
+        real(child_fd)
+
+    monkeypatch.setattr(tmpguard, "_empty_through", swap)
+
+    def body(directory: Path) -> None:
+        (directory / "f").write_text("x")
+
+    await run_turn(env, env.root, body)
+    assert env.listing(env.stage) == ["aside"]  # the empty impostor, nothing else
+    assert env.listing(env.stage / "aside") == []
+
+
+# --- shutdown ---------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_aclose_waits_for_pending_cleanup_before_closing_anchors(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Even after the owner released its admission, shutdown drains the worker."""
+    entered, release = threading.Event(), threading.Event()
+    real = tmpguard._empty_through  # pyright: ignore[reportPrivateUsage]
+
+    def blocking(child_fd: int) -> None:
+        entered.set()
+        assert release.wait(5)
+        real(child_fd)
+
+    monkeypatch.setattr(tmpguard, "_empty_through", blocking)
+    adm = env.admit()
+
+    async def owner() -> None:
+        async with turn_tmpdir(env.settings, env.anchors, adm):
+            pass
+
+    task = asyncio.create_task(owner())
+    await asyncio.to_thread(entered.wait, 5)
+    adm.close()  # the owner's descriptor is gone; the worker is still running
+    closing = asyncio.create_task(env.anchors.aclose())
+    await asyncio.sleep(0.05)
+    assert not closing.done()
+    assert env.anchors.is_open
+    release.set()
+    await asyncio.wait_for(closing, 2)
+    await task
+    assert not env.anchors.is_open
+    assert env.listing(env.stage) == []
+    assert env.listing(env.root) == []
+
+
+@pytest.mark.asyncio
+async def test_worker_uses_its_own_descriptors(
+    env: Env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reused descriptor number cannot redirect a cleanup that outlives its owner."""
+    entered, release = threading.Event(), threading.Event()
+    real = tmpguard._empty_through  # pyright: ignore[reportPrivateUsage]
+
+    def blocking(child_fd: int) -> None:
+        entered.set()
+        assert release.wait(5)
+        real(child_fd)
+
+    monkeypatch.setattr(tmpguard, "_empty_through", blocking)
+    decoy = tmp_path / "decoy"
+    decoy.mkdir()
+    adm = env.admit()
+    admitted_number = adm.fd
+
+    async def owner() -> None:
+        async with turn_tmpdir(env.settings, env.anchors, adm):
+            pass
+
+    task = asyncio.create_task(owner())
+    await asyncio.to_thread(entered.wait, 5)
+    adm.close()
+    held: list[int] = []
+    for _ in range(64):  # take the freed descriptor number for an unrelated directory
+        held.append(os.open(decoy, os.O_RDONLY | os.O_DIRECTORY))
+        if held[-1] == admitted_number:
+            break
+    assert held[-1] == admitted_number
+    release.set()
+    await task
+    for fd in held:
+        os.close(fd)
+    assert env.listing(env.root) == []  # reclaimed from the real cwd, not the decoy
+    assert env.listing(env.stage) == []
+    assert env.listing(decoy) == []

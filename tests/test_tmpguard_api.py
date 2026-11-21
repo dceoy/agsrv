@@ -21,9 +21,11 @@ from agsrv.config import Settings
 from agsrv.main import create_app
 from agsrv.sandbox import SandboxSetupError
 from agsrv.schemas import CodexQueryRequest, QueryRequest
+from agsrv.tmpguard import TmpdirError
 from tests.conftest import statvfs_stub
 from tests.test_jobs import _wait  # pyright: ignore[reportPrivateUsage]
 from tests.test_main import FakeRunner
+from tests.test_tmpguard import fds
 
 AUTH = {"Authorization": "Bearer secret"}
 CLAUDE = {"agent": "claude", "prompt": "test", "sandbox": False}
@@ -154,30 +156,38 @@ def test_reject_low_space(
         _clean(app, tmp_path)
 
 
-def test_no_staging_makes_turns_unavailable(tmp_path: Path) -> None:
-    """A mount without a protected staging directory runs no turns anywhere."""
+def test_no_staging_is_fatal_at_startup(tmp_path: Path) -> None:
+    """A workspace root whose mount has no staging directory refuses to start."""
     settings = Settings(
         api_key="secret",
         workspace_root=tmp_path,
         jobs_db_path=tmp_path.parent / "j.db",
         tmp_staging_dirs=(),
     )
-    runner = FakeRunner()
-    with TestClient(
-        create_app(settings, runner), raise_server_exceptions=False
-    ) as client:
-        for path, body in [
-            ("/v1/query", CLAUDE),
-            ("/v1/query", CODEX),
-            ("/v1/jobs", CLAUDE),
-        ]:
-            response = client.post(path, headers=AUTH, json=body)
-            assert response.status_code == 503, path
-            assert "no staging" in response.json()["detail"]
-        usage = client.get("/v1/agents/claude/rate-limits", headers=AUTH)
-        assert usage.status_code == 503
-    assert runner.stream_calls == 0
-    assert not list(tmp_path.glob(".agsrv-*"))
+    app = create_app(settings, FakeRunner())
+    base = fds()
+    with (
+        pytest.raises(TmpdirError, match="AGSRV_TMP_STAGING_DIRS"),
+        TestClient(app),
+    ):
+        pytest.fail("startup must not succeed")
+    assert fds() == base
+    assert not app.state.jobs.started
+
+
+def test_default_environment_configuration_is_fatal_at_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default (unset) ``AGSRV_TMP_STAGING_DIRS`` fails, naming the setting."""
+    monkeypatch.delenv("AGSRV_TMP_STAGING_DIRS", raising=False)
+    monkeypatch.setenv("AGSRV_WORKSPACE_ROOT", str(tmp_path))
+    monkeypatch.setenv("AGSRV_JOBS_DB_PATH", str(tmp_path.parent / "env-j.db"))
+    app = create_app()  # Settings.from_env(), no overrides
+    with (
+        pytest.raises(TmpdirError, match=r"workspace root .*AGSRV_TMP_STAGING_DIRS"),
+        TestClient(app),
+    ):
+        pytest.fail("startup must not succeed")
 
 
 def test_startup_rejects_unsafe_staging_and_closes_anchors(tmp_path: Path) -> None:
@@ -449,7 +459,10 @@ def test_busy_claude_and_codex_release_admission(tmp_path: Path) -> None:
 
 
 def _rate_client(tmp_path: Path, runner: FakeRunner) -> tuple[TestClient, Any]:
-    app = create_app(Settings(api_key="k", workspace_root=tmp_path), runner)
+    app = create_app(
+        Settings(api_key="k", workspace_root=tmp_path, jobs_db_path=tmp_path / "j.db"),
+        runner,
+    )
     return TestClient(app, raise_server_exceptions=False), app
 
 
@@ -531,3 +544,27 @@ async def test_shutdown_drains_detached_turns_before_closing_anchors(
         task.add_done_callback(main._pump_tasks.discard)  # pyright: ignore[reportPrivateUsage]
     assert finished.is_set()
     assert not app.state.anchors.is_open
+
+
+@pytest.mark.parametrize(
+    ("body", "code"),
+    [
+        ({**CLAUDE, "permission_mode": "bypassPermissions"}, 403),
+        ({**CLAUDE, "sandbox": True, "permission_mode": "auto"}, 403),
+        ({**CLAUDE, "timeout_seconds": 10**9}, 400),
+    ],
+)
+def test_cheap_validation_precedes_admission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: dict[str, Any], code: int
+) -> None:
+    """Invalid requests get their 4xx even when admission would fail with 503."""
+    app = create_app(_settings(tmp_path), FakeRunner())
+    client = TestClient(app)
+    admit = MagicMock(side_effect=HTTPException(503, "admission is broken"))
+    monkeypatch.setattr(app.state.anchors, "admit", admit)
+    response = client.post("/v1/query", headers=AUTH, json=body)
+    assert response.status_code == code
+    admit.assert_not_called()
+    good = client.post("/v1/query", headers=AUTH, json=CLAUDE)
+    assert good.status_code == 503  # a valid request still reaches admission
+    admit.assert_called_once()

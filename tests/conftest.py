@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from agsrv import tmpguard
 from agsrv.config import Settings
 
 if TYPE_CHECKING:
@@ -45,11 +46,15 @@ def free_space(monkeypatch: pytest.MonkeyPatch) -> None:
 def staging(
     monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
 ) -> None:
-    """Give every test Settings rooted under pytest's tmp dir a private staging dir."""
+    """Isolate test Settings: private staging dir, jobs DB and staging policy."""
     base = tmp_path_factory.getbasetemp()
     original = Settings.__init__
+    # pytest's own tmp dirs live under /tmp, which real deployments may not use.
+    monkeypatch.setattr(tmpguard, "_forbidden_stage_roots", tuple)
 
     def init(self: Settings, *args: Any, **kwargs: Any) -> None:  # ruff: ignore[any-type]
+        if "jobs_db_path" not in kwargs:  # never touch the real ~/.local/state DB
+            kwargs["jobs_db_path"] = Path(tempfile.mkdtemp(dir=base)) / "jobs.sqlite3"
         root = kwargs.get("workspace_root")
         if root is not None and "tmp_staging_dirs" not in kwargs:
             root = Path(root).resolve()

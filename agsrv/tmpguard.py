@@ -24,12 +24,14 @@ so ownership is decided by an open descriptor, never by a name:
   an empty directory.
 * **Reclaim.** Cleanup renames the public entry back into staging (no-replace),
   checks it against the held descriptor with ``os.path.samestat``, and only on a
-  match calls the descriptor-safe ``shutil.rmtree(name, dir_fd=staging)``.
-  Everything destructive happens under the protected staging parent. A
-  mismatching entry is never traversed or deleted; it is renamed back to the
-  public name if that is free, otherwise it is kept in staging and its exact
-  location is logged. Cleanup runs in one worker thread and is shielded from
-  cancellation.
+  match empties the tree *through the held child descriptor* (descriptor-safe
+  ``shutil.rmtree(entry, dir_fd=child_fd)`` per entry). The only name-based
+  destructive step is the final ``rmdir`` of the now-empty directory under the
+  protected staging parent, so even a reachable staging directory can cost at
+  most one empty directory. A mismatching entry is never traversed or deleted;
+  it is renamed back to the public name if that is free, otherwise it is kept
+  in staging and its exact location is logged. Cleanup runs in one worker thread
+  and is shielded from cancellation.
 
 Residual risks (see also the README): children receive a ``TMPDIR`` path string
 and resolve it themselves, so a writer can redirect *children* by replacing the
@@ -39,6 +41,11 @@ Mounting filesystems, service compromise and a same-UID child that can reach the
 staging directory (e.g. via ``/proc``) are outside the model. A service crash
 can leave a public or staged entry; there is deliberately no name-based
 scavenger. The staging directory, workspace root and their ancestors are trusted.
+
+Startup is fail-fast: the workspace root's mount must have a staging directory,
+every staging directory must pass a rename round trip into its mount root (which
+proves the same *mount*, not merely the same ``st_dev``), and staging below
+``/tmp`` and other child-writable roots is rejected.
 """
 
 import asyncio
@@ -50,6 +57,7 @@ import os
 import secrets
 import shutil
 import stat
+import tempfile
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -72,6 +80,22 @@ _RENAME_NOREPLACE = 1
 _PRIVATE_MODE = 0o700
 _NAME_ATTEMPTS = 8
 _DRAIN_TIMEOUT = 60.0
+_PROBE = ".agsrv-probe-"
+
+
+def _forbidden_stage_roots() -> tuple[Path, ...]:
+    """Return roots that agent children can normally write to.
+
+    Returns:
+        Directories under which a staging directory is refused.
+    """
+    roots = [
+        Path("/tmp"),  # ruff: ignore[hardcoded-temp-file]
+        Path("/var/tmp"),  # ruff: ignore[hardcoded-temp-file]
+        Path("/dev/shm"),  # ruff: ignore[hardcoded-temp-file]
+        Path(tempfile.gettempdir()),
+    ]
+    return tuple(dict.fromkeys(r.resolve() for r in roots))
 
 
 class TmpdirError(Exception):
@@ -205,8 +229,14 @@ def _open_trusted(
             fd = _open_stage(mount.resolve(), stage, root_path)
             opened.append(fd)
             stages.append((mount.resolve(), fd))
-        if stages:
-            _renameat2_fn()
+        _renameat2_fn()
+        if not any(root_path.is_relative_to(mount) for mount, _ in stages):
+            msg = (
+                f"no staging directory is configured for the workspace root "
+                f"{root_path}: set AGSRV_TMP_STAGING_DIRS="
+                f"<mount root>=<staging directory> (see the README)"
+            )
+            raise TmpdirError(msg)  # ruff: ignore[raise-within-try]
     except (OSError, TmpdirError) as exc:
         for fd in opened:
             os.close(fd)
@@ -248,17 +278,11 @@ class Anchors:
         self.root_fd, stages = _open_trusted(self.settings, self.root_path)
         self.stages = sorted(stages, key=lambda s: len(s[0].parts), reverse=True)
         self.is_open = True
-        if not stages:
-            logger.warning(
-                "No AGSRV_TMP_STAGING_DIRS configured: agent turns are unavailable"
-            )
 
     def _stage_for(self, cwd: Path) -> int:
-        for mount, fd in self.stages:
-            if cwd.is_relative_to(mount):
-                return fd
-        msg = f"no staging directory is configured for {cwd}"
-        raise TmpdirError(msg)
+        # Startup guarantees a mount root covering the workspace root, hence
+        # every cwd below it.
+        return next(fd for mount, fd in self.stages if cwd.is_relative_to(mount))
 
     def admit(self, cwd: Path) -> Admitted:
         """Bind an accepted canonical ``cwd`` to a held descriptor.
@@ -296,6 +320,8 @@ class Anchors:
         """Wait for every turn owner, then close the shared descriptors."""
         try:
             async with asyncio.timeout(_DRAIN_TIMEOUT):
+                while self.cleanups:
+                    await asyncio.gather(*self.cleanups, return_exceptions=True)
                 await self._idle.wait()
         except TimeoutError:
             logger.exception("Turn owners did not finish; keeping anchors open")
@@ -322,6 +348,40 @@ def _check_stage(stage: Path, mount: Path, info: os.stat_result) -> None:
         raise TmpdirError(msg)
 
 
+def _probe_mount(stage: Path, mount: Path, stage_fd: int) -> None:
+    """Prove staging and ``mount`` share a mount with a rename round trip.
+
+    ``st_dev`` is equal across bind mounts of one filesystem, yet ``renameat2``
+    between them fails with ``EXDEV``. A probe directory is therefore moved from
+    staging into the mount root and back, using the very syscall publication uses.
+
+    Raises:
+        TmpdirError: If the round trip fails (for example ``EXDEV``).
+    """
+    name = f"{_PROBE}{os.urandom(16).hex()}"
+    mount_fd = os.open(mount, _DIR_FLAGS)  # OSError is reported by the caller
+    try:  # ruff: ignore[too-many-statements-in-try-clause]
+        os.mkdir(name, _PRIVATE_MODE, dir_fd=stage_fd)
+        in_mount = False
+        try:
+            _rename_noreplace(stage_fd, name, mount_fd, name)
+            in_mount = True
+            _rename_noreplace(mount_fd, name, stage_fd, name)
+            in_mount = False
+        finally:  # leave nothing behind, wherever the probe ended up
+            with suppress(OSError):
+                os.rmdir(name, dir_fd=mount_fd if in_mount else stage_fd)
+    except OSError as exc:
+        msg = (
+            f"staging directory {stage} is not on the same mount as {mount} "
+            f"(rename round trip failed: {exc}); a bind mount or a different "
+            "mount needs its own staging directory"
+        )
+        raise TmpdirError(msg) from exc
+    finally:
+        os.close(mount_fd)
+
+
 def _open_stage(mount: Path, stage: Path, root: Path) -> int:
     """Open and validate a staging directory.
 
@@ -329,13 +389,21 @@ def _open_stage(mount: Path, stage: Path, root: Path) -> int:
         The held descriptor.
 
     Raises:
-        TmpdirError: If it is unsafe: inside the workspace, not a ``0700``
-            directory owned by the service, or on another filesystem.
+        TmpdirError: If it is unsafe: inside the workspace or a child-writable
+            root, not a ``0700`` directory owned by the service, or not on the
+            same mount as its mount root.
     """
     stage = stage.resolve()
     if stage.is_relative_to(root):
         msg = f"staging directory {stage} must be outside the workspace root"
         raise TmpdirError(msg)
+    for shared in _forbidden_stage_roots():
+        if stage.is_relative_to(shared):
+            msg = (
+                f"staging directory {stage} is below {shared}, which agent "
+                "children can write to; choose a service-private location"
+            )
+            raise TmpdirError(msg)
     try:
         fd = os.open(stage, _DIR_FLAGS)
     except OSError as exc:
@@ -343,6 +411,7 @@ def _open_stage(mount: Path, stage: Path, root: Path) -> int:
         raise TmpdirError(msg) from exc
     try:
         _check_stage(stage, mount, os.fstat(fd))
+        _probe_mount(stage, mount, fd)
     except BaseException:
         os.close(fd)
         raise
@@ -393,7 +462,12 @@ def check_space(settings: "Settings", anchors: Anchors, cwd: Admitted) -> None:
 
 @dataclass
 class _Turn:
-    """Ownership record for one published turn directory."""
+    """Ownership record for one published turn directory.
+
+    ``stage_fd``, ``cwd_fd`` and ``child_fd`` are private duplicates owned by the
+    record (closed by :func:`_reclaim`), so a cleanup worker that outlives its
+    owner never operates on a descriptor number that was closed and reused.
+    """
 
     stage_fd: int
     cwd_fd: int
@@ -471,18 +545,24 @@ def _setup(adm: Admitted) -> _Turn:
         raise TmpdirError(msg)
     name = _mkdir_private(stage_fd)
     child_fd = -1
+    owned: list[int] = []
     public = f"{_PUBLIC}{secrets.token_hex(16)}"
     try:
+        # One at a time: if the second dup fails the first must still be closed.
+        owned.append(os.dup(stage_fd))  # ruff: ignore[repeated-append]
+        owned.append(os.dup(adm.fd))
         child_fd = _open_private(stage_fd, name)
         _rename_noreplace(stage_fd, name, adm.fd, public)
     except BaseException as exc:
         _private_rollback(stage_fd, name, child_fd)
+        for fd in owned:
+            os.close(fd)
         if isinstance(exc, OSError):
             msg = f"cannot publish into {adm.path}: {exc}"
             raise TmpdirError(msg) from exc
         raise
     path = adm.path / public
-    return _Turn(stage_fd, adm.fd, child_fd, public, path, str(path))
+    return _Turn(owned[0], owned[1], child_fd, public, path, str(path))
 
 
 def _capture(turn: _Turn) -> str | None:
@@ -511,11 +591,24 @@ def _capture(turn: _Turn) -> str | None:
     return None
 
 
-def _make_removable(turn: _Turn, recovery: str) -> None:
+def _make_removable(child_fd: int) -> None:
     """Let read-only subdirectories be emptied (descriptor-based chmod only)."""
-    for _top, _dirs, _files, dirfd in os.fwalk(recovery, dir_fd=turn.stage_fd):
+    os.fchmod(child_fd, _PRIVATE_MODE)
+    for _top, _dirs, _files, dirfd in os.fwalk(".", dir_fd=child_fd):
         with suppress(OSError):
             os.fchmod(dirfd, _PRIVATE_MODE)
+
+
+def _empty_through(child_fd: int) -> None:
+    """Delete everything inside the held directory, never following names out."""
+    _make_removable(child_fd)
+    with os.scandir(child_fd) as entries:
+        children = [(e.name, e.is_dir(follow_symlinks=False)) for e in entries]
+    for name, is_dir in children:
+        if is_dir:
+            shutil.rmtree(name, dir_fd=child_fd)
+        else:
+            os.unlink(name, dir_fd=child_fd)
 
 
 def _reclaim_verified(turn: _Turn) -> None:
@@ -552,8 +645,10 @@ def _reclaim_verified(turn: _Turn) -> None:
                 turn.path,
             )
         return
-    _make_removable(turn, recovery)
-    shutil.rmtree(recovery, dir_fd=turn.stage_fd)
+    # Contents go through the held descriptor; the sole name-based removal is
+    # the final rmdir of the (now empty) verified directory under staging.
+    _empty_through(turn.child_fd)
+    os.rmdir(recovery, dir_fd=turn.stage_fd)
 
 
 def _reclaim(turn: _Turn) -> None:
@@ -567,7 +662,8 @@ def _reclaim(turn: _Turn) -> None:
             turn.where,
         )
     finally:
-        os.close(turn.child_fd)
+        for fd in (turn.child_fd, turn.cwd_fd, turn.stage_fd):
+            os.close(fd)
 
 
 async def _finish(anchors: Anchors, turn: _Turn) -> None:

@@ -65,7 +65,7 @@ curl -sS https://agsrv.example.net/v1/jobs \
 | `AGSRV_TMP_MIN_FREE_BYTES`      | `536870912`                      | Minimum free bytes on /tmp; 0 disables the check |
 | `AGSRV_WORKSPACE_MIN_FREE_BYTES`| `1073741824`                     | Minimum free bytes on the workspace filesystem; 0 disables the check |
 | `AGSRV_WORKSPACE_ROOT`           | current directory                | All request `cwd` values must resolve inside this path   |
-| `AGSRV_TMP_STAGING_DIRS`         | unset (turns unavailable)        | `mount_root=staging_dir` pairs, comma-separated; see below |
+| `AGSRV_TMP_STAGING_DIRS`         | **required** (unset: server refuses to start) | `mount_root=staging_dir` pairs, comma-separated; see below |
 | `AGSRV_DEFAULT_MODEL`            | unset (SDK default)              | Model used when a request omits `model`                  |
 | `AGSRV_PERMISSION_MODE`          | `acceptEdits`                    | Default permission mode                                  |
 | `AGSRV_ALLOWED_TOOLS`            | `Read,Write,Edit,Bash,Glob,Grep` | Default auto-approve list (not a restriction; see below) |
@@ -95,17 +95,32 @@ spawns a Claude child process and gets the same admission, preflight and
 
 ### Temporary directory design and threat model
 
+> **Breaking deployment requirement (0.4.0).** `AGSRV_TMP_STAGING_DIRS` has no
+> default and is **mandatory**. If the workspace root's mount has no configured
+> staging directory, **startup fails with a fatal error** naming the missing
+> configuration; agsrv no longer starts and then answers every turn (including
+> `/v1/query`, `/v1/jobs` and `/v1/agents/claude/rate-limits`) with HTTP 503.
+> Existing deployments must provision a staging directory *before* upgrading.
+
 **Required deployment property.** Turns need one pre-provisioned,
 service-controlled *staging* directory per workspace mount, configured with
 `AGSRV_TMP_STAGING_DIRS` (comma-separated `mount_root=staging_dir` pairs; the most
-specific mount root containing the working directory wins). Each staging
-directory must be owned by the service, mode `0700`, outside the workspace root,
-on the same filesystem as its mount root, and unreachable by workspace writers.
-They are opened and validated at startup (startup fails on an unsafe one) and the
-descriptors are held for the life of the server. A mount without a staging
-directory runs no turns (HTTP 503). A local filesystem with atomic rename and
-`RENAME_NOREPLACE` support is required; `EXDEV`, unsupported flags or a missing
-`renameat2` fail closed. Example: `AGSRV_WORKSPACE_ROOT=/srv/ws`
+specific mount root containing the working directory wins). The workspace root's
+own mount must have one. Each staging directory must be owned by the service,
+mode `0700`, outside the workspace root, on the **same mount** as its mount root
+(not merely the same filesystem: a bind mount of one filesystem shares `st_dev`
+yet makes `renameat2` fail with `EXDEV`), and unreachable by workspace writers.
+Startup opens and validates every staging directory and fails on an unsafe one:
+not a service-owned `0700` directory, inside the workspace root, below `/tmp`,
+`/var/tmp`, `/dev/shm` or the system temp directory (all child-writable), or not
+on the mount of its mount root. The mount check is a rename round trip of a
+probe directory from staging into the mount root and back, so the service must be
+able to create entries in each configured mount root. Descriptors are held for the
+life of the server. A working directory on a nested mount that is not covered by
+its own staging directory fails closed per turn (HTTP 503). A local filesystem
+with atomic rename and `RENAME_NOREPLACE` support is required; `EXDEV`,
+unsupported flags or a missing `renameat2` fail closed. Example:
+`AGSRV_WORKSPACE_ROOT=/srv/ws`
 `AGSRV_TMP_STAGING_DIRS=/srv/ws=/var/lib/agsrv/stage`.
 
 Other writers may share the working directory and can list it, rename or remove
@@ -132,15 +147,20 @@ service user.
   with `EINVAL` on Linux 6.4 and later).
 - **Reclaim before delete.** Cleanup renames the public entry from the held
   working-directory descriptor back into staging (no-replace), checks it against
-  the held descriptor, and only on a match runs `shutil.rmtree(name, dir_fd=...)`
-  (symlink-attack resistant; required at startup). All deletion, including the
-  final `rmdir`, happens under the protected staging parent. On a mismatch
+  the held descriptor, and only on a match deletes the contents *through the
+  held directory descriptor* (`shutil.rmtree(entry, dir_fd=child_fd)` for each
+  entry; symlink-attack resistant, required at startup). The only name-based
+  removal is the final `rmdir` of the then-empty directory under the protected
+  staging parent, so even a writer that reaches staging can cost at most one
+  empty directory, never another tree. On a mismatch
   nothing is traversed or deleted: the entry is renamed back if the public name
   is free; otherwise it stays in staging and its recovery name is logged.
 - **Off the event loop, shielded.** Cleanup runs in one worker thread. If the
   owning task is cancelled (repeatedly, too) the same worker is awaited to the
   end, and only then is cancellation propagated and the workspace lease released.
-  At shutdown turn owners are drained before the shared descriptors are closed.
+  Each cleanup worker owns private duplicates of the descriptors it uses, and
+  at shutdown pending cleanups and turn owners are drained before the shared
+  descriptors are closed.
 - **Rollback.** A failure after the private `mkdir` removes the staged directory
   by its private name; a failure after publication runs the full
   reclaim-and-verify sequence. The original error, result or cancellation is
@@ -163,8 +183,12 @@ Residual risks:
   there is deliberately no name-based scavenger. Subdirectories made
   non-listable by a child may keep a partially removed entry in staging (logged).
 - `0700` is also a deployment property: an unrestricted same-UID child that can
-  reach staging (for example through the service's `/proc` descriptors) defeats
-  it, and such a deployment needs credential or namespace isolation. Mount
+  reach staging (for example by reading `AGSRV_TMP_STAGING_DIRS` from the
+  service's `/proc/<pid>/environ`) can enumerate and rename entries there. Content
+  deletion stays on held descriptors, so the damage is bounded (an impostor entry
+  may be lost only if it is an empty directory, and a genuine turn tree may be
+  left behind), but a deployment that wants the full guarantee needs credential
+  or namespace isolation. Mount
   administration, service compromise, malicious filesystems and the trusted
   anchors (workspace root, staging directory and their ancestors) are outside
   the model.

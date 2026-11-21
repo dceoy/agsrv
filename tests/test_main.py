@@ -40,7 +40,7 @@ from agsrv.claude import (
     message_to_dict,
 )
 from agsrv.config import DEFAULT_SANDBOX_ALLOWED_DOMAINS, Settings
-from agsrv.main import _SlotLease, app, create_app  # pyright: ignore[reportPrivateUsage]
+from agsrv.main import _SlotLease, create_app  # pyright: ignore[reportPrivateUsage]
 from agsrv.sandbox import (
     SandboxSetupError,
     build_sandbox_settings,
@@ -195,9 +195,10 @@ def client_for(
 AUTH = {"Authorization": "Bearer secret"}
 
 
-def test_health() -> None:
+def test_health(tmp_path: Path) -> None:
     """Verify the public health endpoint."""
-    with TestClient(app) as client:
+    client, _ = client_for(make_settings(tmp_path))
+    with client:
         response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}

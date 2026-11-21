@@ -121,8 +121,8 @@ class Settings:
         jobs_max_result_bytes: Maximum persisted response size.
         tmp_staging_dirs: ``(workspace mount root, staging directory)`` pairs.
             Each staging directory must be service-owned, mode 0700, outside the
-            workspace root and on the mount it serves. Turns in a mount without
-            one are unavailable.
+            workspace root and on the mount it serves. Required: startup fails
+            if the workspace root's mount has none.
     """
 
     api_key: str | None = None
