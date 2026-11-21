@@ -1082,9 +1082,11 @@ def test_usage_reader_availability_route(
     response = client.get(url, headers=headers)
     assert response.status_code == 503
     assert response.json()["detail"] == "Muse is disabled or unavailable"
+    response = client.get(url, headers=headers)
+    assert response.status_code == 503
+    assert response.json()["detail"] == "Muse is disabled or unavailable"
     host.request.assert_not_awaited()
     host.initialize_result = {"sandboxAvailability": "available"}
-    app.state.muse_usage_expires = 0
     response = client.get(url, headers=headers)
     assert response.status_code == 200
     assert response.json()["available"] is False

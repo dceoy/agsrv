@@ -834,15 +834,16 @@ def _add_meta_routes(app: FastAPI, settings: Settings) -> None:  # ruff: ignore[
                             )
 
                         async def refresh() -> None:
-                            raw: dict[str, Any] = {}
                             try:
                                 raw = await muse.read_usage(settings.muse_bin)
-                            finally:
                                 app.state.muse_usage = {
                                     **muse.parse_usage(raw),
                                     "backend": raw,
                                 }
-                                app.state.muse_usage_expires = time.monotonic() + 60
+                            except BaseException:
+                                app.state.muse_usage_expires = 0
+                                raise
+                            app.state.muse_usage_expires = time.monotonic() + 60
 
                         empty: dict[str, Any] = {}
                         app.state.muse_usage = {
