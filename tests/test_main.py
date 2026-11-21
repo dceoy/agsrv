@@ -51,7 +51,7 @@ from agsrv.sandbox import (
     service_home,
 )
 from agsrv.schemas import QueryRequest
-from agsrv.security import check_sandbox_request
+from agsrv.security import check_sandbox_cwd, check_sandbox_request
 
 if TYPE_CHECKING:
     from collections.abc import (
@@ -189,7 +189,7 @@ def client_for(
         Client and runner.
     """
     runner = runner or FakeRunner()
-    return TestClient(create_app(settings, runner)), runner
+    return TestClient(create_app(settings, runner), base_url="http://localhost"), runner
 
 
 AUTH = {"Authorization": "Bearer secret"}
@@ -202,6 +202,22 @@ def test_health(tmp_path: Path) -> None:
         response = client.get("/health")
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
+
+
+def test_unauthenticated_hosts(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Local development accepts loopback hosts only and warns at startup."""
+    settings = make_settings(tmp_path, api_key=None, allow_unauthenticated=True)
+    with TestClient(create_app(settings)) as client:
+        assert "AGSRV_ALLOW_UNAUTHENTICATED is enabled" in caplog.text
+        for host in ("localhost", "127.0.0.1:8000", "[::1]:8000"):
+            assert client.get("/health", headers={"Host": host}).status_code == 200
+        for host in ("example.org", "testserver"):
+            assert client.get("/health", headers={"Host": host}).status_code == 400
+
+    with TestClient(create_app(make_settings(tmp_path))) as client:
+        assert client.get("/health", headers={"Host": "example.org"}).status_code == 200
 
 
 def test_query_success(tmp_path: Path) -> None:
@@ -585,7 +601,7 @@ def test_info(tmp_path: Path) -> None:
     client, _ = client_for(make_settings(tmp_path, default_model="m1"))
     body = client.get("/v1/info", headers=AUTH).json()
     assert body == {
-        "version": "0.5.0",
+        "version": "0.5.1",
         "stateless": True,
         "default_model": "m1",
         "workspace_root": str(tmp_path.resolve()),
@@ -602,6 +618,7 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
         "AGSRV_API_KEY",
         "AGSRV_ALLOW_UNAUTHENTICATED",
+        "AGSRV_ALLOW_UNSANDBOXED",
         "AGSRV_WORKSPACE_ROOT",
         "AGSRV_DEFAULT_MODEL",
         "AGSRV_PERMISSION_MODE",
@@ -617,6 +634,7 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = Settings.from_env()
     assert settings.api_key is None
     assert settings.allow_unauthenticated is False
+    assert settings.allow_unsandboxed is True
     assert settings.workspace_root == Path.cwd().resolve()
     assert settings.default_model is None
     assert settings.permission_mode == "acceptEdits"
@@ -630,10 +648,20 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert Settings().workspace_root == Path.cwd().resolve()
 
 
+def test_settings_positional_workspace_root(tmp_path: Path) -> None:
+    """Preserve the positional Settings constructor's workspace argument."""
+    settings = Settings("token", False, tmp_path)  # ruff: ignore[boolean-positional-value-in-call]
+    assert settings.api_key == "token"
+    assert settings.allow_unauthenticated is False
+    assert settings.workspace_root == tmp_path
+    assert settings.allow_unsandboxed is True
+
+
 def test_settings_from_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Verify explicit environment parsing."""
     monkeypatch.setenv("AGSRV_API_KEY", "k")
     monkeypatch.setenv("AGSRV_ALLOW_UNAUTHENTICATED", "TRUE")
+    monkeypatch.setenv("AGSRV_ALLOW_UNSANDBOXED", "false")
     monkeypatch.setenv("AGSRV_WORKSPACE_ROOT", str(tmp_path))
     monkeypatch.setenv("AGSRV_DEFAULT_MODEL", "mm")
     monkeypatch.setenv("AGSRV_PERMISSION_MODE", "plan")
@@ -647,6 +675,7 @@ def test_settings_from_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     settings = Settings.from_env()
     assert settings.api_key == "k"
     assert settings.allow_unauthenticated is True
+    assert settings.allow_unsandboxed is False
     assert settings.workspace_root == tmp_path.resolve()
     assert settings.default_model == "mm"
     assert settings.permission_mode == "plan"
@@ -1288,47 +1317,60 @@ def test_unsandboxed_egress_mode_allowed(sbx: SandboxEnv) -> None:
     assert runner.stream_calls == 1
 
 
-@pytest.mark.parametrize("path", ["/v1/query"])
-def test_sandbox_rejects_cwd_at_home_root(sbx: SandboxEnv, path: str) -> None:
-    """Verify a workspace rooted at the service home is rejected without cwd."""
-    (sbx.home / ".cache").mkdir()
-    client, runner = sbx_client(sbx, root=sbx.home)
-    response = client.post(path, json=SANDBOX_BODY, headers=AUTH)
-    assert response.status_code == 403
-    assert "cache" in response.json()["detail"]
-    assert runner.stream_calls == 0
-    assert not sandbox_cache_dir(sbx.home).exists()
+def test_settings_reject_workspace_containing_home(sbx: SandboxEnv) -> None:
+    """Reject the service home and its ancestors, including symlink aliases."""
+    alias = sbx.workspace / "alias"
+    alias.symlink_to(sbx.home.parent)
+    for root in (sbx.home, sbx.home.parent, alias):
+        with pytest.raises(ValueError, match="must not contain the service home"):
+            Settings(workspace_root=root)
 
 
-def test_sandbox_rejects_cwd_ancestor_and_shared_cache(sbx: SandboxEnv) -> None:
-    """Verify ancestors of ~/.cache and non-dedicated cache subdirs are rejected."""
+def test_sandbox_rejects_shared_cache(sbx: SandboxEnv) -> None:
+    """Reject the cache and non-dedicated cache subdirectories."""
     cache = sbx.home / ".cache"
     (cache / "pip").mkdir(parents=True)
     (cache / "agsrv-sandbox" / "work").mkdir(parents=True)
-    client, runner = sbx_client(sbx, root=sbx.home)
-    for cwd in (".cache", ".cache/pip", "."):
+    client, runner = sbx_client(sbx, root=cache)
+    for cwd in (".", "pip"):
         body = {**SANDBOX_BODY, "cwd": cwd}
         response = client.post("/v1/query", json=body, headers=AUTH)
         assert response.status_code == 403, cwd
     assert runner.stream_calls == 0
-    ok = {**SANDBOX_BODY, "cwd": ".cache/agsrv-sandbox/work"}
+    ok = {**SANDBOX_BODY, "cwd": "agsrv-sandbox/work"}
     assert client.post("/v1/query", json=ok, headers=AUTH).status_code == 200
     assert runner.stream_calls == 1
+
+
+def test_sandbox_rejects_symlinked_shared_cache(tmp_path: Path) -> None:
+    """Resolve a relocated cache before checking the sandbox cwd."""
+    home = tmp_path / "home"
+    home.mkdir()
+    cache = tmp_path / "workspace" / "cache"
+    (cache / "pip").mkdir(parents=True)
+    (cache / "agsrv-sandbox" / "work").mkdir(parents=True)
+    (home / ".cache").symlink_to(cache)
+    with pytest.raises(HTTPException) as exc_info:
+        check_sandbox_cwd(cache / "pip", home)
+    assert exc_info.value.status_code == 403
+    check_sandbox_cwd(cache / "agsrv-sandbox" / "work", home)
 
 
 def test_sandbox_allows_unrelated_cwd_under_home(sbx: SandboxEnv) -> None:
     """Verify a sibling directory of ~/.cache is allowed."""
     project = sbx.home / "project"
     project.mkdir()
-    client, runner = sbx_client(sbx, root=sbx.home)
-    body = {**SANDBOX_BODY, "cwd": "project"}
+    client, runner = sbx_client(sbx, root=project)
+    body = SANDBOX_BODY
     assert client.post("/v1/query", json=body, headers=AUTH).status_code == 200
     assert runner.stream_calls == 1
 
 
-def test_unsandboxed_cwd_at_home_allowed(sbx: SandboxEnv) -> None:
+def test_unsandboxed_cwd_at_cache_allowed(sbx: SandboxEnv) -> None:
     """Verify the cache guard applies to sandboxed runs only."""
-    client, runner = sbx_client(sbx, root=sbx.home)
+    cache = sbx.home / ".cache"
+    cache.mkdir()
+    client, runner = sbx_client(sbx, root=cache)
     assert (
         client.post(
             "/v1/query",

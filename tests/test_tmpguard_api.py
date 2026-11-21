@@ -19,7 +19,7 @@ from agsrv import main, muse
 from agsrv.claude import build_options
 from agsrv.config import Settings
 from agsrv.main import create_app
-from agsrv.sandbox import SandboxSetupError
+from agsrv.sandbox import SANDBOX_DENIED_ENV_VARS, SandboxSetupError
 from agsrv.schemas import CodexQueryRequest, QueryRequest
 from agsrv.tmpguard import TmpdirError
 from tests.conftest import statvfs_stub
@@ -627,8 +627,12 @@ def test_muse_rejects_low_space(
 
 @pytest.mark.asyncio
 async def test_muse_spawn_exports_tmpdir(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The host child gets TMPDIR only when a turn directory is supplied."""
-    seen: list[Any] = []
+    """Every host gets a filtered environment; turn directories override TMPDIR."""
+    for name in SANDBOX_DENIED_ENV_VARS:
+        monkeypatch.setenv(name, "sentinel")
+    monkeypatch.setenv("TMPDIR", "/inherited")
+    monkeypatch.setenv("AGSRV_KEEP_ME", "keep")
+    seen: list[dict[str, str]] = []
     client = MagicMock()
     client.close = AsyncMock()
 
@@ -640,4 +644,7 @@ async def test_muse_spawn_exports_tmpdir(monkeypatch: pytest.MonkeyPatch) -> Non
     await muse._close(await muse._spawn(None, None, "/w/t"))  # pyright: ignore[reportPrivateUsage]
     await muse._close(await muse._spawn(None, None))  # pyright: ignore[reportPrivateUsage]
     assert seen[0]["TMPDIR"] == "/w/t"
-    assert seen[1] is None
+    assert seen[1]["TMPDIR"] == "/inherited"
+    for env in seen:
+        assert set(SANDBOX_DENIED_ENV_VARS).isdisjoint(env)
+        assert env["AGSRV_KEEP_ME"] == "keep"

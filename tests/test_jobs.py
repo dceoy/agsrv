@@ -86,6 +86,36 @@ def test_submit_poll_and_idempotency(tmp_path: Path) -> None:
         assert client.get("/v1/jobs/unknown", headers=AUTH).status_code == 404
 
 
+@pytest.mark.parametrize("path", ["/v1/query", "/v1/jobs"])
+@pytest.mark.parametrize("agent", ["claude", "muse"])
+def test_operator_forbids_sandbox_opt_out(
+    tmp_path: Path, path: str, agent: str
+) -> None:
+    """Reject the opt-out before running a query or accepting a job."""
+    settings = _settings(tmp_path, allow_unsandboxed=False, muse_enabled=True)
+    with TestClient(create_app(settings, FakeRunner())) as client:
+        response = client.post(path, headers=AUTH, json={**BODY, "agent": agent})
+        assert response.status_code == 403
+        assert response.json()["detail"] == "unsandboxed runs are disabled"
+
+
+@pytest.mark.parametrize("path", ["/v1/query", "/v1/jobs"])
+def test_muse_rejects_shared_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """Sandboxed Muse queries and jobs cannot use the shared cache as cwd."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    cache = tmp_path / ".cache"
+    cache.mkdir()
+    settings = _settings(cache, muse_enabled=True)
+    with TestClient(create_app(settings)) as client:
+        response = client.post(
+            path, headers=AUTH, json={"agent": "muse", "prompt": "x"}
+        )
+        assert response.status_code == 403
+        assert "shared cache" in response.json()["detail"]
+
+
 def test_queue_saturation_and_cancellation(tmp_path: Path) -> None:
     """Queue admission is bounded, and queued/running jobs can be cancelled."""
     runner = FakeRunner(delay=0.3)
@@ -289,7 +319,7 @@ def test_job_admission_failure_cases(
             msg = "missing home"
             raise SandboxSetupError(msg)
 
-        monkeypatch.setattr("agsrv.jobs.service_home", no_home)
+        monkeypatch.setattr("agsrv.security.service_home", no_home)
         assert (
             client.post(
                 "/v1/jobs", headers=AUTH, json={"agent": "claude", "prompt": "x"}

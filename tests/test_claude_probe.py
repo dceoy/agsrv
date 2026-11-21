@@ -96,6 +96,8 @@ async def test_auth_status_uses_query_environment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``auth status`` runs with the same environment as the query path."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
     monkeypatch.setenv("HOME", str(tmp_path))
     fake_cli(
         tmp_path,
@@ -105,7 +107,7 @@ async def test_auth_status_uses_query_environment(
             f'[ "$HOME" = "{tmp_path}" ] || exit 4'
         ),
     )
-    assert await claude.probe(FakeRunner(), Settings(workspace_root=tmp_path))
+    assert await claude.probe(FakeRunner(), Settings(workspace_root=workspace))
 
 
 @pytest.mark.asyncio

@@ -104,6 +104,7 @@ class Settings:
         workspace_min_free_bytes: Minimum free bytes on the workspace (0 disables).
         api_key: Bearer token required from clients, if any.
         allow_unauthenticated: Permit requests when no API key is configured.
+        allow_unsandboxed: Permit Claude and Muse requests to disable their sandbox.
         workspace_root: Directory that all agent working directories must stay in.
         default_model: Model used when a request does not specify one.
         permission_mode: Default permission mode for agent runs.
@@ -131,6 +132,7 @@ class Settings:
 
     api_key: str | None = None
     allow_unauthenticated: bool = False
+    allow_unsandboxed: bool = field(default=True, kw_only=True)
     workspace_root: Path = field(default_factory=lambda: Path.cwd().resolve())
     default_model: str | None = None
     permission_mode: str = "acceptEdits"
@@ -158,11 +160,15 @@ class Settings:
     tmp_staging_dirs: tuple[tuple[Path, Path], ...] = ()
 
     def __post_init__(self) -> None:
-        """Validate disk thresholds and staging locations.
+        """Validate the workspace root, disk thresholds and staging locations.
 
         Raises:
-            ValueError: If a threshold is negative or a staging path is relative.
+            ValueError: If the root contains the service home, a threshold is
+                negative, or a staging path is relative.
         """
+        if Path.home().resolve().is_relative_to(self.workspace_root.resolve()):
+            msg = "AGSRV_WORKSPACE_ROOT must not contain the service home directory"
+            raise ValueError(msg)
         for mount, stage in self.tmp_staging_dirs:
             if not (mount.is_absolute() and stage.is_absolute()):
                 msg = "AGSRV_TMP_STAGING_DIRS paths must be absolute"
@@ -190,6 +196,7 @@ class Settings:
             ),
             api_key=_env_api_key(),
             allow_unauthenticated=_env_bool("AGSRV_ALLOW_UNAUTHENTICATED"),
+            allow_unsandboxed=_env_bool("AGSRV_ALLOW_UNSANDBOXED", default=True),
             workspace_root=Path(
                 os.environ.get("AGSRV_WORKSPACE_ROOT", str(Path.cwd()))
             ).resolve(),

@@ -1,6 +1,6 @@
 [project]
 name = "agsrv"
-version = "0.5.0"
+version = "0.5.1"
 description = "Stateless HTTP API for remote multi-agent execution"
 authors = [{name = "dceoy", email = "dceoy@users.noreply.github.com"}]
 maintainers = [{name = "dceoy", email = "dceoy@users.noreply.github.com"}]
@@ -14,6 +14,7 @@ dependencies = [
   "fastapi >= 0.115.0",
   "muse-code-sdk==1.4.24",
   "openai-codex>=0.170.0",
+  "starlette >= 1.7.0",
   "uvicorn[standard]>=0.54.0",
 ]
 classifiers = [

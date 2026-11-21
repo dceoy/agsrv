@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Annotated, Any, TypeVar, cast
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import Response
 from pydantic import Field
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from agsrv import claude, codex, muse
 from agsrv.claude import (
@@ -36,6 +37,7 @@ from agsrv.security import (
     auth_dependency,
     check_permission_mode,
     check_sandbox_cwd,
+    check_sandbox_opt_out,
     check_sandbox_request,
     resolve_cwd,
 )
@@ -50,7 +52,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 DISCONNECT_POLL_INTERVAL = 0.1
 PROBE_TIMEOUT = 10.0
 MUSE_PROBE_TIMEOUT = 10.0
@@ -530,7 +532,10 @@ async def _muse_query(  # ruff: ignore[complex-structure]
 ) -> dict[str, Any]:
     settings: Settings = request.app.state.settings
     anchors: Anchors = request.app.state.anchors
+    check_sandbox_opt_out(settings, sandbox=body.sandbox)
     cwd = resolve_cwd(settings, body.cwd)
+    if body.sandbox:
+        check_sandbox_cwd(cwd)
     timeout = body.timeout_seconds or settings.max_timeout_seconds
     if timeout > settings.max_timeout_seconds:
         raise HTTPException(
@@ -994,6 +999,8 @@ def _add_query_routes(app: FastAPI) -> None:  # ruff: ignore[complex-structure, 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncGenerator[None]:
     """Open the durable queue and stop all owned jobs on shutdown."""
+    if app.state.settings.allow_unauthenticated:
+        logger.warning("AGSRV_ALLOW_UNAUTHENTICATED is enabled; bind only to loopback")
     app.state.anchors.open()
     app.state.jobs.start()
     try:
@@ -1066,6 +1073,10 @@ def create_app(
         version=VERSION,
         lifespan=_lifespan,
     )
+    if settings.allow_unauthenticated:
+        app.add_middleware(
+            TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]"]
+        )
     app.state.settings = settings
     app.state.runner = runner or SdkAgentRunner()
     app.state.semaphore = asyncio.Semaphore(settings.max_concurrency)

@@ -27,6 +27,7 @@ from agsrv.schemas import CodexQueryRequest, MuseQueryRequest, QueryRequest
 from agsrv.security import (
     check_permission_mode,
     check_sandbox_cwd,
+    check_sandbox_opt_out,
     check_sandbox_request,
     resolve_cwd,
 )
@@ -188,17 +189,15 @@ class JobManager:
                 "timeout_seconds exceeds server maximum "
                 f"{settings.max_timeout_seconds}",
             )
+        if isinstance(body, CodexQueryRequest):
+            return cwd
         if isinstance(body, QueryRequest):
             check_permission_mode(settings, body.permission_mode)
             check_sandbox_request(settings, body.sandbox, body.permission_mode)
-            if body.sandbox:
-                try:
-                    check_sandbox_cwd(cwd, service_home())
-                except SandboxSetupError as exc:
-                    raise HTTPException(
-                        status.HTTP_503_SERVICE_UNAVAILABLE,
-                        "sandbox unavailable",
-                    ) from exc
+        else:
+            check_sandbox_opt_out(settings, sandbox=body.sandbox)
+        if body.sandbox:
+            check_sandbox_cwd(cwd)
         return cwd
 
     def submit(

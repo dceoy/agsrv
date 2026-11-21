@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Annotated
 
 from fastapi import Header, HTTPException, Request, status
 
+from agsrv.sandbox import SandboxSetupError, service_home
+
 if TYPE_CHECKING:
     from agsrv.config import Settings
 
@@ -95,6 +97,16 @@ def resolve_cwd(settings: Settings, cwd: str | None) -> Path:
 EGRESS_EXPANDING_MODES = frozenset({"auto", "bypassPermissions"})
 
 
+def check_sandbox_opt_out(settings: Settings, *, sandbox: bool) -> None:
+    """Enforce the operator's sandbox policy for Claude and Muse.
+
+    Raises:
+        HTTPException: 403 if the request disables a required sandbox.
+    """
+    if not sandbox and not settings.allow_unsandboxed:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "unsandboxed runs are disabled")
+
+
 def check_sandbox_request(
     settings: Settings, requested: bool, permission_mode: str | None = None
 ) -> None:
@@ -109,6 +121,7 @@ def check_sandbox_request(
     Raises:
         HTTPException: 403 if the effective permission mode can expand egress.
     """
+    check_sandbox_opt_out(settings, sandbox=requested)
     if not requested:
         return
     mode = permission_mode or settings.permission_mode
@@ -120,7 +133,7 @@ def check_sandbox_request(
         )
 
 
-def check_sandbox_cwd(cwd: Path, home: Path) -> None:
+def check_sandbox_cwd(cwd: Path, home: Path | None = None) -> None:
     """Reject working directories that would make the shared cache writable.
 
     The CLI grants write access to the whole working directory, so it must not
@@ -129,12 +142,18 @@ def check_sandbox_cwd(cwd: Path, home: Path) -> None:
 
     Args:
         cwd: Resolved working directory.
-        home: Home directory of the server user.
+        home: Service home directory, if already resolved.
 
     Raises:
-        HTTPException: 403 if the directory overlaps the shared cache.
+        HTTPException: 403 if the directory overlaps the shared cache; 503 if
+            the service home directory is unavailable.
     """
-    cache = home.resolve() / ".cache"
+    try:
+        cache = ((home or service_home()) / ".cache").resolve()
+    except SandboxSetupError as exc:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "sandbox unavailable"
+        ) from exc
     if cwd.is_relative_to(cache / "agsrv-sandbox"):
         return
     if cache.is_relative_to(cwd) or cwd.is_relative_to(cache):

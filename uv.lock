@@ -14,7 +14,7 @@ exclude-newer-span = "P1D"
 
 [[package]]
 name = "agsrv"
-version = "0.5.0"
+version = "0.5.1"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
@@ -22,6 +22,7 @@ dependencies = [
     { name = "fastapi" },
     { name = "muse-code-sdk" },
     { name = "openai-codex" },
+    { name = "starlette" },
     { name = "uvicorn", extra = ["standard"] },
 ]
 
@@ -47,6 +48,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "muse-code-sdk", specifier = "==1.4.24" },
     { name = "openai-codex", specifier = ">=0.170.0" },
+    { name = "starlette", specifier = ">=1.7.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.54.0" },
 ]
 

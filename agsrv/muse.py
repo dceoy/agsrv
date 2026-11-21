@@ -17,6 +17,8 @@ from muse_code import (
 )
 from muse_code.facade.approval import ApprovalDecisionInput
 
+from agsrv.sandbox import SANDBOX_DENIED_ENV_VARS
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -98,7 +100,9 @@ async def _spawn(
     sandbox: bool = True,
     experimental: bool = False,
 ) -> MuseClient[Any]:
-    env = {**os.environ, "TMPDIR": tmpdir} if tmpdir else None
+    env = {k: v for k, v in os.environ.items() if k not in SANDBOX_DENIED_ENV_VARS}
+    if tmpdir:
+        env["TMPDIR"] = tmpdir
     opts = MuseClientSpawnOptions(
         binary,
         _client_info(),  # pyright: ignore[reportArgumentType]
