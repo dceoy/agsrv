@@ -18,6 +18,8 @@ from muse_code import (
 from muse_code.facade.approval import ApprovalDecisionInput
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from muse_code_msp import ApprovalRequestParams
 
 logger = logging.getLogger(__name__)
@@ -94,6 +96,7 @@ async def _spawn(
     tmpdir: str | None = None,
     *,
     sandbox: bool = True,
+    experimental: bool = False,
 ) -> MuseClient[Any]:
     env = {**os.environ, "TMPDIR": tmpdir} if tmpdir else None
     opts = MuseClientSpawnOptions(
@@ -102,6 +105,7 @@ async def _spawn(
         args=serve_args(sandbox=sandbox),
         cwd=cwd,
         env=env,
+        capabilities={"experimentalApi": True} if experimental else None,
         on_stderr=_on_stderr,
     )
     client: MuseClient[Any] = await MuseClient.spawn(opts)
@@ -318,21 +322,30 @@ def parse_usage(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def read_usage(binary: str | None) -> dict[str, Any]:
-    """Read the host cache without a model turn.
+async def read_usage(
+    binary: str | None, on_dispatch: Callable[[], None]
+) -> dict[str, Any]:
+    """Refresh subscription usage without a model turn.
 
     Returns:
-        The last-observed usage payload.
+        The refreshed usage payload, or an empty dict if the refresh fails.
 
     Raises:
         MuseUnavailableError: If the host is unavailable.
     """
-    client = await _spawn(binary, None)
+    try:
+        client = await _spawn(binary, None, experimental=True)
+    except Exception:  # ruff: ignore[blind-except]  # unavailable usage fails closed
+        return {}
     try:
         if not _is_ephemeral(client) or not _sandbox_available(client):
             msg = "Muse unavailable"
             raise MuseUnavailableError(msg)
-        return dict(await client.read_usage())
+        try:
+            on_dispatch()
+            return dict(await client.request("usage/refresh"))
+        except Exception:  # ruff: ignore[blind-except]  # unavailable usage fails closed
+            return {}
     finally:
         await _close(client)
 

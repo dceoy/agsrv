@@ -18,7 +18,7 @@ disconnect, and retrieve the result later.
 | GET    | `/v1/agents`       | yes  | Agent capabilities and health              |
 | GET    | `/v1/agents/claude/rate-limits` | yes | Claude subscription quota |
 | GET    | `/v1/agents/codex/rate-limits` | yes | Codex account limits              |
-| GET    | `/v1/agents/muse/rate-limits` | yes | Muse last-observed subscription usage |
+| GET    | `/v1/agents/muse/rate-limits` | yes | Muse subscription usage |
 | POST   | `/v1/query`        | yes  | Run one agent query, return the result |
 | POST   | `/v1/jobs`        | yes  | Submit a durable asynchronous job (202)  |
 | GET    | `/v1/jobs/{job_id}` | yes | Poll status and terminal result         |
@@ -287,9 +287,9 @@ cached probe expired).
 
 Each agent also has a rate-limits route (see the endpoints table): Claude's
 returns the local `/usage` result, Codex's the typed
-`account/rateLimits/read` response, and Muse's the host's last-observed
-`usage/read` cache, all without a model turn. A fresh Muse host may have no
-observation yet; its route then returns `available: false`. See
+`account/rateLimits/read` response, and Muse's an active `usage/refresh` request, all without a model turn. Muse's
+request uses an experimental host API; if it fails or has no usable windows,
+the route returns `available: false`. See
 [docs/api/rest-api.md](docs/api/rest-api.md) for the exact response shapes and
 the precise health definitions.
 
