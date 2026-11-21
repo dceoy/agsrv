@@ -265,11 +265,12 @@ If the output cannot be parsed, it returns `available=false`.
 Muse runs (disabled unless `AGSRV_MUSE_ENABLED=true` and the service user is
 logged in to `muse`) use `muse serve --no-session-log --contributor-mode off`
 and deny-all approvals. The host sandbox is on by default; a request may opt
-out per turn with an explicit `"sandbox": false` (adds `--disable-sandbox`). Muse requires the same
-SDK/host version coupling as Codex (`muse-code-sdk==1.4.24` matches `muse 1.4.24`);
-upgrade them together. Sessions are memory-only (`--no-session-log`) and the
-backend fails closed when durability is not ephemeral. `GET /v1/agents` reports
-`muse` health with a cached probe and never leaks paths or credentials.
+out per turn with an explicit `"sandbox": false` (adds `--disable-sandbox`).
+Muse requires the same SDK/host version coupling as Codex
+(`muse-code-sdk==1.4.24` matches `muse 1.4.24`); upgrade them together.
+Sessions are memory-only (`--no-session-log`) and the backend fails closed when
+durability is not ephemeral. `GET /v1/agents` reports `muse` health with a
+cached probe and never leaks paths or credentials.
 
 ## Agent health and rate limits
 

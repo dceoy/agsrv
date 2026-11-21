@@ -192,11 +192,14 @@ deny-all `on_approval` handler and approval mode `onRequest` (never
 `--trust-workspace`).
 
 `sandbox` (boolean, default `true`) applies to both `POST /v1/query` and
-`POST /v1/jobs`. Only an explicit `"sandbox": false` opts out: that turn's
-`muse serve` host is spawned with `--disable-sandbox` and the sandbox
-availability check is skipped for that turn. Omitting the field, or any value
-other than `false`, keeps the sandboxed posture and the fail-closed
-availability check. The opt-out is per request; there is no server-wide
+`POST /v1/jobs`. An explicit opt-out is the only way to disable the sandbox:
+that turn's `muse serve` host is spawned with `--disable-sandbox` and the
+sandbox availability check is skipped for that turn. Omitting the field or
+sending `true` keeps the sandboxed posture and the fail-closed availability
+check. `false` (or any value Pydantic's boolean parsing accepts as false, such
+as `"false"`, `"0"`, `"no"`, `"off"` or `0`) opts out for that turn; other
+non-boolean values, including `null` and strings such as `"maybe"`, are
+rejected with 422. The opt-out is per request; there is no server-wide
 setting or separate control endpoint, and the health probe and
 `GET /v1/agents/muse/rate-limits` always use the sandboxed posture. The
 effective value is recorded as `backend.sandbox` in the response. Sessions are

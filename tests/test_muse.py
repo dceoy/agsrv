@@ -1096,6 +1096,13 @@ def test_query_and_job_plumb_sandbox(
                 "/v1/query", headers=headers, json={**body, "sandbox": bad_value}
             )
             assert bad.status_code == 422
+        run.reset_mock()
+        coerced = client.post(
+            "/v1/query", headers=headers, json={**body, "sandbox": "false"}
+        )
+        assert coerced.status_code == 200
+        assert run.await_args is not None
+        assert run.await_args.kwargs["sandbox"] is False
 
 
 def test_invalid_usage() -> None:
