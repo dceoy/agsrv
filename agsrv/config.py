@@ -132,7 +132,7 @@ class Settings:
 
     api_key: str | None = None
     allow_unauthenticated: bool = False
-    allow_unsandboxed: bool = True
+    allow_unsandboxed: bool = field(default=True, kw_only=True)
     workspace_root: Path = field(default_factory=lambda: Path.cwd().resolve())
     default_model: str | None = None
     permission_mode: str = "acceptEdits"

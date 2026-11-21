@@ -648,6 +648,15 @@ def test_settings_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
     assert Settings().workspace_root == Path.cwd().resolve()
 
 
+def test_settings_positional_workspace_root(tmp_path: Path) -> None:
+    """Preserve the positional Settings constructor's workspace argument."""
+    settings = Settings("token", False, tmp_path)
+    assert settings.api_key == "token"
+    assert settings.allow_unauthenticated is False
+    assert settings.workspace_root == tmp_path
+    assert settings.allow_unsandboxed is True
+
+
 def test_settings_from_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Verify explicit environment parsing."""
     monkeypatch.setenv("AGSRV_API_KEY", "k")
