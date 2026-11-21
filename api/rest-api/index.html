@@ -293,7 +293,16 @@ or unavailable backend returns 503 without affecting Claude.</p>
 <h2 id="get-v1agents"><code>GET /v1/agents</code><a class="headerlink" href="#get-v1agents" title="Permanent link">&para;</a></h2>
 <p>Returns <code>claude</code> and <code>codex</code> objects with <code>enabled</code>, <code>healthy</code>, <code>default_model</code>,
 and <code>supports</code> flags for <code>sandbox</code>, <code>network_access</code>, <code>rate_limits</code>, and
-<code>streaming</code>. Codex initialization health is cached for approximately 30 seconds.</p>
+<code>streaming</code>. Claude and Codex health probes are cached for approximately 30 seconds. Claude uses the local <code>/usage</code> command, without consuming tokens or allowance.</p>
+<p>Claude is <code>healthy</code> when the CLI is spawnable, the ephemeral <code>/usage</code> run does not
+return an error result, and the bundled CLI's <code>auth status</code> reports
+<code>loggedIn: true</code>. The probe never uses the sandbox. This proves a configured,
+spawnable CLI whose <code>/usage</code> run succeeds; it does not prove the credential is
+still valid server-side (an expired or revoked token can pass until a real turn
+runs). While the Claude concurrency slot is busy, this endpoint returns the last
+cached health value (even if expired) and never responds 429 because of the
+Claude probe. The Codex entry is unaffected: with Codex enabled and its
+concurrency slot busy, this endpoint can still respond 429.</p>
 <h2 id="get-v1agentscodexrate-limits"><code>GET /v1/agents/codex/rate-limits</code><a class="headerlink" href="#get-v1agentscodexrate-limits" title="Permanent link">&para;</a></h2>
 <p>Returns <code>plan</code>, <code>primary</code> and <code>secondary</code> windows (<code>used_percent</code> and
 <code>resets_at</code>), <code>reached_type</code>, <code>reset_credits</code>, and the raw SDK payload in
@@ -392,7 +401,7 @@ The old SSE stream endpoint is deliberately removed.</p>
 </tr>
 <tr>
 <td>503</td>
-<td><code>AGSRV_API_KEY</code> not configured and unauthenticated access not allowed; sandbox prerequisites unavailable or Codex disabled/unavailable</td>
+<td><code>AGSRV_API_KEY</code> not configured and unauthenticated access not allowed; sandbox prerequisites unavailable or Claude or Codex disabled/unavailable</td>
 </tr>
 <tr>
 <td>504</td>
