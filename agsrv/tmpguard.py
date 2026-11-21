@@ -18,8 +18,11 @@ so ownership is decided by an open descriptor, never by a name:
 * **Creation in staging.** A service-controlled staging directory (one per
   workspace mount, opened and validated at startup: directory, owned by the
   service, mode ``0700``) is outside the writers' reach. The turn directory is
-  created there with ``mkdir`` and a random name, made ``0700``, opened, and
-  verified through the descriptor while still private. It is then *published*
+  created there with ``mkdir`` and a random name, then opened relative to the
+  staging descriptor (``O_NOFOLLOW | O_DIRECTORY``). The held descriptor must be
+  an empty directory; mode ``0700`` is applied with ``fchmod`` on it (never by
+  name) and its ``(st_dev, st_ino)`` identity is recorded. Rollback removes the
+  entry only if that identity still matches. It is then *published*
   into the cwd with ``renameat2(RENAME_NOREPLACE)``, which never overwrites even
   an empty directory.
 * **Reclaim.** Cleanup renames the public entry back into staging (no-replace),
@@ -27,11 +30,16 @@ so ownership is decided by an open descriptor, never by a name:
   match empties the tree *through the held child descriptor* (descriptor-safe
   ``shutil.rmtree(entry, dir_fd=child_fd)`` per entry). The only name-based
   destructive step is the final ``rmdir`` of the now-empty directory under the
-  protected staging parent, so even a reachable staging directory can cost at
-  most one empty directory. A mismatching entry is never traversed or deleted;
+  staging parent. A mismatching entry is never traversed or deleted;
   it is renamed back to the public name if that is free, otherwise it is kept
   in staging and its exact location is logged. Cleanup runs in one worker thread
   and is shielded from cancellation.
+
+Staging must be reachable only by the service account. A writer that can reach
+the staging directory defeats the setup and cleanup guarantees (published-tree
+identity, chmod target, content deletion); processes under the same UID are
+outside the guarantee, and real isolation needs separate credentials or
+namespaces.
 
 Residual risks (see also the README): children receive a ``TMPDIR`` path string
 and resolve it themselves, so a writer can redirect *children* by replacing the

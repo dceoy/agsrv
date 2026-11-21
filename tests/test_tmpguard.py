@@ -1336,7 +1336,7 @@ async def test_substitution_inside_staging_after_verification(
 
 @pytest.mark.asyncio
 @pytest.mark.usefixtures("names")
-async def test_empty_substitute_inside_staging_costs_at_most_itself(
+async def test_empty_substitute_inside_staging_only_loses_the_rmdir_target(
     env: Env, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The only name-based removal is ``rmdir``; it removes empty directories only."""

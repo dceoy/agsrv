@@ -140,8 +140,10 @@ service user.
   anything is published or launched. All later server mutations use the held
   descriptor, so a later symlink swap cannot redirect them.
 - **Create privately, publish atomically.** The directory is created in staging
-  (`mkdir` under a random name, `chmod 0700` while still private, opened and
-  verified through its descriptor) and then published into the working directory
+  (`mkdir` under a random name, then opened relative to the staging descriptor
+  with `O_NOFOLLOW | O_DIRECTORY`; the held descriptor must be an empty
+  directory, receives mode `0700` via `fchmod`, and supplies the identity used
+  later; there is no name-based `chmod`) and then published into the working directory
   with `renameat2(RENAME_NOREPLACE)`, which never overwrites an existing entry,
   even an empty directory. `O_CREAT | O_EXCL | O_DIRECTORY` is not used (it fails
   with `EINVAL` on Linux 6.4 and later).
@@ -150,9 +152,9 @@ service user.
   the held descriptor, and only on a match deletes the contents *through the
   held directory descriptor* (`shutil.rmtree(entry, dir_fd=child_fd)` for each
   entry; symlink-attack resistant, required at startup). The only name-based
-  removal is the final `rmdir` of the then-empty directory under the protected
-  staging parent, so even a writer that reaches staging can cost at most one
-  empty directory, never another tree. On a mismatch
+  removal is the final `rmdir` of the then-empty directory under the staging
+  parent. These checks assume staging is reachable only by the service account
+  (see the limits below). On a mismatch
   nothing is traversed or deleted: the entry is renamed back if the public name
   is free; otherwise it stays in staging and its recovery name is logged.
 - **Off the event loop, shielded.** Cleanup runs in one worker thread. If the
@@ -184,11 +186,15 @@ Residual risks:
   non-listable by a child may keep a partially removed entry in staging (logged).
 - `0700` is also a deployment property: an unrestricted same-UID child that can
   reach staging (for example by reading `AGSRV_TMP_STAGING_DIRS` from the
-  service's `/proc/<pid>/environ`) can enumerate and rename entries there. Content
-  deletion stays on held descriptors, so the damage is bounded (an impostor entry
-  may be lost only if it is an empty directory, and a genuine turn tree may be
-  left behind), but a deployment that wants the full guarantee needs credential
-  or namespace isolation. Mount
+  service's `/proc/<pid>/environ`) can enumerate and rename entries there. A writer
+  that can reach the staging directory defeats the setup and cleanup guarantees:
+  the published-tree identity, the target of the mode change and the deletion of
+  content are no longer assured. The guarantees hold only while staging is
+  reachable solely by the service account; processes under the same UID are
+  outside them, and real isolation requires separate credentials or
+  namespaces. A `umask` that clears the owner bits makes the new directory
+  unopenable; the turn then fails (HTTP 503) and the staged entry is left
+  for the operator. Mount
   administration, service compromise, malicious filesystems and the trusted
   anchors (workspace root, staging directory and their ancestors) are outside
   the model.
