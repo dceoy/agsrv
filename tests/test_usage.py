@@ -18,7 +18,7 @@ from fastapi.testclient import TestClient
 
 from agsrv import main
 from agsrv.config import Settings
-from agsrv.main import VERSION, create_app
+from agsrv.main import create_app
 from agsrv.usage import parse_usage
 from tests.test_main import CleanupRunner, FakeRunner
 
@@ -157,9 +157,9 @@ def test_invalid_percentages_and_timezone() -> None:
 
 
 def test_documented_info_version() -> None:
-    """The REST example tracks the running API version."""
+    """The REST example carries a version field without hard-coding the version."""
     docs = Path("docs/api/rest-api.md").read_text(encoding="utf-8")
-    assert f'"version": "{VERSION}"' in docs
+    assert '"version": "x.y.z"' in docs
 
 
 @pytest.mark.asyncio
