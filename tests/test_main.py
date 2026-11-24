@@ -834,7 +834,13 @@ def test_json_safe() -> None:
 
 def test_generic_serialization() -> None:
     """Verify fallback serialization for unknown message and block types."""
-    event = StreamEvent(uuid="u", session_id="s", event={"x": 1})
+    event = StreamEvent(
+        uuid="u",
+        session_id="s",
+        event={"x": 1},
+        user_message_uuid="prompt-1",
+        user_message_uuids=["prompt-1"],
+    )
     assert message_to_dict(event) == {
         "type": "stream_event",
         "data": {
@@ -842,6 +848,8 @@ def test_generic_serialization() -> None:
             "session_id": "s",
             "event": {"x": 1},
             "parent_tool_use_id": None,
+            "user_message_uuid": "prompt-1",
+            "user_message_uuids": ["prompt-1"],
         },
     }
     block = ServerToolUseBlock(id="i", name="web_search", input={"q": "z"})
