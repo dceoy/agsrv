@@ -23,7 +23,7 @@ overrides = [
 
 [[package]]
 name = "agsrv"
-version = "0.5.2"
+version = "0.5.3"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
@@ -57,7 +57,7 @@ requires-dist = [
     { name = "anyio", specifier = ">=4.16.0" },
     { name = "claude-agent-sdk", specifier = ">=0.2.182" },
     { name = "fastapi", specifier = ">=0.115.0" },
-    { name = "muse-code-sdk", specifier = "==1.4.24" },
+    { name = "muse-code-sdk", specifier = ">=1.4.25" },
     { name = "openai-codex", specifier = ">=0.170.0" },
     { name = "starlette", specifier = ">=1.7.0" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.54.0" },
@@ -1152,24 +1152,24 @@ wheels = [
 
 [[package]]
 name = "muse-code-msp"
-version = "1.4.24"
+version = "1.4.25"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/b3/79/4fbe38740e7c73fd4d9f12e8e569d1cf75fe9c9c9bf1f3cc8c14f36d04d4/muse_code_msp-1.4.24.tar.gz", hash = "sha256:e12598b8a5b469e07697100fab24043b39f0c0b7df162dbe6897ec67d42c9a3e", size = 407054, upload-time = "2026-11-19T04:55:08.902Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/fc/c2/331c06bea43e5dd079640a029e02d19dbd24161226ff4a8322ed69524fbc/muse_code_msp-1.4.25.tar.gz", hash = "sha256:5870d7b406b60cdda2b775809e8e9056c60e545efc222dfedd078d35451035b0", size = 411329, upload-time = "2026-11-21T19:35:17.343Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d4/23/6829306201c37874bc8554c218a190585d329280a526b6122dea46c44228/muse_code_msp-1.4.24-py3-none-any.whl", hash = "sha256:90ccc4ba2537c0c49bfdd4feffbce6629ca7b4f63e1be911b67da859d3836d4b", size = 411255, upload-time = "2026-11-19T04:55:07.546Z" },
+    { url = "https://files.pythonhosted.org/packages/c2/e5/9379a69bf9ee99f0f450b6535239f014c78a2e7a96b2b8320b29857f0f17/muse_code_msp-1.4.25-py3-none-any.whl", hash = "sha256:8c9dd0e3c916dcf1b5fe1f37a60f3fee300284068685d16f71aab9debc4f1678", size = 415619, upload-time = "2026-11-21T19:35:15.973Z" },
 ]
 
 [[package]]
 name = "muse-code-sdk"
-version = "1.4.24"
+version = "1.4.25"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "muse-code-msp" },
     { name = "pydantic" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/8a/41/c75ebf353ae9b2a9f24870b23d8059629cc6b09283728197ae06c87d1be3/muse_code_sdk-1.4.24.tar.gz", hash = "sha256:fdb25ce2edd7b2dbc78f59ddb53eaeab1d32363820293faafc5ded39cac26b5e", size = 358830, upload-time = "2026-11-19T04:55:54.79Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/bf/dd/d63ac841f2ac6cffb2be86cefd9b0c151312cdc9cb276f35e89794b964b0/muse_code_sdk-1.4.25.tar.gz", hash = "sha256:8ec415da743be03461409aefceaede68c004e5379c5352295054536c25fdd5ed", size = 358781, upload-time = "2026-11-21T19:35:52.129Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/aa/e4/656ecd2474d759be85e1c32bf434fb4cb5824b7dc10036845931f42686d9/muse_code_sdk-1.4.24-py3-none-any.whl", hash = "sha256:5764fff04e25a273edd6dd640b4e0cac040ba039071c9d8ff66ff7bee5db6a45", size = 154854, upload-time = "2026-11-19T04:55:53.245Z" },
+    { url = "https://files.pythonhosted.org/packages/88/9c/80b7b7fbfab9efef0c9850d04a4bf62ca9dcbc6ff4ccfaf7eff7a43c936f/muse_code_sdk-1.4.25-py3-none-any.whl", hash = "sha256:548640d68fec7e0143e5d21ecee58390be711c870fef71a588fd4cfb74c455e1", size = 154855, upload-time = "2026-11-21T19:35:50.64Z" },
 ]
 
 [[package]]
