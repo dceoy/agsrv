@@ -7,7 +7,7 @@ maintainers = [{name = "dceoy", email = "dceoy@users.noreply.github.com"}]
 license = "AGPL-3.0-only"
 license-files = ["LICENSE"]
 readme = "README.md"
-requires-python = ">=3.15, <3.16"
+requires-python = ">= 3.11, < 3.15"
 dependencies = [
   "anyio >= 4.16.0",
   "claude-agent-sdk >= 0.2.182",
