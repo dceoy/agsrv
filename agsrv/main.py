@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 from contextlib import aclosing, asynccontextmanager, suppress
+from importlib.metadata import version as _package_version
 from typing import TYPE_CHECKING, Annotated, Any, TypeVar, cast
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
@@ -52,7 +53,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-VERSION = "0.5.1"
+VERSION = _package_version("agsrv")
 DISCONNECT_POLL_INTERVAL = 0.1
 PROBE_TIMEOUT = 10.0
 MUSE_PROBE_TIMEOUT = 10.0
