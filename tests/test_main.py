@@ -1251,8 +1251,12 @@ def test_sandbox_false_when_off(tmp_path: Path) -> None:
     assert runner.options.cli_path is None
 
 
-@pytest.mark.parametrize("fast_mode", [{}, {"fast_mode": True}])
-def test_sandbox_default_enabled(sbx: SandboxEnv, fast_mode: dict[str, bool]) -> None:
+@pytest.mark.parametrize(
+    "fast_mode", [{}, {"fast_mode": None}, {"fast_mode": False}, {"fast_mode": True}]
+)
+def test_sandbox_default_enabled(
+    sbx: SandboxEnv, fast_mode: dict[str, bool | None]
+) -> None:
     """Verify a request omitting sandbox enables a fail-closed sandbox."""
     settings = make_settings(sbx.workspace)
     client, runner = client_for(settings)
@@ -1261,7 +1265,7 @@ def test_sandbox_default_enabled(sbx: SandboxEnv, fast_mode: dict[str, bool]) ->
     )
     assert response.status_code == 200
     assert runner.options is not None
-    if fast_mode:
+    if fast_mode.get("fast_mode") is True:
         assert runner.options.settings is not None
         assert json.loads(runner.options.settings) == {"fastMode": True}
     else:
