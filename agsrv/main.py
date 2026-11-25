@@ -361,6 +361,7 @@ async def _codex_query(body: CodexQueryRequest, request: Request) -> dict[str, A
                     effort=body.effort,
                     sandbox=body.options.sandbox,
                     network_access=body.options.network_access,
+                    service_tier=body.options.service_tier,
                     binary=settings.codex_bin,
                     tmpdir=str(tmpdir),
                 )

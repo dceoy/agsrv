@@ -257,8 +257,11 @@ before lowercasing, so look-alike characters such as the Kelvin sign are rejecte
 
 Codex requests use `"agent": "codex"` and may set `options.sandbox` to
 `"read-only"` (default) or `"workspace-write"`, and `options.network_access`
-to a boolean (default `false`). Codex threads are ephemeral, approvals are
-denied, and explicit network access uses the SDK’s low-level sandbox policy.
+to a boolean (default `false`). Set `options.service_tier` to `"fast"` (alias
+`"priority"`), `"flex"`, `"ultrafast"`, or `"default"` (standard routing).
+Omit the tier to use Codex's configured routing. Codex threads are ephemeral,
+approvals are denied, and explicit network access uses the SDK’s low-level
+sandbox policy.
 Rate limits come from `account/rateLimits/read`. The Claude rate-limits route
 runs the local `/usage` command and returns normalized windows and the raw text.
 If the output cannot be parsed, it returns `available=false`.

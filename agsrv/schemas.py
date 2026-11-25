@@ -7,7 +7,7 @@ from typing import Any, Literal
 # Pydantic resolves these Literal aliases at runtime, so the import cannot
 # move into a TYPE_CHECKING block.
 from claude_agent_sdk import EffortLevel, PermissionMode  # ruff: ignore[typing-only-third-party-import]
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool
 
 
 class QueryRequest(BaseModel):
@@ -23,17 +23,21 @@ class QueryRequest(BaseModel):
     permission_mode: PermissionMode | None = None
     max_turns: int | None = Field(default=None, ge=1, le=1000)
     effort: EffortLevel | None = None
+    fast_mode: StrictBool | None = None
     timeout_seconds: float | None = Field(default=None, gt=0)
     include_messages: bool = True
     sandbox: bool = True
 
 
 class CodexOptions(BaseModel):
-    """Codex sandbox settings."""
+    """Codex sandbox and service settings."""
 
     model_config = ConfigDict(extra="forbid")
     sandbox: Literal["read-only", "workspace-write"] = "read-only"
     network_access: bool = False
+    service_tier: Literal["fast", "priority", "flex", "ultrafast", "default"] | None = (
+        None
+    )
 
 
 class CodexQueryRequest(BaseModel):

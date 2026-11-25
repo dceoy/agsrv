@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import sqlite3
 import time
+from contextlib import closing
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -14,9 +16,10 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from agsrv.config import Settings
+from agsrv.jobs import _canonical  # pyright: ignore[reportPrivateUsage]
 from agsrv.main import create_app
 from agsrv.sandbox import SandboxSetupError
-from agsrv.schemas import QueryRequest
+from agsrv.schemas import CodexQueryRequest, QueryRequest
 from tests.test_main import FakeRunner, canned
 
 if TYPE_CHECKING:
@@ -47,6 +50,30 @@ def _wait(client: TestClient, job_id: str) -> dict[str, Any]:
     pytest.fail("job did not reach a terminal state")
 
 
+@pytest.mark.parametrize("fast_mode", [{}, {"fast_mode": None}, {"fast_mode": False}])
+def test_claude_job_pre_pr_hash(fast_mode: dict[str, bool | None]) -> None:
+    """Keep retries compatible with Claude job records created before fast mode."""
+    request = QueryRequest.model_validate({**BODY, **fast_mode})
+    # Pin SHA-256 of the canonical JSON generated at base commit 70ee593.
+    assert hashlib.sha256(_canonical(request).encode()).hexdigest() == (
+        "9652d3f09d4aa62d3fd2b3af4718df5b09e16cb614f40ebf70d57a18fb01c44f"
+    )
+
+
+@pytest.mark.parametrize("options", [{}, {"options": {"service_tier": None}}])
+def test_codex_job_pre_pr_hash(options: dict[str, object]) -> None:
+    """Keep retries compatible with Codex job records created before service tiers."""
+    request = CodexQueryRequest.model_validate({
+        "agent": "codex",
+        "prompt": "inspect",
+        **options,
+    })
+    # Pin SHA-256 of the canonical JSON generated at base commit 70ee593.
+    assert hashlib.sha256(_canonical(request).encode()).hexdigest() == (
+        "b4b4c862d7d6ad022d49c7a3914195afa1154e4f5b82d6d4f2cc6b5148476bf4"
+    )
+
+
 def test_submit_poll_and_idempotency(tmp_path: Path) -> None:
     """The client may disappear without cancelling its server-owned task."""
     runner = FakeRunner(delay=0.05)
@@ -60,6 +87,11 @@ def test_submit_poll_and_idempotency(tmp_path: Path) -> None:
         again = client.post("/v1/jobs", headers=headers, json=BODY)
         assert again.status_code == 202
         assert again.json()["job_id"] == job_id
+        disabled = client.post(
+            "/v1/jobs", headers=headers, json={**BODY, "fast_mode": False}
+        )
+        assert disabled.status_code == 202
+        assert disabled.json()["job_id"] == job_id
         conflict = client.post(
             "/v1/jobs", headers=headers, json={**BODY, "prompt": "other"}
         )
@@ -285,22 +317,77 @@ def test_workspace_jobs_do_not_overlap(tmp_path: Path) -> None:
         assert runner.peak == 1
 
 
-def test_codex_jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("path", ["/v1/query", "/v1/jobs"])
+@pytest.mark.parametrize("fast_mode", [1, "yes", "on"])
+def test_claude_rejects_non_boolean_fast_mode(
+    tmp_path: Path, path: str, fast_mode: int | str
+) -> None:
+    """Reject malformed fast mode values before execution or job submission."""
+    runner = FakeRunner()
+    with TestClient(create_app(_settings(tmp_path), runner)) as client:
+        response = client.post(
+            path, headers=AUTH, json={**BODY, "fast_mode": fast_mode}
+        )
+        assert response.status_code == 422
+        (error,) = response.json()["detail"]
+        assert error["loc"][-1] == "fast_mode"
+        assert error["type"] == "bool_type"
+        assert runner.stream_calls == 0
+
+
+@pytest.mark.parametrize(
+    "fast_mode", [{}, {"fast_mode": None}, {"fast_mode": False}, {"fast_mode": True}]
+)
+def test_claude_job_fast_mode(
+    tmp_path: Path, fast_mode: dict[str, bool | None]
+) -> None:
+    """A queued Claude request enables fast mode only when explicitly true."""
+    runner = FakeRunner()
+    with TestClient(create_app(_settings(tmp_path), runner)) as client:
+        response = client.post("/v1/jobs", headers=AUTH, json={**BODY, **fast_mode})
+        assert response.status_code == 202
+        assert _wait(client, response.json()["job_id"])["status"] == "succeeded"
+        assert runner.options is not None
+        if fast_mode.get("fast_mode") is True:
+            assert runner.options.settings is not None
+            assert json.loads(runner.options.settings) == {"fastMode": True}
+        else:
+            assert runner.options.settings is None
+
+
+@pytest.mark.parametrize("tier", [None, "fast"])
+def test_codex_jobs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tier: str | None
+) -> None:
     """Codex uses its own execution adapter and captures normalized metadata."""
 
-    async def fake_codex(**_kwargs: object) -> dict[str, Any]:
+    async def fake_codex(**kwargs: object) -> dict[str, Any]:
         await asyncio.sleep(0)
+        assert kwargs["service_tier"] == tier
         return {"agent": "codex", "result": "done", "is_error": False}
 
     monkeypatch.setattr("agsrv.jobs.codex.run_codex", fake_codex)
+    tier_options = {} if tier is None else {"service_tier": tier}
     with TestClient(create_app(_settings(tmp_path))) as client:
         response = client.post(
-            "/v1/jobs", headers=AUTH, json={"agent": "codex", "prompt": "x"}
+            "/v1/jobs",
+            headers=AUTH,
+            json={"agent": "codex", "prompt": "x", "options": tier_options},
         )
         assert response.status_code == 202
-        result = _wait(client, response.json()["job_id"])
+        job_id = response.json()["job_id"]
+        result = _wait(client, job_id)
         assert result["status"] == "succeeded"
         assert result["result"]["agent"] == "codex"
+        with closing(sqlite3.connect(tmp_path / "jobs.db")) as db:
+            (request_json,) = db.execute(
+                "SELECT request_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        assert json.loads(request_json)["options"] == {
+            "sandbox": "read-only",
+            "network_access": False,
+            **tier_options,
+        }
 
 
 def test_job_admission_failure_cases(

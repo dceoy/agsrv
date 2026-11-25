@@ -58,6 +58,7 @@ Claude request (`agent` and `prompt` are required):
   "permission_mode": "default",
   "max_turns": 5,
   "effort": "low",
+  "fast_mode": null,
   "timeout_seconds": 300,
   "include_messages": true,
   "sandbox": true
@@ -85,6 +86,9 @@ Claude request (`agent` and `prompt` are required):
   (always rejected with 403), `dontAsk`, `auto`.
 - `max_turns`: 1–1000. `timeout_seconds` must be > 0;
   `timeout_seconds` may not exceed `AGSRV_MAX_TIMEOUT_SECONDS`.
+- Set `fast_mode` to `true` to request Claude Code fast mode for a supported
+  Fable or Opus model. Omitting the field or passing `false` or `null` uses the
+  usual Claude Code settings. [Claude Code fast mode](https://code.claude.com/docs/en/fast-mode)
 
 If a Claude client disconnects, the run is promptly cancelled and its concurrency
 slot is freed. The server internally answers 499 without logging an error; the
@@ -159,12 +163,17 @@ still HTTP `200`. Message types not listed above are emitted as
 { "agent": "codex", "prompt": "Summarize this project", "cwd": ".",
   "model": null, "effort": "high", "timeout_seconds": 300,
   "include_messages": false,
-  "options": { "sandbox": "read-only", "network_access": false } }
+  "options": { "sandbox": "read-only", "network_access": false, "service_tier": "fast" } }
 ```
 
-`options.sandbox` is `read-only` (default) or `workspace-write`;
-`network_access` defaults to `false`. `cwd` is confined to the same workspace
-root as Claude. `include_messages` is accepted for consistency; Codex returns
+`options.sandbox` is `read-only` (default) or `workspace-write`.
+`options.network_access` defaults to `false`. `options.service_tier` accepts
+`fast` (alias `priority`), `flex`, `ultrafast`, and `default`. Use `default` to
+request standard routing.
+Omit the tier or pass `null` to use Codex's configured routing. Tier availability
+depends on the Codex configuration and model. The options apply to both queries
+and jobs. `cwd` is confined to the same workspace root as Claude.
+`include_messages` is accepted for consistency; Codex returns
 a turn summary rather than a transcript. The response contains `agent`,
 `result`, `model`, `is_error`, `duration_ms`, `usage`, and `backend` with the
 turn ID, status and executed commands. The model comes from thread metadata,
