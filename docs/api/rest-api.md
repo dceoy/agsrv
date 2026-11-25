@@ -58,6 +58,7 @@ Claude request (`agent` and `prompt` are required):
   "permission_mode": "default",
   "max_turns": 5,
   "effort": "low",
+  "fast_mode": null,
   "timeout_seconds": 300,
   "include_messages": true,
   "sandbox": true
@@ -85,6 +86,9 @@ Claude request (`agent` and `prompt` are required):
   (always rejected with 403), `dontAsk`, `auto`.
 - `max_turns`: 1–1000. `timeout_seconds` must be > 0;
   `timeout_seconds` may not exceed `AGSRV_MAX_TIMEOUT_SECONDS`.
+- Set `fast_mode` to `true` to request Claude Code fast mode for a supported
+  Fable or Opus model. Omitting the field or passing `false` or `null` uses the
+  usual Claude Code settings. [Claude Code fast mode](https://code.claude.com/docs/en/fast-mode)
 
 If a Claude client disconnects, the run is promptly cancelled and its concurrency
 slot is freed. The server internally answers 499 without logging an error; the

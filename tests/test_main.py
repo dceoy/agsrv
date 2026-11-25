@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from dataclasses import dataclass, replace
 from importlib.metadata import version as _package_version
@@ -766,9 +767,8 @@ def test_settings_api_key_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_build_options(tmp_path: Path) -> None:
     """Verify defaults versus overrides."""
     settings = make_settings(tmp_path, default_model="dm")
-    options = build_options(
-        QueryRequest(agent="claude", sandbox=False, prompt="x"), settings, tmp_path
-    )
+    default_request = QueryRequest(agent="claude", sandbox=False, prompt="x")
+    options = build_options(default_request, settings, tmp_path)
     assert options.model == "dm"
     assert options.permission_mode == "acceptEdits"
     assert options.allowed_tools == ["Read", "Write", "Edit", "Bash", "Glob", "Grep"]
@@ -781,6 +781,10 @@ def test_build_options(tmp_path: Path) -> None:
     assert options.max_turns is None
     assert options.resume is None
     assert options.continue_conversation is False
+    assert options.settings is None
+    assert options == build_options(
+        default_request.model_copy(update={"fast_mode": False}), settings, tmp_path
+    )
 
     request = QueryRequest(
         agent="claude",
@@ -799,6 +803,15 @@ def test_build_options(tmp_path: Path) -> None:
     assert options.permission_mode == "plan"
     assert options.max_turns == 3
     assert options.effort == "low"
+
+
+@pytest.mark.parametrize("fast_mode", [True, False, None])
+def test_fast_mode_request_round_trip(fast_mode: bool | None) -> None:
+    """Preserve fast mode through Claude request validation and serialization."""
+    body = {"agent": "claude", "prompt": "x", "fast_mode": fast_mode}
+    request = QueryRequest.model_validate(body)
+    assert request.fast_mode is fast_mode
+    assert QueryRequest.model_validate_json(request.model_dump_json()) == request
 
 
 @dataclass
@@ -1238,15 +1251,21 @@ def test_sandbox_false_when_off(tmp_path: Path) -> None:
     assert runner.options.cli_path is None
 
 
-def test_sandbox_default_enabled(sbx: SandboxEnv) -> None:
+@pytest.mark.parametrize("fast_mode", [{}, {"fast_mode": True}])
+def test_sandbox_default_enabled(sbx: SandboxEnv, fast_mode: dict[str, bool]) -> None:
     """Verify a request omitting sandbox enables a fail-closed sandbox."""
     settings = make_settings(sbx.workspace)
     client, runner = client_for(settings)
     response = client.post(
-        "/v1/query", json={"agent": "claude", "prompt": "x"}, headers=AUTH
+        "/v1/query", json={"agent": "claude", "prompt": "x", **fast_mode}, headers=AUTH
     )
     assert response.status_code == 200
     assert runner.options is not None
+    if fast_mode:
+        assert runner.options.settings is not None
+        assert json.loads(runner.options.settings) == {"fastMode": True}
+    else:
+        assert runner.options.settings is None
     assert runner.options.sandbox == build_sandbox_settings(settings, sbx.home)
     assert runner.options.cli_path == sbx.cli
     env = runner.options.env

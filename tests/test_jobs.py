@@ -62,6 +62,11 @@ def test_submit_poll_and_idempotency(tmp_path: Path) -> None:
         again = client.post("/v1/jobs", headers=headers, json=BODY)
         assert again.status_code == 202
         assert again.json()["job_id"] == job_id
+        disabled = client.post(
+            "/v1/jobs", headers=headers, json={**BODY, "fast_mode": False}
+        )
+        assert disabled.status_code == 202
+        assert disabled.json()["job_id"] == job_id
         conflict = client.post(
             "/v1/jobs", headers=headers, json={**BODY, "prompt": "other"}
         )
@@ -285,6 +290,20 @@ def test_workspace_jobs_do_not_overlap(tmp_path: Path) -> None:
         assert _wait(client, one)["status"] == "succeeded"
         assert _wait(client, two)["status"] == "succeeded"
         assert runner.peak == 1
+
+
+def test_claude_job_fast_mode(tmp_path: Path) -> None:
+    """A queued Claude request retains fast mode through execution."""
+    runner = FakeRunner()
+    with TestClient(create_app(_settings(tmp_path), runner)) as client:
+        response = client.post(
+            "/v1/jobs", headers=AUTH, json={**BODY, "fast_mode": True}
+        )
+        assert response.status_code == 202
+        assert _wait(client, response.json()["job_id"])["status"] == "succeeded"
+        assert runner.options is not None
+        assert runner.options.settings is not None
+        assert json.loads(runner.options.settings) == {"fastMode": True}
 
 
 @pytest.mark.parametrize("tier", [None, "fast"])

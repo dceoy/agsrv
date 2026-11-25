@@ -68,17 +68,14 @@ def _canonical(body: QueryRequest | CodexQueryRequest | MuseQueryRequest) -> str
     Returns:
         Canonical JSON string.
     """
-    # Preserve hashes for jobs submitted before Codex accepted a service tier.
+    # Preserve hashes for jobs submitted before these opt-in settings existed.
+    exclude: dict[str, Any] = {}
+    if isinstance(body, CodexQueryRequest) and body.options.service_tier is None:
+        exclude["options"] = {"service_tier"}
+    if isinstance(body, QueryRequest) and not body.fast_mode:
+        exclude["fast_mode"] = True
     return json.dumps(
-        body.model_dump(
-            mode="json",
-            exclude=(
-                {"options": {"service_tier"}}
-                if isinstance(body, CodexQueryRequest)
-                and body.options.service_tier is None
-                else None
-            ),
-        ),
+        body.model_dump(mode="json", exclude=exclude),
         sort_keys=True,
         separators=(",", ":"),
     )

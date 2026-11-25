@@ -23,6 +23,7 @@ class QueryRequest(BaseModel):
     permission_mode: PermissionMode | None = None
     max_turns: int | None = Field(default=None, ge=1, le=1000)
     effort: EffortLevel | None = None
+    fast_mode: bool | None = None
     timeout_seconds: float | None = Field(default=None, gt=0)
     include_messages: bool = True
     sandbox: bool = True

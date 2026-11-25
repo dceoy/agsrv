@@ -247,6 +247,8 @@ def build_options(
         "effort": request.effort,
     }
     kwargs.update({k: v for k, v in optional.items() if v is not None})
+    if request.fast_mode:
+        kwargs["settings"] = json.dumps({"fastMode": True})
     if request.sandbox:
         home = home or service_home()
         kwargs["cli_path"] = bundled_cli_path()
