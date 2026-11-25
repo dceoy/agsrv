@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import sqlite3
 import time
+from contextlib import closing
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -285,22 +287,39 @@ def test_workspace_jobs_do_not_overlap(tmp_path: Path) -> None:
         assert runner.peak == 1
 
 
-def test_codex_jobs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("tier", [None, "fast"])
+def test_codex_jobs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tier: str | None
+) -> None:
     """Codex uses its own execution adapter and captures normalized metadata."""
 
-    async def fake_codex(**_kwargs: object) -> dict[str, Any]:
+    async def fake_codex(**kwargs: object) -> dict[str, Any]:
         await asyncio.sleep(0)
+        assert kwargs["service_tier"] == tier
         return {"agent": "codex", "result": "done", "is_error": False}
 
     monkeypatch.setattr("agsrv.jobs.codex.run_codex", fake_codex)
+    tier_options = {} if tier is None else {"service_tier": tier}
     with TestClient(create_app(_settings(tmp_path))) as client:
         response = client.post(
-            "/v1/jobs", headers=AUTH, json={"agent": "codex", "prompt": "x"}
+            "/v1/jobs",
+            headers=AUTH,
+            json={"agent": "codex", "prompt": "x", "options": tier_options},
         )
         assert response.status_code == 202
-        result = _wait(client, response.json()["job_id"])
+        job_id = response.json()["job_id"]
+        result = _wait(client, job_id)
         assert result["status"] == "succeeded"
         assert result["result"]["agent"] == "codex"
+        with closing(sqlite3.connect(tmp_path / "jobs.db")) as db:
+            (request_json,) = db.execute(
+                "SELECT request_json FROM jobs WHERE job_id = ?", (job_id,)
+            ).fetchone()
+        assert json.loads(request_json)["options"] == {
+            "sandbox": "read-only",
+            "network_access": False,
+            **tier_options,
+        }
 
 
 def test_job_admission_failure_cases(

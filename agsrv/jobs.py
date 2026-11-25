@@ -68,8 +68,19 @@ def _canonical(body: QueryRequest | CodexQueryRequest | MuseQueryRequest) -> str
     Returns:
         Canonical JSON string.
     """
+    # Preserve hashes for jobs submitted before Codex accepted a service tier.
     return json.dumps(
-        body.model_dump(mode="json"), sort_keys=True, separators=(",", ":")
+        body.model_dump(
+            mode="json",
+            exclude=(
+                {"options": {"service_tier"}}
+                if isinstance(body, CodexQueryRequest)
+                and body.options.service_tier is None
+                else None
+            ),
+        ),
+        sort_keys=True,
+        separators=(",", ":"),
     )
 
 
@@ -501,6 +512,7 @@ class JobManager:
                     effort=body.effort,
                     sandbox=body.options.sandbox,
                     network_access=body.options.network_access,
+                    service_tier=body.options.service_tier,
                     binary=settings.codex_bin,
                     tmpdir=str(tmpdir),
                 )

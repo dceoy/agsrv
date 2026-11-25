@@ -102,8 +102,9 @@ async def test_probe_and_limits(monkeypatch: pytest.MonkeyPatch) -> None:
     ("network", "sandbox"),
     [(False, "read-only"), (True, "read-only"), (True, "workspace-write")],
 )
+@pytest.mark.parametrize("tier", [None, "fast"])
 async def test_run(
-    monkeypatch: pytest.MonkeyPatch, network: bool, sandbox: str
+    monkeypatch: pytest.MonkeyPatch, network: bool, sandbox: str, tier: str | None
 ) -> None:
     """Every turn is ephemeral and denies approvals with the requested sandbox."""
     client = FakeClient()
@@ -139,6 +140,7 @@ async def test_run(
         network_access=network,
         binary=None,
         tmpdir="/workspace/.agsrv-tmp-test",
+        service_tier=tier,
     )
     assert client.thread_start.await_args is not None
     assert client.thread_start.await_args.args[0]["config"] == {
@@ -150,6 +152,10 @@ async def test_run(
     ]
     assert client.thread_start.call_args.args[0]["ephemeral"] is True
     assert client.thread_start.call_args.args[0]["approvalPolicy"] == "never"
+    if tier is None:
+        assert "serviceTier" not in client.thread_start.await_args.args[0]
+    else:
+        assert client.thread_start.await_args.args[0]["serviceTier"] == tier
     if network:
         policy = client._start_turn.call_args.args[2]["sandboxPolicy"]  # pyright: ignore[reportPrivateUsage]
         assert policy == {
@@ -231,6 +237,19 @@ def test_terminal_results_endpoint(
     assert result["backend"]["commands"][0]["command"] == "pwd"
 
 
+@pytest.mark.parametrize("endpoint", ["/v1/query", "/v1/jobs"])
+def test_invalid_service_tier(tmp_path: Path, endpoint: str) -> None:
+    """Reject unsupported service tiers during request validation."""
+    app = create_app(Settings(api_key="key", workspace_root=tmp_path))
+    response = TestClient(app).post(
+        endpoint,
+        headers={"Authorization": "Bearer key"},
+        json={"agent": "codex", "prompt": "hi", "options": {"service_tier": "auto"}},
+    )
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"][-2:] == ["options", "service_tier"]
+
+
 def test_endpoints(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Exercise routing, authentication, validation, and backend failure mapping."""
     probe = AsyncMock(return_value=True)
@@ -264,6 +283,16 @@ def test_endpoints(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     }
     assert client.post("/v1/query", headers=headers, json=body).json()["result"] == "ok"
     assert run.call_args.kwargs["sandbox"] == "read-only"
+    assert run.call_args.kwargs["service_tier"] is None
+    assert (
+        client.post(
+            "/v1/query",
+            headers=headers,
+            json={**body, "options": {"service_tier": "fast"}},
+        ).status_code
+        == 200
+    )
+    assert run.call_args.kwargs["service_tier"] == "fast"
     assert (
         client.post("/v1/query", headers=headers, json={"prompt": "hi"}).status_code
         == 422

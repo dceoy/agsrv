@@ -207,6 +207,7 @@ async def run_codex(
     network_access: bool,
     binary: str | None,
     tmpdir: str | None = None,
+    service_tier: str | None = None,
 ) -> dict[str, Any]:
     """Run a single ephemeral Codex turn.
 
@@ -219,6 +220,7 @@ async def run_codex(
         network_access: Whether sandbox network access is enabled.
         binary: Optional Codex binary path.
         tmpdir: Private per-turn temporary directory.
+        service_tier: Optional service tier for the ephemeral thread.
 
     Returns:
         The collected turn and thread metadata.
@@ -235,6 +237,7 @@ async def run_codex(
             ),
             "approvalPolicy": "never",
             "sandbox": sandbox,
+            **({"serviceTier": service_tier} if service_tier is not None else {}),
         })
         thread = started.thread
         if network_access:

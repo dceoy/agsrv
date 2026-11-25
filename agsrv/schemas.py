@@ -29,11 +29,14 @@ class QueryRequest(BaseModel):
 
 
 class CodexOptions(BaseModel):
-    """Codex sandbox settings."""
+    """Codex sandbox and service settings."""
 
     model_config = ConfigDict(extra="forbid")
     sandbox: Literal["read-only", "workspace-write"] = "read-only"
     network_access: bool = False
+    service_tier: Literal["fast", "priority", "flex", "ultrafast", "default"] | None = (
+        None
+    )
 
 
 class CodexQueryRequest(BaseModel):

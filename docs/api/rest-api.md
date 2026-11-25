@@ -159,12 +159,17 @@ still HTTP `200`. Message types not listed above are emitted as
 { "agent": "codex", "prompt": "Summarize this project", "cwd": ".",
   "model": null, "effort": "high", "timeout_seconds": 300,
   "include_messages": false,
-  "options": { "sandbox": "read-only", "network_access": false } }
+  "options": { "sandbox": "read-only", "network_access": false, "service_tier": "fast" } }
 ```
 
-`options.sandbox` is `read-only` (default) or `workspace-write`;
-`network_access` defaults to `false`. `cwd` is confined to the same workspace
-root as Claude. `include_messages` is accepted for consistency; Codex returns
+`options.sandbox` is `read-only` (default) or `workspace-write`.
+`options.network_access` defaults to `false`. `options.service_tier` accepts
+`fast` (alias `priority`), `flex`, `ultrafast`, and `default`. Use `default` to
+request standard routing.
+Omit the tier or pass `null` to use Codex's configured routing. Tier availability
+depends on the Codex configuration and model. The options apply to both queries
+and jobs. `cwd` is confined to the same workspace root as Claude.
+`include_messages` is accepted for consistency; Codex returns
 a turn summary rather than a transcript. The response contains `agent`,
 `result`, `model`, `is_error`, `duration_ms`, `usage`, and `backend` with the
 turn ID, status and executed commands. The model comes from thread metadata,
