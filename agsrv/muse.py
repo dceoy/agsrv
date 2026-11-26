@@ -63,23 +63,29 @@ def deny_approval(request: ApprovalRequestParams) -> ApprovalDecisionInput:
         request: SDK approval request.
 
     Returns:
-        A denial or abort when offered, otherwise an input the SDK rejects locally.
+        An unambiguous denial or abort, otherwise an input the SDK rejects locally.
     """
     choices = request.get("availableChoices") or []
+    # The SDK matches the first entry for an ID and sends only that ID.
+    decisions_by_id: dict[str, set[str | None]] = {}
     for choice in choices:
-        if choice.get("decision") in {"denied", "deniedPolicyAmendment"}:
-            return ApprovalDecisionInput(choice_id=choice["choiceId"])
+        decisions_by_id.setdefault(choice["choiceId"], set()).add(
+            choice.get("decision")
+        )
+    for choice_id, decisions in decisions_by_id.items():
+        if len(decisions) == 1 and decisions & {"denied", "deniedPolicyAmendment"}:
+            return ApprovalDecisionInput(choice_id=choice_id)
     logger.warning(
         "Muse approval has no deny choice (offered decisions: %s)",
         [choice.get("decision") for choice in choices],
     )
-    for choice in choices:
-        if choice.get("decision") == "abort":
-            return ApprovalDecisionInput(choice_id=choice["choiceId"])
+    for choice_id, decisions in decisions_by_id.items():
+        if decisions == {"abort"}:
+            return ApprovalDecisionInput(choice_id=choice_id)
 
     # The SDK requires a decision input. Extending the greatest offered ID
     # guarantees an unoffered ID, which the router rejects before sending.
-    greatest_id = max((choice["choiceId"] for choice in choices), default="")
+    greatest_id = max(decisions_by_id, default="")
     return ApprovalDecisionInput(choice_id=greatest_id + "_")
 
 

@@ -28,9 +28,10 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from muse_code import MuseClientSpawnOptions
+    from muse_code_msp import ApprovalChoice
 
 
-def _choice(choice_id: str, decision: str) -> dict[str, str]:
+def _choice(choice_id: str, decision: str) -> ApprovalChoice:
     """Build an approval choice."""
     return {
         "choiceId": choice_id,
@@ -40,7 +41,7 @@ def _choice(choice_id: str, decision: str) -> dict[str, str]:
     }
 
 
-def _request(choices: list[dict[str, str]]) -> dict[str, list[dict[str, str]]]:
+def _request(choices: list[ApprovalChoice]) -> dict[str, list[ApprovalChoice]]:
     """Build an approval request."""
     return {"availableChoices": choices}
 
@@ -68,7 +69,7 @@ def test_serve_args_disable_sandbox_only_when_false() -> None:
 @pytest.mark.parametrize("denied", ["denied", "deniedPolicyAmendment"])
 def test_deny_approval_picks_denied(denied: str) -> None:
     """Deny handler picks denied decision."""
-    req: dict[str, list[dict[str, str]]] = _request([
+    req = _request([
         _choice("allow", "approved"),
         _choice("stop", "abort"),
         _choice("deny-1", denied),
@@ -78,9 +79,32 @@ def test_deny_approval_picks_denied(denied: str) -> None:
     assert decision.choice_id != "allow"
 
 
+@pytest.mark.parametrize(
+    ("extra_choices", "expected_id"),
+    [([], "x_"), ([_choice("deny", "denied")], "deny")],
+)
+def test_deny_approval_skips_conflicting_denied(
+    extra_choices: list[ApprovalChoice], expected_id: str
+) -> None:
+    """A denial sharing an ID with an approval is skipped."""
+    req = _request([_choice("x", "approved"), _choice("x", "denied"), *extra_choices])
+    decision = muse.deny_approval(req)  # pyright: ignore[reportArgumentType]
+    assert decision.choice_id == expected_id
+
+
+@pytest.mark.parametrize(
+    "offered_decision", ["denied", "deniedPolicyAmendment", "abort"]
+)
+def test_deny_approval_accepts_matching_duplicates(offered_decision: str) -> None:
+    """Duplicate IDs with the same decision remain selectable."""
+    req = _request([_choice("x", offered_decision), _choice("x", offered_decision)])
+    decision = muse.deny_approval(req)  # pyright: ignore[reportArgumentType]
+    assert decision.choice_id == "x"
+
+
 def test_deny_approval_ignores_label() -> None:
     """An approval with a misleading label is never selected."""
-    req: dict[str, list[dict[str, str]]] = _request([
+    req = _request([
         {"choiceId": "x", "decision": "approved", "label": "Deny it", "scope": "once"},
     ])
     decision = muse.deny_approval(req)  # pyright: ignore[reportArgumentType]
@@ -89,7 +113,7 @@ def test_deny_approval_ignores_label() -> None:
 
 def test_deny_approval_without_denied(caplog: pytest.LogCaptureFixture) -> None:
     """Deny handler declines to select any approval and logs the offers."""
-    req: dict[str, list[dict[str, str]]] = _request([
+    req = _request([
         _choice("a", "approved"),
         _choice("b", "approvedForSession"),
         _choice("b_", "approvedPolicyAmendment"),
@@ -486,8 +510,16 @@ def test_stderr_and_client_info() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("terminal", ["completed", "failed"])
+@pytest.mark.parametrize(
+    "choices",
+    [[_choice("_", "approved")], [_choice("x", "approved"), _choice("x", "abort")]],
+    ids=["approval-only", "conflicting-abort"],
+)
 async def test_approval_failure_through_sdk(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, terminal: str
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    terminal: str,
+    choices: list[ApprovalChoice],
 ) -> None:
     """The SDK sends no approval decision and the run reports its own outcome."""
     connection = MagicMock()
@@ -502,14 +534,7 @@ async def test_approval_failure_through_sdk(
         round_trip = router.requested({
             "approvalId": "a",
             "currentRequirementId": {"approvalId": "a", "sourceIndex": 0},
-            "availableChoices": [
-                {
-                    "choiceId": "_",
-                    "decision": "approved",
-                    "label": "Allow",
-                    "scope": "once",
-                },
-            ],
+            "availableChoices": choices,
         })  # pyright: ignore[reportArgumentType]
         assert round_trip is not None
         await round_trip
