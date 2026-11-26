@@ -65,40 +65,47 @@ def test_serve_args_disable_sandbox_only_when_false() -> None:
     assert "--disable-sandbox" not in muse.SERVE_ARGS
 
 
-def test_deny_approval_picks_denied() -> None:
+@pytest.mark.parametrize("denied", ["denied", "deniedPolicyAmendment"])
+def test_deny_approval_picks_denied(denied: str) -> None:
     """Deny handler picks denied decision."""
     req: dict[str, list[dict[str, str]]] = _request([
         _choice("allow", "approved"),
-        _choice("deny-1", "denied"),
+        _choice("stop", "abort"),
+        _choice("deny-1", denied),
     ])
     decision = muse.deny_approval(req)  # pyright: ignore[reportArgumentType,reportUnknownArgumentType,reportUnknownVariableType]
     assert decision.choice_id == "deny-1"
     assert decision.choice_id != "allow"
 
 
-def test_deny_approval_label_fallback() -> None:
-    """Deny handler uses label fallback."""
+def test_deny_approval_ignores_label() -> None:
+    """An approval with a misleading label is never selected."""
     req: dict[str, list[dict[str, str]]] = _request([
         {"choiceId": "x", "decision": "approved", "label": "Deny it", "scope": "once"},
     ])
-    with pytest.raises(RuntimeError):
-        muse.deny_approval(req)  # pyright: ignore[reportArgumentType]
+    decision = muse.deny_approval(req)  # pyright: ignore[reportArgumentType]
+    assert decision.choice_id != "x"
 
 
-def test_deny_approval_raises_without_denied() -> None:
-    """Deny handler fails closed without denied choice."""
+def test_deny_approval_without_denied(caplog: pytest.LogCaptureFixture) -> None:
+    """Deny handler declines to select any approval and logs the offers."""
     req: dict[str, list[dict[str, str]]] = _request([
         _choice("a", "approved"),
         _choice("b", "approvedForSession"),
+        _choice("b_", "approvedPolicyAmendment"),
     ])
-    with pytest.raises(RuntimeError):
-        muse.deny_approval(req)  # pyright: ignore[reportArgumentType]
+    decision = muse.deny_approval(req)  # pyright: ignore[reportArgumentType]
+    assert decision.choice_id not in {"a", "b", "b_"}
+    assert (
+        "['approved', 'approvedForSession', 'approvedPolicyAmendment']" in caplog.text
+    )
 
 
-def test_deny_approval_empty_request() -> None:
-    """Deny handler raises on empty choices."""
-    with pytest.raises(RuntimeError):
-        muse.deny_approval({"availableChoices": []})  # pyright: ignore[reportArgumentType,reportUnknownArgumentType]
+def test_deny_approval_empty_request(caplog: pytest.LogCaptureFixture) -> None:
+    """Deny handler returns a locally rejected input for empty choices."""
+    decision = muse.deny_approval({"availableChoices": []})  # pyright: ignore[reportArgumentType]
+    assert decision.choice_id == "_"
+    assert "offered decisions: []" in caplog.text
 
 
 def test_is_ephemeral() -> None:
@@ -464,33 +471,12 @@ def test_probe_cache(tmp_path: object, monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_deny_extra_branches() -> None:
-    """Cover remaining deny fallbacks."""
-    req = {
-        "availableChoices": [
-            {
-                "choiceId": "approved-ux",
-                "decision": "approved",
-                "label": "x",
-                "scope": "once",
-            },
-            {
-                "choiceId": "denied-opt",
-                "decision": "approvedForSession",
-                "label": "y",
-                "scope": "once",
-            },
-        ]
-    }
-    with pytest.raises(RuntimeError):
-        muse.deny_approval(req)  # pyright: ignore[reportArgumentType]
-    req2 = {
-        "availableChoices": [
-            {"choiceId": "a", "decision": "approved", "label": "a", "scope": "once"},
-            {"choiceId": "b", "decision": "timedOut", "label": "b", "scope": "once"},
-        ]
-    }
-    with pytest.raises(RuntimeError):
-        muse.deny_approval(req2)  # pyright: ignore[reportArgumentType]
+    """Only abort is a safe fallback among timeout and unknown choices."""
+    choices = [_choice("a", "timedOut"), _choice("b", "futureDecision")]
+    decision = muse.deny_approval(_request(choices))  # pyright: ignore[reportArgumentType]
+    assert decision.choice_id not in {"a", "b"}
+    decision = muse.deny_approval(_request([*choices, _choice("stop", "abort")]))  # pyright: ignore[reportArgumentType]
+    assert decision.choice_id == "stop"
 
 
 def test_stderr_and_client_info() -> None:
@@ -499,21 +485,39 @@ def test_stderr_and_client_info() -> None:
 
 
 @pytest.mark.asyncio
-async def test_approval_failure_through_sdk(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An SDK-reported approval failure terminates the waiting run."""
-    router = ApprovalRouter("s", None)
+@pytest.mark.parametrize("terminal", ["completed", "failed"])
+async def test_approval_failure_through_sdk(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, terminal: str
+) -> None:
+    """The SDK sends no approval decision and the run reports its own outcome."""
+    connection = MagicMock()
+    connection.command = AsyncMock()
+    router = ApprovalRouter("s", connection)
     session = MagicMock()
     session.on_approval = router.on_approval
     session.on_approval_error = router.on_approval_error
 
-    async def run(*args: object, **kwargs: object) -> None:
+    async def run(*args: object, **kwargs: object) -> SimpleNamespace:
         _ = (args, kwargs)
-        router.requested({
+        round_trip = router.requested({
             "approvalId": "a",
             "currentRequirementId": {"approvalId": "a", "sourceIndex": 0},
-            "availableChoices": [],
+            "availableChoices": [
+                {
+                    "choiceId": "_",
+                    "decision": "approved",
+                    "label": "Allow",
+                    "scope": "once",
+                },
+            ],
         })  # pyright: ignore[reportArgumentType]
-        await asyncio.Event().wait()
+        assert round_trip is not None
+        await round_trip
+        await asyncio.sleep(0)
+        return SimpleNamespace(
+            outcome=SimpleNamespace(kind="completed", params={"terminal": terminal}),
+            final_text="turn result",
+        )
 
     session.run = run
     client = MagicMock()
@@ -521,13 +525,15 @@ async def test_approval_failure_through_sdk(monkeypatch: pytest.MonkeyPatch) -> 
     client.start_session = AsyncMock(return_value=session)
     client.close = AsyncMock()
     monkeypatch.setattr(muse.MuseClient, "spawn", AsyncMock(return_value=client))
-    with pytest.raises(RuntimeError, match="approval failed"):
-        await asyncio.wait_for(
-            muse.run_muse(
-                prompt="hi", cwd="/workspace", model=None, effort=None, binary=None
-            ),
-            1,
-        )
+    result = await muse.run_muse(
+        prompt="hi", cwd="/workspace", model=None, effort=None, binary=None
+    )
+    assert result["backend"]["outcome"] == terminal
+    assert result["is_error"] is (terminal == "failed")
+    assert result["result"] == "turn result"
+    assert "UnofferedChoice(approval_id='a'" in caplog.text
+    connection.command.assert_not_awaited()
+    client.close.assert_awaited_once()
 
 
 def test_muse_probe_slot_429(tmp_path: object, monkeypatch: pytest.MonkeyPatch) -> None:
