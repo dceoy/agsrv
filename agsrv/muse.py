@@ -22,6 +22,7 @@ from agsrv.sandbox import SANDBOX_DENIED_ENV_VARS
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from muse_code.facade.approval import ApprovalFailure
     from muse_code_msp import ApprovalRequestParams
 
 logger = logging.getLogger(__name__)
@@ -62,18 +63,30 @@ def deny_approval(request: ApprovalRequestParams) -> ApprovalDecisionInput:
         request: SDK approval request.
 
     Returns:
-        Decision input selecting the denied choice.
-
-    Raises:
-        RuntimeError: If no deny-like choice is offered.
+        An unambiguous denial or abort, otherwise an input the SDK rejects locally.
     """
     choices = request.get("availableChoices") or []
+    # The SDK matches the first entry for an ID and sends only that ID.
+    decisions_by_id: dict[str, set[str | None]] = {}
     for choice in choices:
-        decision = str(choice.get("decision", ""))
-        if decision in {"denied", "deniedPolicyAmendment"}:
-            return ApprovalDecisionInput(choice_id=str(choice["choiceId"]))
-    msg = "Muse approval has no deny choice"
-    raise RuntimeError(msg)
+        decisions_by_id.setdefault(choice["choiceId"], set()).add(
+            choice.get("decision")
+        )
+    for choice_id, decisions in decisions_by_id.items():
+        if len(decisions) == 1 and decisions & {"denied", "deniedPolicyAmendment"}:
+            return ApprovalDecisionInput(choice_id=choice_id)
+    logger.warning(
+        "Muse approval has no deny choice (offered decisions: %s)",
+        [choice.get("decision") for choice in choices],
+    )
+    for choice_id, decisions in decisions_by_id.items():
+        if decisions == {"abort"}:
+            return ApprovalDecisionInput(choice_id=choice_id)
+
+    # The SDK requires a decision input. Extending the greatest offered ID
+    # guarantees an unoffered ID, which the router rejects before sending.
+    greatest_id = max(decisions_by_id, default="")
+    return ApprovalDecisionInput(choice_id=greatest_id + "_")
 
 
 def _on_stderr(chunk: str) -> None:
@@ -221,7 +234,7 @@ async def run_muse(
         Normalized response dict.
 
     Raises:
-        RuntimeError: If the backend is not ephemeral or approval fails.
+        RuntimeError: If the backend is not ephemeral or the sandbox is unavailable.
     """
     started = time.monotonic()
     client: MuseClient[Any] | None = None
@@ -242,27 +255,17 @@ async def run_muse(
         )
         session.on_approval(deny_approval)
 
-        failure_event = asyncio.Event()
-
-        def _on_error(failure: Any) -> None:  # ruff: ignore[any-type]
-            _ = failure
-            failure_event.set()
+        def _on_error(failure: ApprovalFailure) -> None:
+            logger.warning("Muse approval could not be resolved: %r", failure)
 
         session.on_approval_error(_on_error)
         run_task = asyncio.create_task(
             session.run(prompt, reasoning_effort=effort)  # pyright: ignore[reportArgumentType]
         )
-        failure_task = asyncio.create_task(failure_event.wait())
         try:
-            done, _ = await asyncio.wait(
-                {run_task, failure_task}, return_when=asyncio.FIRST_COMPLETED
-            )
-            if failure_task in done:
-                msg = "Muse approval failed"
-                raise RuntimeError(msg)
-            result = run_task.result()
+            # The query or job deadline also bounds turns left pending by the host.
+            result = await asyncio.shield(run_task)
         finally:
-            failure_task.cancel()
             if not run_task.done():
                 run_task.cancel()
                 await asyncio.wait({run_task}, timeout=0.5)
